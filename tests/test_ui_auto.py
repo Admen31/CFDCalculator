@@ -201,3 +201,16 @@ def test_unchanged_instrument_result_is_current_and_journaled(app, make, monkeyp
     w.start()
     settle(app, w)
     assert w.verdict.text() == "BUY" and "XAU/USD" in (tmp_path / "journal.csv").read_text()
+
+
+def test_reading_requested_while_busy_is_never_lost(app, make):
+    """START during a running AUTO reading must still get its own reading and callback."""
+    reader = Reader("Tesla")
+    w = make(reader)
+    got = []
+    w.bar.tick()                                   # a timer reading is running...
+    w.bar.read_once(then=lambda r: got.append(r))  # ...and START asks for another one
+    for _ in range(3):
+        w.bar.read_once(then=lambda r: got.append(r))
+    w.bar.wait_idle()
+    assert len(got) == 4 and reader.calls == 5 and not w.bar._busy and not w.bar._queued

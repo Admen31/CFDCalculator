@@ -104,6 +104,7 @@ class InstrumentBar(QWidget):
         self.tracker = Tracker(stable=2)
         self.reading: auto.Reading | None = None
         self._task: ReadTask | None = None
+        self._busy = False  # set/cleared in the UI thread only; QThread.isRunning() can lag behind `finished`
         self._queued: list[tuple[int, Callable | None]] = []
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -199,7 +200,7 @@ class InstrumentBar(QWidget):
             self.timer.stop()
 
     def tick(self):
-        if not (self._task and self._task.isRunning()):  # never queue up readings
+        if not self._busy:  # never queue up readings
             self._read(stable=None)
 
     # ---- readings ----
@@ -208,9 +209,10 @@ class InstrumentBar(QWidget):
         self._read(stable=1, then=then)
 
     def _read(self, stable: int | None, then=None):
-        if self._task and self._task.isRunning():
+        if self._busy:
             self._queued.append((stable, then))
             return
+        self._busy = True
         region = self.region()
         self._task = ReadTask(lambda: self.reader(region))
         self._task.done.connect(lambda r, st=stable, cb=then: self._on_reading(r, st, cb))
@@ -218,6 +220,7 @@ class InstrumentBar(QWidget):
         self._task.start()
 
     def _next(self):
+        self._busy = False
         if self._queued:
             stable, then = self._queued.pop(0)
             self._read(stable, then)
@@ -233,8 +236,9 @@ class InstrumentBar(QWidget):
 
     def wait_idle(self, ms: int = 15000):
         """Tests and shutdown: wait for the reading worker."""
-        while self._task and (self._task.isRunning() or self._queued):
-            self._task.wait(ms)
+        while self._busy or self._queued:
+            if self._task:
+                self._task.wait(ms)
             QGuiApplication.processEvents()
 
     # ---- manual choice ----
