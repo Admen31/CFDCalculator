@@ -25,6 +25,13 @@ def app():
     return QApplication.instance() or QApplication([])
 
 
+T0 = time.monotonic()
+
+
+def mark(what):
+    print(f"[{time.monotonic() - T0:7.1f} s] {what}", flush=True)
+
+
 def pump(app, ms=600):
     end = time.monotonic() + ms / 1000
     while time.monotonic() < end:
@@ -156,16 +163,20 @@ def test_app_recognises_switches_and_marks_old_signal_historical(app, tmp_path, 
     w.show()
     pump(app, 600)
     try:
+        mark("app shown")
         assert w.bar.save_region(t212.label_rect())   # set the region ONCE
         w.bar.wait_idle()
         pump(app, 300)
         assert w.inst and w.inst.symbol == "TSLA", w.bar.status.text()
+        mark("region set, TSLA recognised")
 
         w.start()                          # START: re-reads Trading 212, analyses only the confirmed one
         w.bar.wait_idle()
         pump(app, 300)
+        mark("START read done")
         w.task.wait(20000)
         pump(app, 400)
+        mark("analysis done")
         assert w.analysed.symbol == "TSLA" and w.gauge.pct == 100
         w.grab().save(str(OUT / "3_app_tesla.png"))
 
@@ -175,6 +186,7 @@ def test_app_recognises_switches_and_marks_old_signal_historical(app, tmp_path, 
             w.bar.tick()
             w.bar.wait_idle()
             pump(app, 200)
+        mark("two AUTO readings done")
         assert w.inst.symbol == "AAPL", w.bar.status.text()
         assert w.verdict.text().startswith("HISTORICKÝ")
         w.grab().save(str(OUT / "4_app_switched_to_apple.png"))

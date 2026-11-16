@@ -33,7 +33,8 @@ jobs:
         env:
           CFD_E2E: "1"
           CFD_E2E_OUT: e2e-out
-        run: python -m pytest -p no:cacheprovider -s -rA tests/test_windows_e2e.py
+          PYTHONIOENCODING: utf-8
+        run: python -m pytest -p no:cacheprovider -s -rA --durations=5 -o faulthandler_timeout=90 tests/test_windows_e2e.py
       - name: Twelve Data symbol mapping (informational, network)
         continue-on-error: true
         env:
