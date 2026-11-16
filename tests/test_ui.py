@@ -5,7 +5,6 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 QtCore = pytest.importorskip("PySide6.QtCore")
-from PySide6.QtGui import QColor, QFont, QImage, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 
@@ -54,17 +53,14 @@ def test_missing_api_key_never_analyses(app, window, monkeypatch):
 
 
 def test_ocr_reads_rendered_instrument_name():
-    pytest.importorskip("rapidocr_onnxruntime")
+    # Real OCR, no mocks. Text is drawn with Pillow's bundled TrueType font (Pillow comes with RapidOCR):
+    # the offscreen Qt platform on Windows has no fonts and would draw empty boxes.
     import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
 
     from cfdcalc.recognize import match, ocr_lines
-    img = QImage(360, 60, QImage.Format.Format_RGB888)
-    img.fill(QColor("#1b1f27"))
-    p = QPainter(img)
-    p.setPen(QColor("#e6e6e6"))
-    p.setFont(QFont("DejaVu Sans", 20))
-    p.drawText(10, 40, "Germany 40   19 850.2")
-    p.end()
-    arr = np.frombuffer(img.constBits(), np.uint8).reshape(60, img.bytesPerLine())[:, :360 * 3].reshape(60, 360, 3)
-    r = match(ocr_lines(arr.copy()))
-    assert r.confident and r.best.symbol == "DAX", r
+    img = Image.new("RGB", (360, 60), "#1b1f27")
+    ImageDraw.Draw(img).text((10, 14), "Germany 40   19 850.2", fill="#e6e6e6", font=ImageFont.load_default(size=26))
+    lines = ocr_lines(np.asarray(img))
+    r = match(lines)
+    assert r.confident and r.best.symbol == "DAX", (lines, r)
