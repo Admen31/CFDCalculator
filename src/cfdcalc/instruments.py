@@ -43,9 +43,18 @@ CATALOG: tuple[Instrument, ...] = (
     Instrument("US 30", "DJI", "index", ("USD",), 1, 3.0, ("US 30", "US30", "Wall Street 30", "Dow Jones")),
     Instrument("Germany 40", "DAX", "index", ("EUR",), 1, 1.5, ("Germany 40", "DE40", "DAX", "GER40")),
     Instrument("UK 100", "FTSE", "index", ("GBP",), 1, 1.5, ("UK 100", "UK100", "FTSE 100")),
-    _stock("Apple", "AAPL"), _stock("Microsoft", "MSFT"), _stock("Tesla", "TSLA"), _stock("Nvidia", "NVDA", "NVIDIA"),
-    _stock("Amazon", "AMZN", "Amazon.com"), _stock("Meta Platforms", "META", "Meta"),
-    _stock("Alphabet", "GOOGL", "Google", "Alphabet (Class A)"), _stock("Netflix", "NFLX"), _stock("AMD", "AMD"),
+    _stock("Apple", "AAPL", "Apple Inc"), _stock("Microsoft", "MSFT", "Microsoft Corp"),
+    _stock("Tesla", "TSLA", "Tesla Inc"), _stock("NVIDIA", "NVDA", "NVIDIA Corp", "Nvidia Corporation"),
+    _stock("Amazon", "AMZN", "Amazon.com"), _stock("Meta Platforms", "META", "Meta", "Facebook"),
+    _stock("Alphabet", "GOOGL", "Google", "Alphabet (Class A)"), _stock("Netflix", "NFLX"),
+    _stock("AMD", "AMD", "Advanced Micro Devices"), _stock("Intel", "INTC"), _stock("Coca-Cola", "KO"),
+    _stock("JPMorgan Chase", "JPM", "JPMorgan", "JP Morgan"), _stock("Boeing", "BA"), _stock("Palantir", "PLTR"),
+    _stock("Walt Disney", "DIS", "Disney"), _stock("Alibaba", "BABA"),
 )
 
 BY_SYMBOL = {i.symbol: i for i in CATALOG}
+
+
+def labels(inst: Instrument) -> tuple[str, ...]:
+    """Every text that identifies the instrument: name, Twelve Data symbol and Trading 212 aliases."""
+    return tuple(dict.fromkeys((inst.name, inst.symbol, *inst.aliases)))

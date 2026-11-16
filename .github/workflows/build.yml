@@ -2,7 +2,7 @@ name: CFD Signal Calculator
 
 on:
   push:
-    branches: [main]
+    branches: [main, "v2.0-auto-recognition"]
   pull_request:
   workflow_dispatch:
 
@@ -24,15 +24,39 @@ jobs:
       - name: Install
         run: python -m pip install -e ".[dev,build]"
       - name: Lint (ruff)
-        run: ruff check --select F,E9,B,E --line-length 120 src tests
+        run: ruff check --select F,E9,B,E --line-length 120 src tests scripts
       - name: Tests (offscreen Qt, network blocked in tests)
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q -p no:cacheprovider
+      - name: End-to-end on the real Windows desktop (Win32 window search, capture, OCR, UI)
+        env:
+          CFD_E2E: "1"
+          CFD_E2E_OUT: e2e-out
+        run: python -m pytest -p no:cacheprovider -s -rA tests/test_windows_e2e.py
+      - name: Twelve Data symbol mapping (informational, network)
+        continue-on-error: true
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python scripts/verify_symbols.py
       - name: Build EXE (PyInstaller, folder build)
         run: pyinstaller --noconfirm --clean --windowed --name "CFD Signal Calculator" --collect-all rapidocr_onnxruntime --paths src src/cfdcalc/__main__.py
+      - name: EXE starts and keeps running
+        run: |
+          $p = Start-Process -FilePath "dist/CFD Signal Calculator/CFD Signal Calculator.exe" -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { Write-Error "EXE exited early with code $($p.ExitCode)"; exit 1 }
+          Write-Output "EXE is running (PID $($p.Id))"
+          Stop-Process -Id $p.Id -Force
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cfd-signal-calculator-windows
           path: dist/CFD Signal Calculator
           retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: e2e-screenshots
+          path: e2e-out
+          retention-days: 14
+          if-no-files-found: ignore

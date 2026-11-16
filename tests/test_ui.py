@@ -36,7 +36,7 @@ def test_start_runs_real_steps_to_a_verdict(app, window, tmp_path):
     finish(app, window)
     assert window.gauge.pct == 100 and window.gauge.title in ("BUY", "SELL", "WAIT")
     assert window.verdict.text().startswith("DEMO ")
-    assert "Poslední data" in window.stamp.text()
+    assert "Analýza" in window.stamp.text() and "XAU/USD" in window.stamp.text() and "data do" in window.stamp.text()
     assert all(t.value.text() not in ("…", "") for t in window.tiles.values())
     assert not (tmp_path / "journal.csv").exists()  # synthetic demo signals never enter the journal
 

@@ -31,11 +31,9 @@ Požadavky: Windows 10/11, Python ≥ 3.12. OCR (RapidOCR) běží offline, nic 
 1. **⚙ Nastavení** – API klíč Twelve Data (zdarma na twelvedata.com), případně proměnná prostředí
    `TWELVEDATA_API_KEY`, která má přednost. Dále večerní limit (výchozí 21:00 místního času) a minimální počet minut
    do limitu (výchozí 60).
-2. **▭ Oblast** – myší označte v Trading 212 místo, kde je název instrumentu (např. „EUR/USD“, „US 500“,
-   „Gold“). Oblast se uloží.
+2. Otevřete **Trading 212** (desktopovou aplikaci, nebo web v prohlížeči jako aktivní záložku) a zvolte instrument.
 3. Zadejte **spread z T212** (rozdíl BUY − SELL v cenových jednotkách). Předvyplněná hodnota je jen hrubý odhad.
-4. **START** (kliknutí do kruhu). Aplikace nejdřív rozpozná instrument. Při nejisté shodě nabídne ruční výběr,
-   který je k dispozici i přes tlačítko s názvem instrumentu.
+4. **START** (kliknutí do kruhu). Analyzuje se vždy jen potvrzený instrument (viz níže).
 
 ### Ukazatel 1–100 %
 
@@ -43,6 +41,62 @@ Analýza má 20 skutečných kroků: instrument, 3× stažení a 3× ověření 
 8 modulů, trend 1h, spread, večerní limit a rozhodnutí. Procento je `hotové kroky / 20`. Když krok selže
 (API chyba, zastaralá data), analýza skončí s **WAIT** a ukazatel zůstane na dosaženém procentu
 s poznámkou „přerušeno“.
+
+## Automatické rozpoznávání Trading 212 (verze 2.0)
+
+Nastavení stačí udělat **jednou**:
+
+1. Přepněte nahoře na **AUTO**.
+2. Klikněte na **▭** a myší označte v okně Trading 212 **jen název aktivního instrumentu** (např. „NVIDIA“,
+   „EUR/USD“). Neoznačujte lištu s více instrumenty (záložky, watchlist), protože to je nejednoznačné.
+3. Hotovo. Oblast se uloží **relativně k oknu Trading 212**. Funguje i po přesunutí okna, změně velikosti, na jiném
+   monitoru a při měřítku Windows 100/125/150 %.
+
+Jak to funguje:
+
+* Aplikace najde okno podle titulku „Trading 212“. U prohlížeče to je titulek aktivní záložky, takže se čte jen
+  zobrazená záložka.
+* Snímá se pouze označená oblast okna, ne celá plocha. Okno se vykreslí do paměti, takže to funguje i tehdy, když
+  ho kalkulačka (vždy navrchu) částečně zakrývá. Když obsah nejde bezpečně získat (okno je minimalizované,
+  zakryté, zavřené nebo menší než oblast), OCR se neprovádí a stav to ukáže.
+* S volbou **Průběžně sledovat** (Nastavení, interval 2–3 s) se čte opakovaně. OCR běží mimo grafické
+  rozhraní, takže okno nezamrzá. Změna instrumentu se potvrdí až po **dvou shodných čteních** po sobě.
+* **⟳** načte instrument z Trading 212 jednorázově, i v režimu RUČNĚ.
+* Řádek stavu: zelená = vidím instrument, oranžová = nejisté nebo nečitelné, červená = okno nenalezeno.
+* **RUČNĚ**: instrument vyberete vyhledávacím polem (název, ticker nebo alias, např. „nvda“, „Germany 40“),
+  tlačítky oblíbených (★) a naposledy použitých instrumentů. Ruční volba přepne do RUČNĚ, aby ji AUTO nepřepsal.
+
+Pravidla bezpečnosti:
+
+* START v režimu AUTO **vždy nejdřív znovu přečte Trading 212** a analyzuje jen jednoznačně rozpoznaný
+  instrument.
+* Při nízké jistotě, více instrumentech v oblasti nebo nečitelném okně aplikace nic neanalyzuje. Ukáže důvod
+  a kandidáty k potvrzení. Potvrzený text si zapamatuje.
+* Když se instrument změní, předchozí výsledek se označí jako **HISTORICKÝ** (šedě, i u indikátorů). To platí
+  i při změně během běžící analýzy; takový signál se nezapíše do demo deníku.
+* U výsledku je čas analýzy a použitý symbol.
+* Rozpoznání nikdy nespouští analýzu ani obchod samo. Aplikace nepoužívá žádné API Trading 212 a nezadává obchody.
+
+### Testovací postup na vašem počítači
+
+Automatické testy (GitHub Actions, Windows) ověřují skutečné hledání okna, snímání a OCR na **zkušebním okně**
+s titulkem „Trading 212“. Se skutečným Trading 212 jsem to ověřit nemohl. Prosím projděte:
+
+1. Trading 212 v prohlížeči (Chrome/Edge), instrument NVIDIA → AUTO → ▭ označit název → stav ukáže
+   „vidím NVIDIA“.
+2. Přepněte v Trading 212 na EUR/USD → do ~5 s se nahoře objeví EUR/USD. Případný předchozí výsledek je
+   HISTORICKÝ.
+3. Kalkulačku posuňte přes okno Trading 212 (ne přes označený název) → rozpoznávání dál funguje.
+4. Přesuňte nebo zvětšete okno prohlížeče, případně ho přesuňte na druhý monitor → funguje bez nového
+   označení. Pokud se název v Trading 212 při změně šířky posune jinam, označte oblast znovu.
+5. Windows → Nastavení → Obrazovka → Měřítko 125 % a 150 % → funguje bez nového označení.
+6. Otevřete v prohlížeči jinou záložku → stav „Okno Trading 212 nenalezeno“. Minimalizujte okno → stav
+   „minimalizované“. V obou případech START nic neanalyzuje bez vašeho potvrzení.
+7. Spusťte START a během analýzy přepněte instrument → výsledek bude HISTORICKÝ.
+8. Kalkulačku zakryjte přes označený název → buď rozpozná správně, nebo hlásí „nelze bezpečně přečíst“,
+   nikdy jiný instrument.
+
+Pokud něco nesedí, pošlete text ze stavového řádku a snímek okna.
 
 ## Pravidla signálu
 
@@ -91,8 +145,10 @@ Vývojové prostředí nemělo přístup k api.twelvedata.com. Proti skutečném
   je WAIT.
 * Ekonomický kalendář je neoficiální týdenní feed Forex Factory (`nfs.faireconomy.media`), uložený
   v mezipaměti na 1 h a důvěryhodný nejvýš 6 h. Earnings jednotlivých akcií se nesledují.
-* OCR bylo ověřeno na vykresleném textu, ne na skutečném snímku Trading 212. Pokud rozpoznání selže, zúžte
-  oblast jen na název instrumentu.
+* OCR a snímání okna byly ověřeny na zkušebním okně ve Windows (GitHub Actions), ne na skutečném Trading 212.
+  Detekce okna předpokládá, že titulek obsahuje „Trading 212“. Pokud rozpoznání selže, zúžte oblast jen na
+  název instrumentu.
+* Mapování symbolů na Twelve Data kontroluje `python scripts/verify_symbols.py` (v CI informativně).
 * API klíč se ukládá nešifrovaně do `%APPDATA%\CFDSignalCalculator\app.ini`, případně ho nastavte proměnnou
   prostředí.
 
