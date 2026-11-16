@@ -1,0 +1,38 @@
+name: CFD Signal Calculator
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Tests + Windows EXE
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -e ".[dev,build]"
+      - name: Lint (ruff)
+        run: ruff check --select F,E9,B,E --line-length 120 src tests
+      - name: Tests (offscreen Qt, network blocked in tests)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q -p no:cacheprovider
+      - name: Build EXE (PyInstaller, folder build)
+        run: pyinstaller --noconfirm --clean --windowed --name "CFD Signal Calculator" --collect-all rapidocr_onnxruntime --paths src src/cfdcalc/__main__.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cfd-signal-calculator-windows
+          path: dist/CFD Signal Calculator
+          retention-days: 14

@@ -1,0 +1,70 @@
+"""Headless UI smoke test (offscreen Qt) + OCR on a rendered image. Skipped when Qt/OCR are not installed."""
+import os
+
+import pytest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+QtCore = pytest.importorskip("PySide6.QtCore")
+from PySide6.QtGui import QColor, QFont, QImage, QPainter  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def app():
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def window(app, tmp_path, monkeypatch):
+    QtCore.QSettings.setPath(QtCore.QSettings.Format.IniFormat, QtCore.QSettings.Scope.UserScope, str(tmp_path))
+    from cfdcalc import ui
+    monkeypatch.setattr(ui, "data_dir", lambda: tmp_path)
+    w = ui.MainWindow()
+    w.s.setValue("demo", True)
+    w.s.setValue("auto_recognize", False)
+    w.set_instrument(ui.BY_SYMBOL["XAU/USD"])
+    return w
+
+
+def finish(app, w):
+    w.task.wait(10000)
+    for _ in range(50):
+        app.processEvents()
+
+
+def test_start_runs_real_steps_to_a_verdict(app, window, tmp_path):
+    window.start()
+    finish(app, window)
+    assert window.gauge.pct == 100 and window.gauge.title in ("BUY", "SELL", "WAIT")
+    assert window.verdict.text().startswith("DEMO ")
+    assert "Poslední data" in window.stamp.text()
+    assert all(t.value.text() not in ("…", "") for t in window.tiles.values())
+    assert not (tmp_path / "journal.csv").exists()  # synthetic demo signals never enter the journal
+
+
+def test_missing_api_key_never_analyses(app, window, monkeypatch):
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    from cfdcalc import ui
+    shown = []
+    monkeypatch.setattr(ui.QMessageBox, "warning", lambda *a: shown.append(a[2]))
+    window.s.setValue("demo", False)
+    window.s.setValue("api_key", "")
+    window.start()
+    assert window.task is None and "API klíč" in shown[0]
+
+
+def test_ocr_reads_rendered_instrument_name():
+    pytest.importorskip("rapidocr_onnxruntime")
+    import numpy as np
+
+    from cfdcalc.recognize import match, ocr_lines
+    img = QImage(360, 60, QImage.Format.Format_RGB888)
+    img.fill(QColor("#1b1f27"))
+    p = QPainter(img)
+    p.setPen(QColor("#e6e6e6"))
+    p.setFont(QFont("DejaVu Sans", 20))
+    p.drawText(10, 40, "Germany 40   19 850.2")
+    p.end()
+    arr = np.frombuffer(img.constBits(), np.uint8).reshape(60, img.bytesPerLine())[:, :360 * 3].reshape(60, 360, 3)
+    r = match(ocr_lines(arr.copy()))
+    assert r.confident and r.best.symbol == "DAX", r
