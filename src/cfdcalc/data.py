@@ -68,8 +68,17 @@ class TwelveData:
         return body
 
     def bars(self, symbol: str, interval: str, n: int) -> list[Bar]:
-        body = self._get("time_series", {"symbol": symbol, "interval": interval, "outputsize": n,
-                                         "timezone": "UTC", "order": "asc"})
+        from .instruments import BY_SYMBOL
+        inst = BY_SYMBOL.get(symbol)
+        if inst and not inst.td_verified:
+            raise DataError(f"symbol {symbol} nemá ověřené mapování na Twelve Data")
+        params = {"symbol": symbol, "interval": interval, "outputsize": n, "timezone": "UTC", "order": "asc"}
+        if inst and inst.exchange:
+            params["exchange"] = inst.exchange
+        body = self._get("time_series", params)
+        got = str((body.get("meta") or {}).get("exchange", "")).upper()
+        if inst and inst.exchange and got and got != inst.exchange:
+            raise DataError(f"Twelve Data vrátila {symbol} z burzy {got}, očekávána {inst.exchange}")
         out = []
         for v in body.get("values") or []:
             o, h, lo, c = (_num(v.get(k)) for k in ("open", "high", "low", "close"))

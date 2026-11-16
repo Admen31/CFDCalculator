@@ -214,3 +214,14 @@ def test_reading_requested_while_busy_is_never_lost(app, make):
         w.bar.read_once(then=lambda r: got.append(r))
     w.bar.wait_idle()
     assert len(got) == 4 and reader.calls == 5 and not w.bar._busy and not w.bar._queued
+
+
+def test_unmapped_index_is_recognised_but_never_analysed(app, make, monkeypatch):
+    from cfdcalc import ui
+    called = []
+    monkeypatch.setattr(ui, "run_analysis", lambda *a: called.append(a))
+    w = make(Reader("US 500"), demo=False)
+    w.start()
+    settle(app, w)
+    assert w.inst.symbol == "SPX" and not called and w.verdict.text() == "WAIT"
+    assert "mapování neověřeno" in w.explain.text()

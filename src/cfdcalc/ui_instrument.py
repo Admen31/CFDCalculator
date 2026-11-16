@@ -5,6 +5,7 @@ window access runs in a worker thread; the UI thread never blocks on it.
 """
 from __future__ import annotations
 
+import time
 from typing import Callable
 
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
@@ -235,10 +236,12 @@ class InstrumentBar(QWidget):
             then(reading)
 
     def wait_idle(self, ms: int = 15000):
-        """Tests and shutdown: wait for the reading worker."""
-        while self._busy or self._queued:
+        """Tests and shutdown: wait for the reading worker while still processing UI events (a window of
+        this process being captured must be able to answer PrintWindow)."""
+        deadline = time.monotonic() + ms / 1000
+        while (self._busy or self._queued) and time.monotonic() < deadline:
             if self._task:
-                self._task.wait(ms)
+                self._task.wait(20)
             QGuiApplication.processEvents()
 
     # ---- manual choice ----

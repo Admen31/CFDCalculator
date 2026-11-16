@@ -94,7 +94,7 @@ if SUPPORTED:
     _user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
     _user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     _user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-    for _f in ("IsWindowVisible", "IsIconic", "IsWindow"):
+    for _f in ("IsWindowVisible", "IsIconic", "IsWindow", "IsHungAppWindow"):
         getattr(_user32, _f).argtypes = [wintypes.HWND]
     _get_dpi = getattr(_user32, "GetDpiForWindow", None)  # Windows 10 1607+; older systems are treated as 100 %
     _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
@@ -215,6 +215,8 @@ def capture(win: Win, rect: tuple[int, int, int, int]) -> np.ndarray:
         raise CaptureError("okno Trading 212 bylo zavřeno")
     if _user32.IsIconic(win.hwnd):
         raise CaptureError("okno Trading 212 je minimalizované")
+    if _user32.IsHungAppWindow(win.hwnd):
+        raise CaptureError("Trading 212 neodpovídá")
     x, y, w, h = rect
     wr = wintypes.RECT()
     _user32.GetWindowRect(win.hwnd, ctypes.byref(wr))

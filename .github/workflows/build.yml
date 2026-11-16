@@ -39,6 +39,7 @@ jobs:
         continue-on-error: true
         env:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          PYTHONIOENCODING: utf-8
         run: python scripts/verify_symbols.py
       - name: Build EXE (PyInstaller, folder build)
         run: pyinstaller --noconfirm --clean --windowed --name "CFD Signal Calculator" --collect-all rapidocr_onnxruntime --paths src src/cfdcalc/__main__.py

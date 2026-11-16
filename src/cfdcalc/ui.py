@@ -23,6 +23,8 @@ from .ui_instrument import InstrumentBar
 APP = "CFD Signal Calculator"
 COLORS = {"bull": "#22c55e", "bear": "#ef4444", "neutral": "#64748b", "block": "#f59e0b", "na": "#334155"}
 VERDICT_COLORS = {BUY: "#22c55e", SELL: "#ef4444", WAIT: "#f59e0b"}
+UNMAPPED = ("{name}: Twelve Data pod symbolem {symbol} neuvádí tento instrument (mapování neověřeno), "
+            "proto se neanalyzuje")
 STYLE = """
 QWidget { background: #11151d; color: #e5e7eb; font-family: 'Segoe UI', sans-serif; font-size: 12px; }
 QPushButton { background: #1e2533; border: 1px solid #2b3446; border-radius: 8px; padding: 6px 10px; }
@@ -321,6 +323,10 @@ class MainWindow(QWidget):
             t.set("na", "…", "")
         self.analysed, self.shown = inst, None
         self.bar.remember(inst)
+        if not inst.td_verified:
+            self.started = datetime.now(timezone.utc)
+            self.on_result(Result(reasons=[UNMAPPED.format(name=inst.name, symbol=inst.symbol)], aborted=True))
+            return
         self.verdict.setText("…")
         self.levels.setText("")
         self.explain.setText("")
@@ -380,6 +386,9 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, APP, str(e))
             return
         inst, spread, cfg = self.inst, self.spread_of(self.inst), self.cfg()
+        if not inst.td_verified:
+            QMessageBox.information(self, APP, UNMAPPED.format(name=inst.name, symbol=inst.symbol))
+            return
         dlg = TextDialog(f"Backtest – {inst.name}", "Spustit", self)
         dlg.text.setPlainText("Stejná pravidla jako živá analýza na posledních až 5000 svíčkách 5m (3 API dotazy).\n"
                               "Bez historického filtru zpráv; vstup za close + spread; SL a TP v jedné svíčce = SL.\n"

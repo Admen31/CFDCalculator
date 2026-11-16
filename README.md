@@ -138,8 +138,15 @@ Vývojové prostředí nemělo přístup k api.twelvedata.com. Proti skutečném
 * Formát `GET /time_series` (`values[]` s `datetime/open/high/low/close/volume`, `status: error`
   a `message`), parametry `timezone=UTC` a `order=asc` a hlavička `Authorization: apikey …`. Pokud API
   odpoví jinak, je výsledek chyba dat a WAIT.
-* Symboly indexů a komodit (`SPX`, `NDX`, `DJI`, `DAX`, `FTSE`, `WTI/USD`, `XBR/USD`, `NG/USD`) a jejich
-  dostupnost ve vašem tarifu. Nedostupný symbol se projeví jako chyba API a WAIT.
+* **Mapování symbolů** (ověřeno 16. 11. 2026 proti veřejnému vyhledávání symbolů Twelve Data,
+  `scripts/verify_symbols.py`, běží v CI):
+  * Forex (11 párů), zlato `XAU/USD`, stříbro `XAG/USD`, ropa `WTI/USD` a Brent `XBR/USD` odpovídají.
+  * Akcie mají pevně nastavenou americkou burzu (NASDAQ/NYSE). Stejné tickery jsou i jinde, např. `BA` je také
+    Bangkok Airways a `DIS` také Distil Plc. Když Twelve Data vrátí data z jiné burzy, výsledek je WAIT.
+  * **Indexy (US 500, US 100, US 30, Germany 40, UK 100) a zemní plyn se neanalyzují.** Twelve Data pod
+    `SPX`, `NDX`, `DAX` a `FTSE` uvádí ETF nebo jiné firmy (např. SpaceX, Nordex), `DJI` a `NG/USD` neexistují.
+    Aplikace je rozpozná, ale vždy vrátí WAIT s vysvětlením a API nevolá.
+* Dostupnost jednotlivých symbolů ve vašem tarifu. Nedostupný symbol se projeví jako chyba API a WAIT.
 * Bezplatný tarif má limit 8 dotazů za minutu. Analýza spotřebuje 3 dotazy, backtest také 3.
 * Data akcií mohou být zpožděná nebo mimo obchodní hodiny staré. Taková data se zamítnou jako zastaralá a výsledek
   je WAIT.
