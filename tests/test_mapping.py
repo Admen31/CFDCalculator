@@ -1,6 +1,7 @@
 """Twelve Data mapping: unverified symbols never reach the API, stocks are pinned to their exchange."""
 import io
 import json
+import urllib.parse
 
 import pytest
 
@@ -30,7 +31,8 @@ class Resp(io.BytesIO):
 def fake_urlopen(seen, meta_exchange="NYSE"):
     def urlopen(req, timeout):
         seen.append(req.full_url)
-        body = {"status": "ok", "meta": {"symbol": "BA", "exchange": meta_exchange},
+        symbol = urllib.parse.parse_qs(urllib.parse.urlsplit(req.full_url).query)["symbol"][0]
+        body = {"status": "ok", "meta": {"symbol": symbol, "exchange": meta_exchange},
                 "values": [{"datetime": "2026-11-17 10:00:00", "open": "1", "high": "2", "low": "0.5",
                             "close": "1.5", "volume": "10"}]}
         return Resp(json.dumps(body).encode())

@@ -2,7 +2,8 @@ name: CFD Signal Calculator
 
 on:
   push:
-    branches: [main, "v2.0-auto-recognition", "v2.1-signal-and-smooth-ui", "v2.2-research-backtest"]
+    branches: [main, "v2.0-auto-recognition", "v2.1-signal-and-smooth-ui", "v2.2-research-backtest",
+               "v2.2.1-xagusd-data-fix"]
   pull_request:
   workflow_dispatch:
 
@@ -41,6 +42,12 @@ jobs:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           PYTHONIOENCODING: utf-8
         run: python scripts/verify_symbols.py
+      - name: Twelve Data diagnostics XAG/USD, XAU/USD, EUR/USD (public checks; with key only if the secret exists)
+        continue-on-error: true
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: python scripts/td_probe.py
       - name: Strategy comparison v2.0 vs v2.1 on real historical prices (informational, network)
         continue-on-error: true
         env:
@@ -69,6 +76,8 @@ jobs:
           key: dukascopy-${{ steps.month.outputs.month }}-${{ github.run_id }}
           restore-keys: dukascopy-
       - name: v2.2 research backtest on real historical prices (12 months, informational, network)
+        # only on the research branch (or manual runs): other branches must not compete for the data feed
+        if: github.ref_name == 'v2.2-research-backtest' || github.event_name == 'workflow_dispatch'
         continue-on-error: true
         timeout-minutes: 60
         env:

@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +29,71 @@ class Bar:
 
 
 class DataError(Exception):
-    pass
+    """A data problem that prevents analysis. `kind` says what kind of problem it is (never a trading signal):
+    not_found, plan, auth, rate_limit, server, connection, timeout, invalid, no_data, unmapped, request, unknown.
+    `confirmed` is False when the cause is only guessed from an HTTP status without an explaining response."""
+
+    def __init__(self, message: str, kind: str = "unknown", *, source: str = "", symbol: str = "",
+                 interval: str = "", status: int | None = None, provider_message: str = "", confirmed: bool = True):
+        super().__init__(message)
+        self.kind, self.source, self.symbol, self.interval = kind, source, symbol, interval
+        self.status, self.provider_message, self.confirmed = status, provider_message, confirmed
+
+
+KIND_TEXT = {
+    "not_found": "Poskytovatel symbol nenašel",
+    "plan": "Instrument není dostupný v aktuálním tarifu API",
+    "auth": "API klíč byl odmítnut",
+    "rate_limit": "Překročen limit dotazů API",
+    "server": "Výpadek na straně poskytovatele",
+    "connection": "Chyba připojení",
+    "timeout": "Poskytovatel neodpověděl včas (timeout)",
+    "invalid": "Neplatná odpověď poskytovatele",
+    "no_data": "Poskytovatel nevrátil dostatek historických dat",
+    "request": "Poskytovatel odmítl parametry požadavku",
+    "unknown": "Příčinu poskytovatel neupřesnil",
+}
+NEXT_STEP = {
+    "not_found": "ověř zápis symbolu (Nastavení → Ověřit dostupnost dat).",
+    "plan": "ověř, zda tarif Twelve Data zahrnuje tento instrument a interval.",
+    "auth": "zkontroluj API klíč v Nastavení.",
+    "rate_limit": "počkej minutu (bezplatný tarif: 8 dotazů/min, 800/den) a spusť znovu.",
+    "server": "zkus to znovu za několik minut.",
+    "connection": "zkontroluj připojení k internetu.",
+    "timeout": "zkus to znovu; při pomalé síti může dotaz trvat déle.",
+    "invalid": "spusť Ověřit dostupnost dat a výsledek pošli k analýze.",
+    "no_data": "trh může být zavřený nebo symbol nemá data v tomto intervalu.",
+    "request": "spusť Ověřit dostupnost dat a výsledek pošli k analýze.",
+    "unknown": "ověř dostupnost symbolu a oprávnění API tarifu (Nastavení → Ověřit dostupnost dat).",
+}
+_PLAN_WORDS = ("plan", "upgrade", "subscription", "pricing", "available starting", "grow", "pro plan")
+
+
+def classify(status: int | None, body) -> tuple[str, bool, str]:
+    """(kind, confirmed, provider message) from an HTTP status and the parsed JSON body (if any).
+    The kind is only `confirmed` when the provider's own message supports it."""
+    msg = str(body.get("message", "")) if isinstance(body, dict) else ""
+    code = body.get("code") if isinstance(body, dict) and isinstance(body.get("code"), int) else status
+    m = msg.lower()
+    if code == 429 or "api credits" in m or "rate limit" in m:
+        return "rate_limit", bool(msg) or code == 429, msg
+    if code == 401 or "api key" in m or "apikey" in m:
+        return "auth", "key" in m or code == 401, msg
+    if any(w in m for w in _PLAN_WORDS):
+        return "plan", True, msg
+    if code == 403:
+        return "plan", False, msg
+    if code == 404 or "not found" in m:
+        if "symbol" in m and any(w in m for w in ("not found", "invalid", "missing", "specify")):
+            return "not_found", True, msg
+        if "no data" in m or "data is not available" in m:
+            return "no_data", True, msg
+        return "unknown", False, msg
+    if code == 400:
+        return "request", bool(msg), msg
+    if code is not None and code >= 500:
+        return "server", True, msg
+    return "unknown", False, msg
 
 
 class Provider(Protocol):
@@ -42,54 +108,133 @@ def _num(x) -> float | None:
 
 
 class TwelveData:
-    """GET /time_series. The key goes in the Authorization header so it never appears in URLs or logs."""
+    """GET /time_series. The key goes in the Authorization header so it never appears in URLs or logs;
+    every message shown to the user is passed through redact()."""
 
     BASE = "https://api.twelvedata.com"
+    name = "Twelve Data"
 
     def __init__(self, api_key: str, timeout: float = 15.0):
         if not api_key:
-            raise DataError("Chybí API klíč Twelve Data (Nastavení).")
+            raise DataError("Chybí API klíč Twelve Data (Nastavení).", "auth", source=self.name)
         self._key, self._timeout = api_key, timeout
 
-    def _get(self, path: str, params: dict) -> dict:
+    def redact(self, text: str) -> str:
+        """Remove the API key (and anything that looks like an apikey parameter) and control characters."""
+        text = text.replace(self._key, "***") if self._key else text
+        text = re.sub(r"(?i)(apikey[=: ]+)[^&\s\"']+", r"\1***", text)
+        text = "".join(ch for ch in text if ch.isprintable())
+        return text[:240]
+
+    def _error(self, kind: str, confirmed: bool, symbol: str, interval: str, status: int | None, msg: str):
+        from .instruments import BY_SYMBOL
+        inst = BY_SYMBOL.get(symbol)
+        who = f"{inst.name} ({symbol})" if inst else symbol
+        msg = self.redact(msg)
+        where = f" pro interval {interval}" if interval else ""
+        parts = [f"{who}: Twelve Data neposkytla data{where}."]
+        if status:
+            parts.append(f"HTTP {status}.")
+        parts.append(KIND_TEXT[kind] + ("." if confirmed else " (příčina nepotvrzena odpovědí poskytovatele)."))
+        if msg:
+            parts.append(f"Odpověď poskytovatele: „{msg}“.")
+        parts.append(f"Další krok: {NEXT_STEP[kind]}")
+        return DataError(" ".join(parts), kind, source=self.name, symbol=symbol, interval=interval, status=status,
+                         provider_message=msg, confirmed=confirmed)
+
+    def _get(self, path: str, params: dict, symbol: str = "", interval: str = "") -> dict:
         url = f"{self.BASE}/{path}?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={"Authorization": f"apikey {self._key}",
                                                    "User-Agent": "cfd-signal-calculator"})
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as r:  # nosec B310 - fixed https base URL
-                body = json.loads(r.read().decode("utf-8"))
+                raw = r.read()
         except urllib.error.HTTPError as e:
-            raise DataError(f"Twelve Data HTTP {e.code}") from None
-        except (urllib.error.URLError, TimeoutError, ValueError) as e:
-            raise DataError(f"Twelve Data nedostupné: {type(e).__name__}") from None
-        if not isinstance(body, dict) or body.get("status") == "error":
-            msg = body.get("message", "neznámá chyba") if isinstance(body, dict) else "neplatná odpověď"
-            raise DataError(f"Twelve Data: {msg}")
+            try:
+                body = json.loads(e.read().decode("utf-8", "replace"))
+            except (ValueError, OSError):
+                body = None
+            kind, confirmed, msg = classify(e.code, body)
+            raise self._error(kind, confirmed, symbol, interval, e.code, msg) from None
+        except (TimeoutError, socket.timeout):
+            raise self._error("timeout", True, symbol, interval, None, "") from None
+        except urllib.error.URLError as e:
+            kind = "timeout" if isinstance(e.reason, (TimeoutError, socket.timeout)) else "connection"
+            raise self._error(kind, True, symbol, interval, None, type(e.reason).__name__) from None
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise self._error("invalid", True, symbol, interval, 200, "odpověď není JSON") from None
+        if not isinstance(body, dict):
+            raise self._error("invalid", True, symbol, interval, 200, "odpověď není objekt JSON")
+        if body.get("status") == "error":
+            kind, confirmed, msg = classify(None, body)
+            raise self._error(kind, confirmed, symbol, interval, body.get("code") if isinstance(body.get("code"),
+                                                                                                int) else 200, msg)
         return body
 
     def bars(self, symbol: str, interval: str, n: int) -> list[Bar]:
         from .instruments import BY_SYMBOL
         inst = BY_SYMBOL.get(symbol)
         if inst and not inst.td_verified:
-            raise DataError(f"symbol {symbol} nemá ověřené mapování na Twelve Data")
+            raise DataError(f"symbol {symbol} nemá ověřené mapování na Twelve Data", "unmapped", source=self.name,
+                            symbol=symbol, interval=interval)
         params = {"symbol": symbol, "interval": interval, "outputsize": n, "timezone": "UTC", "order": "asc"}
         if inst and inst.exchange:
             params["exchange"] = inst.exchange
-        body = self._get("time_series", params)
-        got = str((body.get("meta") or {}).get("exchange", "")).upper()
+        body = self._get("time_series", params, symbol, interval)
+        meta = body.get("meta") or {}
+        got = str(meta.get("exchange", "")).upper()
         if inst and inst.exchange and got and got != inst.exchange:
-            raise DataError(f"Twelve Data vrátila {symbol} z burzy {got}, očekávána {inst.exchange}")
+            raise DataError(f"Twelve Data vrátila {symbol} z burzy {got}, očekávána {inst.exchange}", "invalid",
+                            source=self.name, symbol=symbol, interval=interval)
+        returned = str(meta.get("symbol", "")).upper()
+        if returned and returned != symbol.upper():   # never accept a different instrument than requested
+            raise self._error("invalid", True, symbol, interval, 200, f"vrácen jiný symbol: {returned}")
         out = []
         for v in body.get("values") or []:
             o, h, lo, c = (_num(v.get(k)) for k in ("open", "high", "low", "close"))
             try:
                 t = datetime.fromisoformat(v["datetime"]).replace(tzinfo=timezone.utc)
-            except (KeyError, ValueError):
-                raise DataError("Twelve Data: neplatný čas svíčky") from None
+            except (KeyError, ValueError, TypeError):
+                raise self._error("invalid", True, symbol, interval, 200,
+                                  f"neplatný čas svíčky {str(v.get('datetime'))[:30]}") from None
             if None in (o, h, lo, c):
-                raise DataError(f"Twelve Data: chybí cena ve svíčce {v.get('datetime')}")
+                raise self._error("invalid", True, symbol, interval, 200, f"chybí cena ve svíčce {v.get('datetime')}")
             out.append(Bar(t, o, h, lo, c, _num(v.get("volume"))))
+        if not out:
+            raise self._error("no_data", True, symbol, interval, 200, "0 svíček")
         out.sort(key=lambda b: b.t)
+        return out
+
+    def probe(self, symbol: str, intervals=("5min", "15min", "1h")) -> list[tuple[str, str, str, str]]:
+        """Availability check for one symbol: catalogue listing + a 2-bar request per interval + plan usage.
+        Returns (check, status ok|fail|info, detail, kind: OK or DataError.kind). Stops at a rate limit.
+        Run it in a worker thread."""
+        out: list[tuple[str, str, str, str]] = []
+        try:
+            rows = self._get("symbol_search", {"symbol": symbol, "outputsize": 30}, symbol).get("data") or []
+            exact = [r for r in rows if str(r.get("symbol", "")).upper() == symbol.upper()]
+            out.append(("Katalog symbolů", "ok" if exact else "fail", "; ".join(
+                f"{r.get('instrument_name')} [{r.get('instrument_type')}, {r.get('exchange') or '-'}]"
+                for r in exact[:3]) or "symbol v katalogu nenalezen", "OK" if exact else "not_found"))
+        except DataError as e:
+            out.append(("Katalog symbolů", "fail", str(e), e.kind))
+        for interval in intervals:
+            try:
+                bars = self.bars(symbol, interval, 2)
+                out.append((f"Svíčky {interval}", "ok", f"poslední {bars[-1].t:%Y-%m-%d %H:%M} UTC", "OK"))
+            except DataError as e:
+                out.append((f"Svíčky {interval}", "fail", str(e), e.kind))
+                if e.kind == "rate_limit":
+                    break
+        try:
+            u = self._get("api_usage", {})
+            out.append(("Tarif API", "info", f"tarif {u.get('plan_category', '?')}, využití "
+                                             f"{u.get('current_usage', '?')}/{u.get('plan_limit', '?')} za minutu",
+                        ""))
+        except DataError as e:
+            out.append(("Tarif API", "info", f"nezjištěno ({KIND_TEXT[e.kind].lower()})", ""))
         return out
 
 
@@ -118,6 +263,7 @@ def synthetic_bars(now: datetime, minutes: int, n: int, drift: float = 0.0, amp:
 
 class SyntheticData:
     """Offline demo provider: a trend whose direction depends on the symbol, scaled to its typical spread."""
+    name = "Offline demo (syntetická data)"
 
     def __init__(self, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
         self.clock = clock

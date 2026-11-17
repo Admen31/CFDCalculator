@@ -123,6 +123,8 @@ class Result:
     direction: str | None = None        # trend direction the indicators were judged against
     counts: dict[str, int] = field(default_factory=dict)   # pro / proti / neutrální / nedostupné / nepoužito
     filters: list[tuple[str, str, str]] = field(default_factory=list)   # (filter, ok|fail|na, detail)
+    sources: list[tuple[str, str, str, str, str]] = field(default_factory=list)  # (source, symbol, interval,
+    #                                                                     OK | data problem kind, detail)
 
     @property
     def is_signal(self) -> bool:
@@ -493,10 +495,13 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
         done += 1
         progress(done, total, label)
 
+    source = getattr(provider, "name", "zdroj dat")
+    sources: list[tuple[str, str, str, str, str]] = []   # bookkeeping for the detail page; no effect on decisions
+
     def stop(verdict: str, reason: str) -> Result:
         extra = "signál se z neúplných dat negeneruje" if verdict != WAIT else "bez analýzy, API se nevolalo"
         return Result(verdict=verdict, reasons=[reason, extra], summary=reason, completed=done, total=total,
-                      aborted=True, profile=prof.name)
+                      aborted=True, profile=prof.name, sources=list(sources))
 
     step(f"Instrument {inst.name}")
     if not inst.td_verified:
@@ -512,13 +517,18 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
         try:
             raw = provider.bars(inst.symbol, interval, FETCH)
         except DataError as e:
+            sources.append((source, inst.symbol, interval, getattr(e, "kind", "unknown"), str(e)))
             return stop(NO_DATA, str(e))
         except Exception as e:  # noqa: BLE001 - unexpected failure is a technical error, never a signal
+            sources.append((source, inst.symbol, interval, "invalid", f"{type(e).__name__}"))
             return stop(ERROR, f"technická chyba při stahování {interval}: {type(e).__name__}: {e}")
         step(f"Data {interval} stažena")
         bars, problem = prepare(raw, interval, now, NEED, session_open(inst, now))
         if problem:
+            sources.append((source, inst.symbol, interval, "no_data", problem))
             return stop(NO_DATA, problem)
+        sources.append((source, inst.symbol, interval, "OK", f"{len(raw)} svíček, poslední uzavřená "
+                                                             f"{bars[-1].t:%d.%m. %H:%M} UTC"))
         frames[interval] = bars
         step(f"Data {interval} ověřena")
     if cancelled():
@@ -535,4 +545,5 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
     except Exception as e:  # noqa: BLE001
         return stop(ERROR, f"technická chyba vyhodnocení: {type(e).__name__}: {e}")
     r.completed, r.total = done, total
+    r.sources = sources
     return r

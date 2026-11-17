@@ -23,6 +23,7 @@ from .backtest import HISTORY, journal_add, journal_read, journal_verify
 from .engine import Costs, Market
 from .report import research_text
 from .validation import research
+from .availability import Availability, state_text
 from .calendar import Calendar
 from .data import DataError, SyntheticData, TwelveData
 from .instruments import BY_SYMBOL, Instrument
@@ -74,7 +75,7 @@ class Task(QThread):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, s: QSettings, parent=None):
+    def __init__(self, s: QSettings, parent=None, probe=None, probe_label: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Nastavení")
         self.s = s
@@ -99,6 +100,11 @@ class SettingsDialog(QDialog):
         note = QLabel(f"Klíč se ukládá nešifrovaně do {s.fileName()}.\n"
                       "Alternativa: proměnná prostředí TWELVEDATA_API_KEY.", objectName="muted")
         form.addRow(note)
+        if probe:
+            check = QPushButton(f"Ověřit dostupnost dat – {probe_label}")
+            check.setToolTip("Katalog symbolů a 2 svíčky pro 5min/15min/1h u Twelve Data (4–5 dotazů)")
+            check.clicked.connect(probe)
+            form.addRow(check)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.save)
         bb.rejected.connect(self.reject)
@@ -229,7 +235,9 @@ class MainWindow(QWidget):
         self.bar.set_manual(inst)
 
     def settings(self):
-        if SettingsDialog(self.s, self).exec():
+        inst = self.inst
+        probe = self.probe_data if inst and not self.demo() else None
+        if SettingsDialog(self.s, self, probe, f"{inst.name} ({inst.symbol})" if inst else "").exec():
             self.bar.apply_settings()
             self.refresh_header()
 
@@ -250,6 +258,10 @@ class MainWindow(QWidget):
             self.mark_historical()
         if not self.running():
             self.gauge.show_state(0, "START", "spustit analýzu" if inst else "vyberte instrument", ACCENT)
+            if inst and not self.demo():   # local record only - no network request on recognition
+                state, text = self.availability().summary(TwelveData.name, inst.symbol)
+                self.step.setText(text if state != "neověřeno" else "Data Twelve Data: zatím neověřena")
+                self.step.setToolTip(text)
 
     def mark_historical(self):
         """The instrument changed: the result on screen no longer applies to what Trading 212 shows."""
@@ -359,8 +371,55 @@ class MainWindow(QWidget):
         if inst != self.inst:  # the instrument changed while the analysis was running
             self.mark_historical()
             return
+        if not self.demo():
+            av = self.availability()
+            for source, symbol, interval, state, detail in r.sources:
+                av.record(source, symbol, interval, state, detail)
         if r.is_signal and not self.demo():
             journal_add(data_dir() / "journal.csv", inst.symbol, r.verdict, r.data_time, r.entry, r.sl, r.tp)
+
+    def availability(self) -> Availability:
+        return Availability(data_dir() / "availability.json")
+
+    def probe_data(self):
+        """Manual availability check of the current instrument at Twelve Data (worker thread, 4-5 requests)."""
+        inst = self.inst
+        try:
+            td = TwelveData(os.environ.get("TWELVEDATA_API_KEY") or self.s.value("api_key", ""))
+        except DataError as e:
+            QMessageBox.warning(self, APP, str(e))
+            return
+        dlg = TextDialog(f"Dostupnost dat – {inst.name} ({inst.symbol})", "Ověřit znovu", self)
+        dlg.bar.setRange(0, 0)
+        av = self.availability()
+
+        def show(rows):
+            dlg.bar.setRange(0, 1)
+            dlg.bar.setValue(1)
+            for check, _status, detail, kind in rows:
+                if check.startswith("Svíčky "):
+                    av.record(TwelveData.name, inst.symbol, check.split()[1], kind, detail)
+            icon = {"ok": "✓", "fail": "✗", "info": "i"}
+            lines = [f"Zdroj: Twelve Data · symbol {inst.symbol} · {datetime.now().astimezone():%d.%m.%Y %H:%M}", ""]
+            lines += [f"{icon.get(st, '?')} {check}: {detail}" for check, st, detail, _ in rows]
+            lines += ["", "Souhrn: " + av.summary(TwelveData.name, inst.symbol)[1],
+                      "Text neobsahuje API klíč – můžete ho zkopírovat a poslat k analýze."]
+            dlg.text.setPlainText("\n".join(lines))
+
+        def run():
+            dlg.btn.setEnabled(False)
+            dlg.text.setPlainText("Ověřuji katalog symbolů a svíčky 5min/15min/1h…")
+            dlg._task = Task(lambda _: td.probe(inst.symbol))
+            dlg._task.done.connect(show)
+            dlg._task.failed.connect(lambda m: dlg.text.setPlainText(f"Ověření selhalo: {td.redact(m)}"))
+            dlg._task.finished.connect(lambda: dlg.btn.setEnabled(True))
+            dlg._task.start()
+
+        dlg.btn.clicked.connect(run)
+        run()
+        dlg.exec()
+        if getattr(dlg, "_task", None):
+            dlg._task.wait(60000)
 
     # ---- shutdown ----
     def closeEvent(self, e):
@@ -473,7 +532,11 @@ def detail_html(r: Result, inst: Instrument) -> str:
                            f"&nbsp;&nbsp;{esc(m.note)}" for k, m in r.modules.items()) + "</p>",
              "<p><b>Bezpečnostní filtry</b><br>"
              + ("<br>".join(f"{icons.get(st, '?')} <b>{esc(name)}</b>: {esc(detail)}" for name, st, detail in r.filters)
-                or "nehodnoceno") + "</p>"]
+                or "nehodnoceno") + "</p>",
+             "<p><b>Zdroje dat</b><br>"
+             + ("<br>".join(f"Zdroj dat: {esc(src)} | Symbol: {esc(sym)} | Interval: {esc(iv)} | Stav: "
+                            f"{esc(state_text(state))}" + ("" if state == "OK" else f"<br>&nbsp;&nbsp;{esc(detail)}")
+                            for src, sym, iv, state, detail in r.sources) or "data nebyla stažena") + "</p>"]
     return "".join(parts)
 
 

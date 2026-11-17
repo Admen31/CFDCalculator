@@ -243,6 +243,49 @@ nákladech, a i ty jsou na krátkém období jen orientační.
 * **Ceny Yahoo nejsou ceny CFD v Trading 212.** Zlato a ropa jsou futures, období je krátké a test nemá filtr
   zpráv. Výsledky proto berte jako **orientační, neověřené pro reálné obchodování**.
 
+## Diagnostika dat a stříbro XAG/USD (verze 2.2.1)
+
+**Problém:** u stříbra skončila analýza na 1/20 krocích s hlášením jen `Twelve Data HTTP 404`.
+
+**Zjištěná příčina nejasného hlášení:** při chybě HTTP aplikace zahodila odpověď poskytovatele a ukázala
+jen číselný kód. Proč Twelve Data pro XAG/USD vrací 404, zatím **nebylo ověřeno na skutečném API s vaším
+klíčem**: z vývojového prostředí API ani dokumentace nejsou dostupné a CI nemá klíč. V katalogu symbolů
+Twelve Data je XAG/USD uvedené jako „Silver Spot / US Dollar [Precious Metal]“; mapování je tedy správné.
+
+**Co se změnilo (pravidla obchodní strategie se neměnila):**
+
+* Aplikace čte a třídí chybovou odpověď poskytovatele. Hlášení obsahuje:
+  * instrument a zdroj;
+  * časový rámec a HTTP status;
+  * text odpovědi s odstraněným klíčem;
+  * kategorii (symbol nenalezen, tarif, API klíč, limit dotazů, výpadek serveru, připojení, timeout, neplatná
+    odpověď, nedostatek dat);
+  * doporučený další krok.
+
+  Kategorii aplikace uvede jen tehdy, když ji potvrzuje odpověď. Jinak napíše „příčina nepotvrzena
+  odpovědí poskytovatele“.
+* Detail analýzy ukazuje pro každý interval řádek „Zdroj dat: Twelve Data | Symbol: XAG/USD | Interval: 5min |
+  Stav: …“.
+* Aplikace si lokálně pamatuje, které symboly a intervaly fungovaly (`availability.json`). Úspěch platí 7 dní,
+  chyba 1 den, a dočasné chyby symbol neoznačí jako nedostupný. Po rozpoznání instrumentu se stav zobrazí
+  **bez síťového dotazu**.
+* **Nastavení → Ověřit dostupnost dat** (aktuální instrument) zkontroluje katalog symbolů, po 2 svíčkách pro
+  5min, 15min a 1h a tarif API. Jde o 4–5 dotazů a běží mimo hlavní vlákno. Výsledek neobsahuje API klíč a lze
+  ho zkopírovat.
+* Aplikace nikdy nepřijme jiný symbol, než o jaký požádala. Stříbro se nenahrazuje futures ani jiným produktem;
+  bez dat zůstává NO DATA.
+
+**Prosím ověřte na svém počítači:** v aplikaci zvolte Silver, otevřete Nastavení → Ověřit dostupnost dat
+a pošlete mi výsledný text. Případně spusťte `python scripts/td_probe.py XAG/USD` s nastavenou proměnnou
+`TWELVEDATA_API_KEY`. Text ukáže přesnou odpověď Twelve Data pro každý interval i kategorii tarifu.
+
+Kontrolu s klíčem lze spouštět i v CI: nastavte v GitHubu secret `TWELVEDATA_API_KEY` (Settings → Secrets and
+variables → Actions). GitHub ho v logu maskuje a skript ho nevypisuje.
+
+**Alternativní zdroj stříbra** se přidá jen tehdy, když se potvrdí, že Twelve Data XAG/USD ve vašem tarifu
+neposkytuje. Musí jít o legální zdroj spotového stříbra se známým původem a zpožděním a se zřetelným
+označením zdroje v aplikaci. Do té doby zůstává NO DATA.
+
 ## Výzkumný backtest (verze 2.2)
 
 Cílem verze 2.2 není víc signálů, ale **ověřit, zda strategie má po nákladech obchodní výhodu**. Výsledky
