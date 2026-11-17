@@ -76,8 +76,8 @@ jobs:
           key: dukascopy-${{ steps.month.outputs.month }}-${{ github.run_id }}
           restore-keys: dukascopy-
       - name: v2.2 research backtest on real historical prices (12 months, informational, network)
-        # only on the research branch (or manual runs): other branches must not compete for the data feed
-        if: github.ref_name == 'v2.2-research-backtest' || github.event_name == 'workflow_dispatch'
+        # manual runs only: the Dukascopy feed throttles GitHub runners (HTTP 503 / timeouts, 54 files in 42 min)
+        if: github.event_name == 'workflow_dispatch'
         continue-on-error: true
         timeout-minutes: 60
         env:

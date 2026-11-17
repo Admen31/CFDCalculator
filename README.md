@@ -349,8 +349,32 @@ a `--calendar-coverage pokryti.csv`. Výstupem je `research/report/report.html` 
 * `folds.csv`, `sensitivity.csv`;
 * `data.csv` s původem a otiskem dat.
 
-V CI se výzkum spouští automaticky a výsledek je v artefaktu `research-report`. Tlačítko **Backtest**
-v aplikaci počítá stejný protokol na 5000 svíčkách z Twelve Data.
+Tlačítko **Backtest** v aplikaci počítá stejný protokol na 5000 svíčkách z Twelve Data.
+
+### Stav výsledků (17. 11. 2026): 12měsíční test zatím NEPROVEDEN
+
+* **Dukascopy v GitHub Actions nefunguje.** Datový zdroj servery GitHubu fakticky blokuje: za 42 minut vydal
+  jen 54 souborů a všechny 4 zkoušené instrumenty skončily na HTTP 503 nebo chybě připojení, i se zdvořilým
+  tempem a čekáním mezi pokusy. Výzkum se proto v CI spouští **jen ručně** (workflow_dispatch).
+* **Proběhl jen test akcií z Yahoo (60 dní).** V závěrečném testu měly 1–5 obchodů na akcii (AAPL 2, MSFT 1,
+  NVDA 5, TSLA 2). U žádné nelze výhodu prokázat ani vyloučit; vzorek je statisticky bezcenný.
+* **Na otázku, zda má strategie po nákladech kladné očekávání na nezávislých datech, zatím rozhodující odpověď
+  nemáme.** Dosavadní údaje (v2.1 na Yahoo za 2,5 měsíce: PF 0,99 a −0,6 R po nákladech u 153 obchodů) výhodu
+  **nepodporují**.
+
+### Spuštění 12měsíčního testu na vlastním počítači
+
+Z domácího připojení Dukascopy obvykle data vydává. Ve složce projektu spusťte:
+
+```bat
+python -m pip install -e .
+python scripts/research.py --months 12 --import-minutes 240 --out research\report
+```
+
+* Stahuje se jeden soubor za druhým, zhruba 600 dotazů na instrument (asi 6–10 min na instrument).
+* Přerušený běh lze spustit znovu a pokračuje z mezipaměti (`research\cache`).
+* Výsledek je v `research\report\report.html` a v CSV souborech. Neobsahují API klíč a lze je poslat
+  k vyhodnocení. Stažená data ze složky `research\` se nepublikují.
 
 ## Předpoklady a omezení (neověřeno proti živému API)
 
