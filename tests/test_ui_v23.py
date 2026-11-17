@@ -55,6 +55,7 @@ def test_watch_and_bias_pills(app, make, monkeypatch, still):  # noqa: F811
 
 def test_reduced_motion_jumps_to_final_values(app, still):  # noqa: F811
     g = widgets.Gauge()
+    assert g.target == 0                      # Windows with animations off: no animation has ever run (was a crash)
     g.show_state(60, "60 %", "x", widgets.GREEN, busy=True)
     assert g._pct == 60 and g._color.name() == widgets.GREEN and g._spinner.state().name == "Stopped"
 

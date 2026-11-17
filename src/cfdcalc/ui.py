@@ -576,7 +576,8 @@ def view(r: Result) -> dict:
     out = {"strategy": "", "waiting": "", "bias": None, "opportunity": None}
     if r.bias:
         out["bias"] = (r.bias.direction, "Směr trhu (není pokyn k obchodu): "
-                       + (f"{r.bias.strength}, " if r.bias.strength else "") + "; ".join(r.bias.parts))
+                       + (f"{r.bias.strength}, " if r.bias.strength else "") + "; ".join(r.bias.parts)
+                       + f"\n{st.BIAS_NOTE}")
     o = r.opportunity
     if r.verdict in (BUY, SELL):
         validated = r.strategy != st.NAMES["v21"]
@@ -589,7 +590,8 @@ def view(r: Result) -> dict:
         out["strategy"] = "Strategie: žádné aktivní nastavení"
     if o:
         rr = f", R:R 1:{o.rr:.1f}" if o.rr else ""
-        tip = f"{o.name}: {o.detail}" + (f" ({o.risk_note})" if o.risk_note else "")
+        tip = (f"{o.name}: {o.detail}" + (f" ({o.risk_note})" if o.risk_note else "")
+               + f"\nOvěření: {st.RESEARCH_NOTE.get(o.key, '')}")
         if o.state == "watch":
             out["opportunity"] = (OPP_TEXT["watch"], YELLOW, tip)
         elif o.state == "trigger" and r.verdict in (BUY, SELL) and o.validated:
@@ -607,7 +609,7 @@ def view(r: Result) -> dict:
         out["waiting"] = "Čeká se na: " + "; ".join(o.missing)
     elif o and o.state == "trigger":
         out["waiting"] = ("Nastavení splněno, ale " + o.risk_note) if o.blocked else (
-            "Nastavení splněno – výzkumná strategie, NENÍ potvrzený signál (neprošla ověřením na historii).")
+            "Nastavení splněno – výzkumná strategie, NENÍ potvrzený signál (v testu po nákladech ztrátová).")
     elif o and o.state == "invalid":
         out["waiting"] = f"Nastavení zaniklo: {o.detail}"
     else:
@@ -625,7 +627,8 @@ def detail_extra(r: Result, ocr_ms: float | None) -> str:
         b = r.bias
         parts.append(f"<p><b>Market bias: <span style='color:{BIAS_COLORS[b.direction]}'>{esc(b.direction)}</span>"
                      f"</b> (skóre {b.score:+d}{', ' + esc(b.strength) if b.strength else ''}) – popis směru, "
-                     "ne pokyn k obchodu<br>" + "<br>".join(f"• {esc(x)}" for x in b.parts) + "</p>")
+                     "ne pokyn k obchodu<br>" + "<br>".join(f"• {esc(x)}" for x in b.parts)
+                     + f"<br><i>{esc(st.BIAS_NOTE)}</i></p>")
     if r.setups:
         rows = []
         for s in r.setups:
@@ -639,6 +642,7 @@ def detail_extra(r: Result, ocr_ms: float | None) -> str:
                 line += (f"<br>&nbsp;&nbsp;vstup {s.entry:.6g} · SL {s.sl:.6g} · TP {s.tp:.6g} · R:R 1:{s.rr:.1f}")
             if s.risk_note:
                 line += f"<br>&nbsp;&nbsp;{esc(s.risk_note)}"
+            line += f"<br>&nbsp;&nbsp;<i>Ověření: {esc(st.RESEARCH_NOTE.get(s.key, ''))}</i>"
             rows.append(line)
         parts.append("<p><b>Obchodní nastavení</b><br>" + "<br>".join(rows) + "</p>")
     times = dict(r.timings)

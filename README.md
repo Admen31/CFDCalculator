@@ -2,7 +2,8 @@
 
 Malá desktopová aplikace pro Windows, kterou lze nechat nad Trading 212. Rozpozná zvolený instrument
 z vybrané oblasti obrazovky, stáhne svíčky z Twelve Data a vrátí **BUY / SELL / WAIT** s vysvětlením
-a návrhem stop-lossu a take-profitu.
+a návrhem stop-lossu a take-profitu. Od verze 2.3 navíc ukazuje **MARKET BIAS** (směr trhu) a **WATCH**
+(blížící se obchodní nastavení s tím, co přesně chybí).
 
 **Aplikace nikdy nezadává obchody.** Neobsahuje žádné napojení na broker, obchod zadáváte ručně.
 Výsledky nejsou investiční doporučení a ziskovost strategie není ověřena.
@@ -49,6 +50,112 @@ Požadavky: Windows 10/11, Python ≥ 3.12. OCR (RapidOCR) běží offline, nic 
 * OCR model se načítá na pozadí hned po zobrazení okna. START použije čtení Trading 212, které právě běží,
   místo aby čekal ve frontě. Čtení, které visí déle než 8 s, START neblokuje.
 * Při zavření okna se pracovní vlákna bezpečně ukončí.
+
+## Verze 2.3: market bias, WATCH a barevné rozhraní
+
+Přehled změn je v [CHANGELOG.md](CHANGELOG.md), úplný výzkumný report v
+[docs/v23-laborator-2026-11-17.md](docs/v23-laborator-2026-11-17.md).
+
+### Co ukazuje výsledkový panel
+
+| Řádek | Význam |
+|---|---|
+| **Instrument** | název, symbol a profil trhu |
+| **BIAS** ▲ BULLISH / ▼ BEARISH / ● NEUTRAL | převládající směr: trend 1h (váha 2), struktura EMA 15m a momentum 5m. **Popis, ne pokyn k obchodu.** |
+| **PŘÍLEŽITOST** ◆ WATCH / ◆ SETUP SPLNĚN · VÝZKUM / ✕ ZANIKLO | nejzajímavější z nastavení TREND PULLBACK, BREAKOUT a MEAN REVERSION |
+| **POTVRZENÝ SIGNÁL** ▲ BUY / ▼ SELL / ■ WAIT / ○ NO DATA / ⚠ ERROR | jediný řádek, který je obchodním signálem |
+| **Strategie** | pravidla, ze kterých signál nebo nastavení pochází, a zda jde o výzkum |
+| **Důvod** a **Čeká se na** | proč WAIT a co přesně musí nastat (cena, svíčka, indikátor). U platného signálu se místo toho ukáže vstup, SL, TP a R:R. |
+| filtry, čas dat | 10 bezpečnostních filtrů (✓ / ✗ / –), čas poslední uzavřené svíčky a analýzy |
+
+Ukázka (ilustrační, ne doporučení): BIAS ▼ BEARISH · PŘÍLEŽITOST ◆ WATCH · POTVRZENÝ SIGNÁL ■ WAIT ·
+Strategie: TREND PULLBACK · potenciálně SELL · výzkum · Čeká se na: dotek vstupní zóny 1.0850–1.0856; potom
+uzavření 5m svíčky zpět ve směru trendu.
+
+### Kdy je BUY/SELL potvrzený
+
+* BUY/SELL dál vydávají **pravidla v2.1** („SHODA TRENDU (v2.1)“). Nejsou změněná a nejsou snížené prahy.
+* Nová strategie smí vydat BUY/SELL jen tehdy, když projde předem stanoveným testem mimo vzorek (seznam
+  `strategies.VALIDATED`). Podmínky testu: souhrnně ≥ 100 obchodů v závěrečném testu, dolní mez 95% intervalu
+  ⌀ R po nákladech > 0, p × 3 < 0,05, kladná validace, ≥ 4/6 kladných walk-forward úseků a lepší výsledek než
+  náhodné vstupy.
+* **Žádná ze tří strategií test neprošla, proto jsou všechny jen ve výzkumném režimu.** Jejich splněné nastavení
+  se ukazuje žlutě jako „SETUP SPLNĚN · VÝZKUM“ s textem „NENÍ potvrzený signál“. Výsledek testu je vidět v detailu
+  i v nápovědě štítku.
+* I splněné nastavení blokují stejné filtry jako v2.1: spread, časový limit, zprávy, volatilita a platný SL.
+
+### Tři strategie (parametry pevné, stanovené před testem)
+
+* **TREND PULLBACK**: trend 1h a 15m souhlasí, momentum 5m se vrátí přes 50 a cena se dotkne zóny EMA20 (15m)
+  ± 0,25 ATR. Vstup po uzavření 5m nad EMA20 (5m) a nad maximem předchozí svíčky s MACD ve směru trendu.
+  SL za extrémem korekce, TP 2R. Zanikne zavřením za EMA50 (15m).
+* **BREAKOUT**: konsolidace 2 h s rozpětím ≤ 2 ATR(15m). Vstup po zavření 0,1 ATR za hranou se silným tělem svíčky
+  a, kde jsou objemy, s objemem ≥ 1,2× průměru. Nikdy proti trendu 1h. Bez objemu se ukáže varování před falešným
+  průrazem. SL ve středu pásma, TP 2R.
+* **MEAN REVERSION**: jen bez silného trendu (rozdíl EMA 1h < 0,5 ATR 1h). Zavření mimo Bollingerovo pásmo
+  (20, 2) s RSI pod 30 / nad 70, pak návratová svíčka. Cíl je průměr 20 svíček; obchod s R:R < 1 se zahodí.
+
+### Proč v2.1 tak často vrací WAIT (diagnostika na reálných datech)
+
+Data: Yahoo Finance 25.08.–17.11.2026, 10 instrumentů (EUR/USD, GBP/USD, USD/JPY, zlato, stříbro a ropa jako
+futures, AAPL, NVDA, MSFT, TSLA), 107 522 rozhodnutí, náklady jako v backtestu 2.2.
+
+* Výsledky: BUY 0,8 %, SELL 1,4 %, **WAIT 91,5 %**, NO DATA 6,4 % (hlavně začátek dat a víkendy), ERROR 0 %.
+* Nejčastěji blokuje **Prostor k cíli** (73,6 % WAIT, rezistence/support blíž než 2R), **Shoda indikátorů** (62,4 %),
+  **Trend 1h** (16,3 %), spread (15,7 %, hlavně GBP/USD a EUR/USD) a časový limit (15,8 %).
+* **Jsou podmínky zbytečně přísné?** Pro každou podmínku jsme spočítali, jak by dopadl obchod v situacích, kdy
+  blokovala jen ona (vstup na další svíčce, plné náklady):
+
+  | jediná blokující podmínka | hypotetické obchody | ⌀ R po nákladech |
+  |---|---|---|
+  | Shoda indikátorů | 4 863 | −0,16 |
+  | RSI extrém | 1 781 | −0,11 |
+  | Prostor k cíli | 10 998 | −0,06 |
+  | Spread | 432 | −0,01 |
+  | *obchody, které v2.1 skutečně vydala* | 2 317 | −0,11 |
+
+  Žádná podmínka neblokuje obchody, které by vycházely kladně. Jejich uvolnění by přidalo BUY/SELL, ale se zápornou
+  očekávanou hodnotou. Proto prahy **nesnižujeme**. (Hypotetické obchody sousedních svíček se překrývají, jde o popis
+  filtru, ne o nezávislé vzorky.)
+* **Jasný směr a přesto WAIT:** v 22 627 rozhodnutích se všechny tři části biasu shodly. V 90 % z nich zůstal WAIT,
+  hlavně kvůli prostoru k cíli a RSI extrému. Bias ale ex post nemá predikční sílu: cena byla o hodinu později
+  ve směru biasu jen v 48 % případů. „Jasný směr“ tedy sám o sobě obchod neopravňuje.
+* **Podle trhu a režimu:** BUY/SELL se nejčastěji objevuje u komodit a forexu v trendu (3–4 %), nejméně u akcií bez
+  trendu (0,4 %). Akcie mají 4–5× méně svíček (jen burzovní hodiny).
+* **Co se změnilo pro uživatele:** WAIT už není „prázdný“. WATCH nebo splněné nastavení se objeví v 41 % rozhodnutí
+  a panel vždy říká, na co se čeká.
+
+### Výsledky strategií (stejná data, rozdělení 50/25/25, 6 úseků)
+
+| strategie | závěrečný test | 95% interval ⌀ R | kladné úseky | stav |
+|---|---|---|---|---|
+| v2.1 (původní) | 118 obch., PF 1,07, ⌀ +0,04 R | −0,20 … +0,29 | 2/6 | beze změny, bez důkazu výhody |
+| TREND PULLBACK | 192 obch., PF 0,89, ⌀ −0,07 R | −0,24 … +0,12 | 0/6 | VÝZKUM |
+| BREAKOUT | 100 obch., PF 0,93, ⌀ −0,05 R | −0,30 … +0,21 | 2/6 | VÝZKUM |
+| MEAN REVERSION | 45 obch., PF 0,49, ⌀ −0,35 R | −0,64 … −0,04 | 0/6 | VÝZKUM |
+| náhodné vstupy | 85 obch., PF 0,43, ⌀ −0,39 R | −0,59 … −0,16 | 0/6 | srovnání |
+
+Všechny strategie jsou lepší než náhodné vstupy, ale žádná neprokázala kladnou očekávanou hodnotu po nákladech.
+Mean reversion je v testu prokazatelně ztrátová. Data nejsou ceny Trading 212 a filtr zpráv nebyl testován
+(chybí historický kalendář). Laboratoř se v CI spouští při každém pushi (`scripts/strategy_lab.py`, artefakt
+`strategy-lab`).
+
+### Rychlost
+
+* Tři časové rámce se stahují současně. Při simulované latenci 400 ms na dotaz trvá analýza ~0,4 s místo ~1,2 s
+  ve v2.2.1.
+* Cache svíček na celou relaci: opakovaná analýza ve stejné 5min periodě se obejde bez dotazu (~3 ms).
+  Hodinové a 15min svíčky se znovu stahují jen tehdy, když mohla vzniknout nová uzavřená svíčka.
+* Ochrana limitu Twelve Data (výchozí 8 dotazů za minutu, **⚙ Nastavení → Limit Twelve Data**).
+* Výpočet indikátorů a všech strategií trvá jednotky ms. Animace výsledek nikdy nezdržují.
+* Doby OCR, stahování jednotlivých rámců, kalendáře a výpočtu ukazuje **Detail → Měření**.
+
+### Barvy a přístupnost
+
+Zelená `#22C55E` = BUY / BULLISH / splněno, červená `#EF4444` = SELL / BEARISH / zamítnuto, žlutá `#FACC15` =
+WAIT / WATCH / upozornění. Každý stav má i ikonu a slovo. **ERROR** má čárkovaný kruh i rámeček a ikonu ⚠, takže se
+nedá splést se SELL. Karta výsledku se jemně podbarví a dlaždice indikátorů mají barevný proužek podle role.
+**⚙ Nastavení → Omezit animace** (výchozí podle Windows „Zobrazovat animace“) vypne přechody i točící se segment.
 
 ## Automatické rozpoznávání Trading 212 (od verze 2.0)
 

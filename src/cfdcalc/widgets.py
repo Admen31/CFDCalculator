@@ -108,7 +108,8 @@ class Gauge(QWidget):
     @property
     def target(self) -> float:
         """The percentage the ring is heading to (the real value; the drawn one may still be animating)."""
-        return float(self._pct_anim.endValue()) if self._pct_anim.state() else self._pct
+        running = self._pct_anim.state() == QPropertyAnimation.State.Running
+        return float(self._pct_anim.endValue()) if running else self._pct
 
     def show_state(self, pct: float, title: str, sub: str, color: str = ACCENT, busy: bool = False):
         _go(self._pct_anim, self._pct, float(pct))

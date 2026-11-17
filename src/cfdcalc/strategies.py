@@ -30,6 +30,17 @@ ORDER = (PULLBACK, BREAKOUT, MEANREV)
 # out-of-sample test (README "v2.3 – výsledky"); empty = every new strategy is research only.
 VALIDATED: frozenset[str] = frozenset()
 
+# Result of the out-of-sample test (scripts/strategy_lab.py, Yahoo 25.08.-17.11.2026, 10 instruments, after costs;
+# docs/v23-laborator-2026-11-17.md). Shown next to every setup so a WATCH is never mistaken for a proven edge.
+RESEARCH_NOTE = {
+    PULLBACK: "neověřeno – závěrečný test 192 obchodů, ⌀ −0,07 R po nákladech, 0/6 kladných úseků",
+    BREAKOUT: "neověřeno – závěrečný test 100 obchodů, ⌀ −0,05 R po nákladech, 2/6 kladných úseků",
+    MEANREV: "neověřeno – závěrečný test 45 obchodů, ⌀ −0,35 R po nákladech, 0/6 kladných úseků",
+    "v21": "pravidla v2.1 – závěrečný test 118 obchodů, ⌀ +0,04 R, 95% interval −0,20 … +0,29 R (bez důkazu výhody)",
+}
+BIAS_NOTE = ("bias je popis, ne předpověď: ex post byla cena o hodinu později ve směru biasu v 48 % případů "
+             "(10 instrumentů, 25.08.–17.11.2026)")
+
 TP_R = 2.0                 # target for pullback and breakout (R multiples)
 MIN_SL_ATR, MAX_SL_ATR = 0.5, 2.5    # sensible stop distance, in ATR(15m)
 MAX_SPREAD_OF_SL = 0.15
