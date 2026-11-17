@@ -197,6 +197,52 @@ u SL/TP ukazuje i vzdálenost od vstupu, kterou přenesete k ceně v T212.
 **Vyšší počet signálů sám o sobě neznamená lepší strategii.** O tom rozhodují výsledky v testovací části po
 nákladech, a i ty jsou na krátkém období jen orientační.
 
+### Výsledky porovnání na reálných datech (17. 11. 2026)
+
+**Podmínky testu**
+
+* Data: Yahoo Finance, 5m/15m za 60 dní (akcie a forex 24.–25. 8. až 16.–17. 11. 2026, zlato a ropa jako
+  futures GC=F/CL=F od 9. 9.), 1h za rok.
+* Instrumenty: AAPL, NVDA, MSFT, TSLA, EUR/USD, GBP/USD, USD/JPY, zlato, WTI.
+* Nastavení: bez filtru zpráv; spread 1× za obchod; modelované náklady navíc 0,5× spread; rozdělení 60 % vývoj
+  a 40 % test.
+* Úplná tabulka po instrumentech je v [docs/porovnani-2026-11-17.md](docs/porovnani-2026-11-17.md).
+
+**Souhrn všech instrumentů po spreadu a modelovaných nákladech**
+
+| pravidla | část | obchodů | zisk. | profit factor | ⌀ R | Σ R | max. pokles |
+|---|---|---|---|---|---|---|---|
+| v2.0 | vývoj | 186 | 35 % | 0,78 | −0,15 | −27,3 | 28,8 R |
+| v2.0 | test | 151 | 39 % | 0,96 | −0,03 | −4,0 | 21,8 R |
+| v2.1 | vývoj | 196 | 35 % | 0,76 | −0,16 | −32,0 | 33,9 R |
+| v2.1 | test | 153 | 41 % | 0,99 | −0,00 | −0,6 | 20,8 R |
+
+**Výsledky všech vyhodnocených svíček**
+
+| pravidla | BUY | SELL | WAIT | NO DATA | ERROR |
+|---|---|---|---|---|---|
+| v2.0 | 717 | 1 178 | 84 146 | 8 027 | 0 |
+| v2.1 | 743 | 1 194 | 86 304 | 5 827 | 0 |
+
+**Co z toho plyne**
+
+* **Žádná z verzí nemá po nákladech prokázanou výhodu.** Profit factor je pod 1 nebo těsně u 1 ve vývojové
+  i testovací části. Rozdíly mezi v2.0 a v2.1 jsou v mezích náhody: v testu je v2.1 o něco lepší, ve vývoji
+  o něco horší.
+* **Forex a komodity mají ve v2.0 i v2.1 přesně stejné výsledky.** Pravidlo „jednomyslnosti“ se v praxi
+  neprojevilo, protože RSI ani MACD téměř nikdy nejsou přesně neutrální. Změna pravidla tedy počet signálů
+  nezvýšila. Je jen konzistentní.
+* **U akcií v2.1 odstranila falešné „zastaralé“ údaje po otevření burzy.** NO DATA v testu kleslo z 242 na 0
+  na akcii a signály jsou možné do 20:45 místo 20:00. Obchodů je ale málo (2–8 na akcii a část), takže výsledky
+  akcií jsou statisticky bezcenné.
+* **Hlavní důvody WAIT jsou legitimní tržní situace,** ne chyba konstrukce:
+  * indikátory nesouhlasí s trendem 1h (u v2.1 „Shoda indikátorů“ asi 54 tis. svíček);
+  * graf je bez trendu (asi 14 tis.);
+  * rezistence nebo support je blíž než cíl 2R (asi 14 tis.);
+  * překoupeno nebo přeprodáno (asi 3 tis.).
+* **Ceny Yahoo nejsou ceny CFD v Trading 212.** Zlato a ropa jsou futures, období je krátké a test nemá filtr
+  zpráv. Výsledky proto berte jako **orientační, neověřené pro reálné obchodování**.
+
 ## Předpoklady a omezení (neověřeno proti živému API)
 
 Vývojové prostředí nemělo přístup k api.twelvedata.com. Proti skutečnému API se tedy neověřovalo následující:
