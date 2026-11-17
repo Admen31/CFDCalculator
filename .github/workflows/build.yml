@@ -3,7 +3,7 @@ name: CFD Signal Calculator
 on:
   push:
     branches: [main, "v2.0-auto-recognition", "v2.1-signal-and-smooth-ui", "v2.2-research-backtest",
-               "v2.2.1-xagusd-data-fix"]
+               "v2.2.1-xagusd-data-fix", "v2.3-smart-signals-color-ui"]
   pull_request:
   workflow_dispatch:
 
@@ -53,6 +53,20 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
         run: python scripts/compare_strategies.py --out comparison.md
+      - name: v2.3 strategy lab - WAIT diagnostics and out-of-sample test of the new strategies (network)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 40
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python scripts/strategy_lab.py --out lab --workers 4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: strategy-lab
+          path: lab
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Build EXE (PyInstaller, folder build)
         run: pyinstaller --noconfirm --clean --windowed --name "CFD Signal Calculator" --collect-all rapidocr_onnxruntime --paths src src/cfdcalc/__main__.py
       - name: EXE starts and keeps running

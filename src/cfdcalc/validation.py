@@ -152,3 +152,71 @@ def research(m: Market, costs: Costs, cfg: Settings = DEFAULTS, progress=lambda 
                                 if base.trades else 0.0)
     out["params"] = BASE
     return out
+
+
+# ---------------------------------------------------------------- v2.3: new strategies, pre-registered promotion
+
+STRATEGY_KEYS = ("pullback", "breakout", "meanrev")
+NEW_CONFIGS = len(STRATEGY_KEYS)            # Bonferroni factor: three new strategies, parameters fixed in advance
+PROMOTION = ("souhrnně přes instrumenty na závěrečném testu: ≥ 100 obchodů, dolní mez 95% intervalu ⌀ R po "
+             "nákladech > 0, p × 3 < 0,05, ⌀ R na validaci > 0, ≥ 4 ze 6 walk-forward úseků s ⌀ R > 0 "
+             "a lepší než náhodné vstupy")
+
+
+def strategy_study(m: Market, costs: Costs, cfg: Settings = DEFAULTS, progress=lambda msg: None) -> dict:
+    """v2.1, the three v2.3 strategies and a random-entry benchmark on one instrument, same periods and costs."""
+    from .strategies import backtest_strategy
+    times = [b.t for b in m.mid5]
+    p = periods(times[249:]) if len(times) > 600 else periods(times)
+    runs = {}
+    progress(f"{m.inst.symbol}: v2.1")
+    runs["v2.1"] = run(m, v21, "v2.1", costs, cfg)
+    for key in STRATEGY_KEYS:
+        progress(f"{m.inst.symbol}: {key}")
+        runs[key] = run(m, backtest_strategy(key), key, costs, cfg)
+    with_data = sum(1 for _, v, _ in runs["v2.1"].outcomes if v != NO_DATA) or 1
+    rate = mean(len(runs[k].trades) for k in STRATEGY_KEYS) / with_data
+    runs["náhodný"] = run(m, RandomEntries(rate, SEED ^ zlib.crc32(m.inst.symbol.encode())), "náhodný", costs, cfg)
+    out = {"symbol": m.inst.symbol, "name": m.inst.name, "kind": m.inst.kind, "periods": p, "runs": runs}
+    out["parts"] = {k: {part: summarize(r, p, part) for part in PARTS} | {"celkem": summarize(r, p)}
+                    for k, r in runs.items()}
+    fl = folds(p)
+    out["folds"] = {k: [_net([t for t in r.trades if a <= t.signal_time < b]) for a, b in fl] for k, r in runs.items()}
+    out["by_regime"] = {k: {g: metrics(rs) for g, rs in sorted(_group(r.trades).items())} for k, r in runs.items()}
+    return out
+
+
+def _group(trades: list[Trade]) -> dict[str, list[float]]:
+    g = defaultdict(list)
+    for t in trades:
+        g[f"{t.regime} / volatilita {t.volatility}"].append(t.net_r)
+    return g
+
+
+def promotion(studies: list[dict]) -> dict:
+    """Pooled out-of-sample verdict per strategy (the only way a strategy may leave research mode)."""
+    out = {}
+    for key in ("v2.1",) + STRATEGY_KEYS + ("náhodný",):
+        def pool(part, key=key):
+            return [t.net_r for s in studies for t in s["runs"][key].trades
+                    if t.net_r is not None and s["periods"].part(t.signal_time) == part]
+        test, val = pool("test"), pool("validace")
+        folds_ = [sum((s["folds"][key][n] for s in studies), []) for n in range(6)]
+        positive = sum(1 for f in folds_ if f and mean(f) > 0)
+        ci = bootstrap(test)
+        p_adj = None if ci["p"] is None else min(1.0, ci["p"] * NEW_CONFIGS)
+        out[key] = {"test": metrics(test), "validation": metrics(val), "ci": ci, "p_adjusted": p_adj,
+                    "folds_positive": positive, "folds": [metrics(f) for f in folds_],
+                    "by_instrument": {s["symbol"]: s["parts"][key]["test"]["net"] for s in studies}}
+    rnd = out["náhodný"]["test"]["exp"]
+    for key in STRATEGY_KEYS:
+        o = out[key]
+        checks = {"≥ 100 obchodů v testu": o["test"]["n"] >= 100,
+                  "dolní mez intervalu > 0": o["ci"]["lo"] is not None and o["ci"]["lo"] > 0,
+                  "p × 3 < 0,05": o["p_adjusted"] is not None and o["p_adjusted"] < 0.05,
+                  "validace ⌀ R > 0": (o["validation"]["exp"] or 0) > 0,
+                  "≥ 4/6 úseků kladných": o["folds_positive"] >= 4,
+                  "lepší než náhodné vstupy": o["test"]["exp"] is not None and (rnd is None or o["test"]["exp"] > rnd)}
+        o["checks"] = checks
+        o["validated"] = all(checks.values())
+    return out

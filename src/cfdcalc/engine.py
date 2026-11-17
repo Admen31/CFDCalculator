@@ -150,16 +150,28 @@ def _regime(s15: list[Bar], s1: list[Bar]) -> tuple[str, str]:
     return trend, vol
 
 
-def run(m: Market, strategy: Callable, name: str, costs: Costs, cfg: Settings = DEFAULTS,
-        params: Params = BASE, start: datetime | None = None, end: datetime | None = None,
-        progress: Callable[[int, int], None] = lambda *_: None) -> Run:
-    out = Run(name, params)
+@dataclass
+class Window:
+    """What a strategy may see at decision time `now` (close of 5m bar i): validated closed bars only."""
+    i: int
+    now: datetime
+    s5: list[Bar]
+    s15: list[Bar]
+    s1: list[Bar]
+    problem: str | None
+    spread: float
+    events: list
+    tested: bool
+
+
+def windows(m: Market, costs: Costs, start: datetime | None = None, end: datetime | None = None,
+            progress: Callable[[int, int], None] = lambda *_: None):
+    """Walk the 5m bars and yield one Window per decision time (shared by run() and the WAIT diagnostics)."""
     inst = m.inst
     t5, t15, t1 = [b.t for b in m.mid5], [b.t for b in m.mid15], [b.t for b in m.mid1h]
     bid = {b.t: b for b in m.bid5} if m.bid5 else None
     ask = {b.t: b for b in m.ask5} if m.ask5 else None
     severe = m.severe
-    busy_until: datetime | None = None
     lo = max(NEED - 1, bisect_left(t5, start) if start else 0)
     hi = bisect_left(t5, end) if end else len(m.mid5) - 1
     hi = min(hi, len(m.mid5) - 1)            # the last bar has no next bar to enter on
@@ -180,15 +192,32 @@ def run(m: Market, strategy: Callable, name: str, costs: Costs, cfg: Settings = 
             q = bisect_left(severe, first)
             if q < len(severe) and severe[q] <= now:
                 problem = f"kvalita dat: problém {severe[q]:%Y-%m-%d %H:%M} v okně"
-        if problem:
-            out.outcomes.append((now, NO_DATA, problem.split(" – ")[0]))
-            continue
         spread = costs.spread_floor
         if bid is not None and t5[i] in bid and t5[i] in ask:
             spread = max(costs.spread_floor, ask[t5[i]].c - bid[t5[i]].c)
         tested = m.news_covered(now)
-        events = m.events(now) if (m.events and tested) else []
-        r = strategy(inst, s5, s15, s1, events, spread, now, cfg, params)
+        events = m.events(now) if (m.events and tested and not problem) else []
+        yield Window(i, now, s5, s15, s1, problem, spread, events, tested)
+    progress(n, n)
+
+
+def quotes(m: Market) -> tuple[dict | None, dict | None]:
+    return ({b.t: b for b in m.bid5} if m.bid5 else None), ({b.t: b for b in m.ask5} if m.ask5 else None)
+
+
+def run(m: Market, strategy: Callable, name: str, costs: Costs, cfg: Settings = DEFAULTS,
+        params: Params = BASE, start: datetime | None = None, end: datetime | None = None,
+        progress: Callable[[int, int], None] = lambda *_: None) -> Run:
+    out = Run(name, params)
+    inst = m.inst
+    bid, ask = quotes(m)
+    busy_until: datetime | None = None
+    for w in windows(m, costs, start, end, progress):
+        now = w.now
+        if w.problem:
+            out.outcomes.append((now, NO_DATA, w.problem.split(" – ")[0]))
+            continue
+        r = strategy(inst, w.s5, w.s15, w.s1, w.events, w.spread, now, cfg, params)
         out.outcomes.append((now, r.verdict, "" if r.verdict in (BUY, SELL) else _reason_key(r.reasons[0] if
                                                                                           r.reasons else "")))
         if r.verdict not in (BUY, SELL) or r.sl is None or r.tp is None:
@@ -196,15 +225,14 @@ def run(m: Market, strategy: Callable, name: str, costs: Costs, cfg: Settings = 
         if busy_until and now < busy_until:
             out.rejected.append((now, r.verdict, "pozice je otevřená"))
             continue
-        trade = _execute(m, i, r, now, costs, cfg, name, bid, ask)
+        trade = _execute(m, w.i, r, now, costs, cfg, name, bid, ask)
         if isinstance(trade, str):
             out.rejected.append((now, r.verdict, trade))
             continue
-        trade.regime, trade.volatility = _regime(s15, s1)
-        trade.news_tested = tested
+        trade.regime, trade.volatility = _regime(w.s15, w.s1)
+        trade.news_tested = w.tested
         out.trades.append(trade)
         busy_until = trade.exit_time or datetime.max.replace(tzinfo=timezone.utc)
-    progress(n, n)
     return out
 
 

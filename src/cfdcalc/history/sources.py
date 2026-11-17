@@ -181,7 +181,8 @@ def dukascopy(symbol: str, start: datetime, end: datetime, http: Http,
 
 YAHOO = {"AAPL": ("AAPL", "stock"), "NVDA": ("NVDA", "stock"), "MSFT": ("MSFT", "stock"), "TSLA": ("TSLA", "stock"),
          "EUR/USD": ("EURUSD=X", "spot"), "GBP/USD": ("GBPUSD=X", "spot"), "USD/JPY": ("JPY=X", "spot"),
-         "XAU/USD": ("GC=F", "futures"), "WTI/USD": ("CL=F", "futures")}
+         "XAU/USD": ("GC=F", "futures"), "WTI/USD": ("CL=F", "futures"),
+         "XAG/USD": ("SI=F", "futures")}   # research proxy only - the app never substitutes silver
 
 
 def yahoo(symbol: str, interval: str, http: Http) -> Fetched:
