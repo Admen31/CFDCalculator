@@ -91,7 +91,7 @@ Automatické testy (GitHub Actions, Windows) ověřují skutečné hledání okn
 s titulkem „Trading 212“. Se skutečným Trading 212 jsem to ověřit nemohl. Prosím projděte:
 
 1. Trading 212 v prohlížeči (Chrome/Edge), instrument NVIDIA → AUTO → ▭ označit název → stav ukáže
-   „vidím NVIDIA“.
+   „Vidím NVIDIA“.
 2. Přepněte v Trading 212 na EUR/USD → do ~5 s se nahoře objeví EUR/USD. Případný předchozí výsledek je
    HISTORICKÝ.
 3. Kalkulačku posuňte přes okno Trading 212 (ne přes označený název) → rozpoznávání dál funguje.

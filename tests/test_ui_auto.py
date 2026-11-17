@@ -80,10 +80,11 @@ def test_auto_recognises_without_marking_the_screen_again(app, make):
     w = make(reader)
     ticks(app, w)
     assert w.inst.symbol == "NVDA" and "NVDA" in w.bar.name.text()
-    assert "vidím NVIDIA" in w.bar.status.text()
+    assert "Vidím NVIDIA" in w.bar.status.text()
     reader.set("EUR/USD", "1.0845")      # user switches Trading 212 to another instrument
     ticks(app, w, 1)
     assert w.inst.symbol == "NVDA" and "ověřuji změnu" in w.bar.status.text()   # one reading is not enough
+    assert "Vidím EUR/USD – ověřuji změnu" in w.bar.status.toolTip()            # full text in the tooltip
     ticks(app, w, 1)
     assert w.inst.symbol == "EUR/USD"
 

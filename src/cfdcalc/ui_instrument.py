@@ -437,12 +437,13 @@ class InstrumentBar(QWidget):
         if r.status != auto.OK:
             return r.message, STATUS_COLORS.get(r.status, "#f59e0b")
         rec = r.recognition
+        # key information first: the status line is one line and its end may be elided
         title = f"Trading 212 připojeno ({r.win.title[:40]})" if r.win else "Trading 212 připojeno"
         target = self.tracker.interpret(r)
         if isinstance(target, Instrument):
-            pending = "" if target == self.tracker.confirmed else " – ověřuji změnu…"
-            return f"{title} · vidím {target.name}{pending}", "#22c55e"
-        return f"{title} · {rec.reason}. Klikněte ⟳ nebo zvolte ručně.", "#f59e0b"
+            pending = " – ověřuji změnu…" if target != self.tracker.confirmed else ""
+            return f"Vidím {target.name}{pending} · {title}", "#22c55e"
+        return f"{rec.reason[:1].upper()}{rec.reason[1:]} – klikněte ⟳ nebo zvolte ručně · {title}", "#f59e0b"
 
     def _show(self):
         inst = self.tracker.confirmed
