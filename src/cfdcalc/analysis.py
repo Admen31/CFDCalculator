@@ -81,6 +81,18 @@ class Settings:
 DEFAULTS = Settings()
 
 
+@dataclass(frozen=True)
+class Params:
+    """Strategy parameters. The defaults ARE the live rules; other values are only used by the research backtest
+    (sensitivity analysis) and never by the application."""
+    sl_atr: float = SL_ATR
+    tp_r: float = TP_R
+    min_share: float | None = None    # None = the profile's value
+
+
+BASE = Params()
+
+
 @dataclass
 class Module:
     key: str
@@ -278,7 +290,7 @@ def _atr(m5, m15, d) -> tuple[Module, float | None]:
     return m, a15
 
 
-def _sr(m15, close, sl_dist, d) -> Module:
+def _sr(m15, close, sl_dist, d, tp_r: float = TP_R) -> Module:
     m = Module("sr")
     res, sup = ind.pivots([b.h for b in m15[:-3]], [b.l for b in m15[:-3]])
     above = min((x for x in res if x > close), default=None)
@@ -288,10 +300,10 @@ def _sr(m15, close, sl_dist, d) -> Module:
         m.state, m.note = "na", "bez ATR nelze posoudit prostor k cíli"
         return m
     blocks, notes = set(), []
-    if above is not None and above - close < TP_R * sl_dist:
+    if above is not None and above - close < tp_r * sl_dist:
         blocks.add(BUY)
         notes.append("rezistence blíž než cíl – BUY nemá prostor")
-    if below is not None and close - below < TP_R * sl_dist:
+    if below is not None and close - below < tp_r * sl_dist:
         blocks.add(SELL)
         notes.append("support blíž než cíl – SELL nemá prostor")
     m.state = "block" if blocks else "neutral"
@@ -329,7 +341,7 @@ def _safe(key: str, fn, *args):
 
 def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], events: list[Event] | None,
              spread: float, now: datetime, cfg: Settings = DEFAULTS,
-             tick: Callable[[str], None] = lambda _: None) -> Result:
+             tick: Callable[[str], None] = lambda _: None, params: Params = BASE) -> Result:
     """Decide on validated CLOSED bars. `events=None` means the calendar is unavailable (-> NO DATA).
     Calls tick() after each of the 12 steps."""
     prof = PROFILES[inst.kind]
@@ -350,8 +362,8 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
         tick(label)
     mods["atr"], a15 = _safe("atr", _atr, m5, m15, d)
     tick("ATR")
-    sl_dist = SL_ATR * a15 if a15 else None
-    mods["sr"] = _safe("sr", _sr, m15, close, sl_dist, d)
+    sl_dist = params.sl_atr * a15 if a15 else None
+    mods["sr"] = _safe("sr", _sr, m15, close, sl_dist, d, params.tp_r)
     tick("Support/Resistance")
     mods["news"] = _safe("news", _news, events, inst, now, cfg, end)
     tick("Fundamentální události")
@@ -409,7 +421,7 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
         m.stance = ("chyba" if m.state == "error" else "nedostupné" if m.state == "na" else
                     "blokuje" if (direction in m.blocks if direction else m.blocks >= {BUY, SELL}) else "OK")
 
-    need = max(2, math.ceil(prof.min_share * len(usable)))
+    need = max(2, math.ceil((params.min_share or prof.min_share) * len(usable)))
     f = r.filters
     f.append(("Aktuální data", "ok", f"poslední uzavřená svíčka 5m {r.data_time:%d.%m. %H:%M} UTC"))
     f.append(("Trend 1h", "ok" if trend else "fail" if t20 is not None else "na", f"trend {r.trend}"))
@@ -437,7 +449,7 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
                    f" potřeba {cfg.min_minutes_left}")
     f.append(("Časový limit", "ok" if time_ok else "fail", time_detail))
     sl_ok = bool(sl_dist) and math.isfinite(sl_dist) and sl_dist > 0
-    f.append(("Stop-loss", "ok" if sl_ok else "na", f"SL = {SL_ATR} × ATR 15m" if sl_ok else "nelze spočítat"))
+    f.append(("Stop-loss", "ok" if sl_ok else "na", f"SL = {params.sl_atr:g} × ATR 15m" if sl_ok else "nelze spočítat"))
     tick("Rozhodnutí")
 
     if errors:
@@ -454,9 +466,10 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
             r.verdict, r.sl_dist = direction, sl_dist
             r.entry = _q(close, d, ROUND_HALF_EVEN)
             if direction == BUY:
-                r.sl, r.tp = _q(close - sl_dist, d, ROUND_FLOOR), _q(close + TP_R * sl_dist, d, ROUND_FLOOR)
+                r.sl, r.tp = _q(close - sl_dist, d, ROUND_FLOOR), _q(close + params.tp_r * sl_dist, d, ROUND_FLOOR)
             else:
-                r.sl, r.tp = _q(close + sl_dist, d, ROUND_CEILING), _q(close - TP_R * sl_dist, d, ROUND_CEILING)
+                r.sl, r.tp = (_q(close + sl_dist, d, ROUND_CEILING),
+                              _q(close - params.tp_r * sl_dist, d, ROUND_CEILING))
             r.reasons = [f"trend 1h {r.trend}, {len(pro)} z {len(usable)} použitelných indikátorů pro, 0 proti, "
                          f"všechny bezpečnostní filtry prošly"]
     r.summary = r.reasons[0]

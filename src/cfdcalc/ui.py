@@ -19,7 +19,10 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
 
 from . import __version__
 from .analysis import BUY, ERROR, MODULES, NO_DATA, PROFILES, SELL, TITLES, Result, Settings, run_analysis
-from .backtest import HISTORY, comparison_text, compare, journal_add, journal_read, journal_verify
+from .backtest import HISTORY, journal_add, journal_read, journal_verify
+from .engine import Costs, Market
+from .report import research_text
+from .validation import research
 from .calendar import Calendar
 from .data import DataError, SyntheticData, TwelveData
 from .instruments import BY_SYMBOL, Instrument
@@ -386,22 +389,27 @@ class MainWindow(QWidget):
         if not inst.td_verified:
             QMessageBox.information(self, APP, UNMAPPED.format(name=inst.name, symbol=inst.symbol))
             return
-        dlg = TextDialog(f"Backtest – {inst.name}: pravidla v2.0 vs. v2.1", "Spustit porovnání", self)
+        dlg = TextDialog(f"Backtest – {inst.name}: v2.1 vs. v2.0 vs. náhodné vstupy", "Spustit backtest", self)
         dlg.text.setPlainText(
-            "Porovná původní pravidla v2.0 a nová v2.1 na stejných datech (až 5000 svíček 5m, 3 API dotazy).\n"
-            "Období se dělí 60 % vývoj / 40 % následný test; signál vidí jen uzavřené svíčky.\n"
-            "Bez historického filtru zpráv; spread 1× za obchod, modelované náklady navíc 0,5× spread;\n"
-            "SL a TP v jedné svíčce = SL. Krátká historie není statistický důkaz ziskovosti.")
+            "Výzkumný backtest v2.2 na datech Twelve Data (až 5000 svíček 5m, 3 API dotazy).\n"
+            "Vstup na otevření následující svíčky, BUY za ask / SELL za bid (váš spread), skluz 0,1× spreadu,\n"
+            "mezera přes SL = horší cena, SL a TP v jedné svíčce = SL, nucené ukončení na časovém limitu.\n"
+            "Vývoj 50 % / validace 25 % / závěrečný test 25 %, citlivost parametrů jen na vývoji a validaci.\n"
+            "Bez historického filtru zpráv. Krátká historie není statistický důkaz ziskovosti.\n"
+            "Delší historii a přesné bid/ask ceny počítá skript scripts/research.py (viz README).")
 
         def run():
             dlg.btn.setEnabled(False)
 
             def job(p):
                 bars = [provider.bars(inst.symbol, i, HISTORY) for i in ("5min", "15min", "1h")]
-                return compare(inst, *bars, spread, 0.5, 0.6, cfg, lambda a, b: p(a, b))
+                steps = iter(range(1, 100))
+                return research(Market(inst, *bars), Costs(spread_floor=spread, slippage=0.1 * spread), cfg,
+                                lambda msg: p(next(steps, 99), 9, msg))
             dlg._task = Task(job)
-            dlg._task.progress.connect(lambda a, b, _: (dlg.bar.setMaximum(max(b, 1)), dlg.bar.setValue(a)))
-            dlg._task.done.connect(lambda res: dlg.text.setPlainText(comparison_text(res)))
+            dlg._task.progress.connect(lambda a, b, msg: (dlg.bar.setMaximum(b), dlg.bar.setValue(min(a, b)),
+                                                          dlg.bar.setFormat(msg)))
+            dlg._task.done.connect(lambda res: dlg.text.setPlainText(research_text(res)))
             dlg._task.failed.connect(lambda m: dlg.text.setPlainText(f"Backtest selhal: {m}"))
             dlg._task.finished.connect(lambda: dlg.btn.setEnabled(True))
             dlg._task.start()

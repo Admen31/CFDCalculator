@@ -2,7 +2,7 @@ name: CFD Signal Calculator
 
 on:
   push:
-    branches: [main, "v2.0-auto-recognition", "v2.1-signal-and-smooth-ui"]
+    branches: [main, "v2.0-auto-recognition", "v2.1-signal-and-smooth-ui", "v2.2-research-backtest"]
   pull_request:
   workflow_dispatch:
 
@@ -13,7 +13,7 @@ jobs:
   windows:
     name: Tests + Windows EXE
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,6 +60,27 @@ jobs:
           name: cfd-signal-calculator-windows
           path: dist/CFD Signal Calculator
           retention-days: 14
+      - name: Month key for the historical data cache
+        id: month
+        run: echo "month=$(Get-Date -Format yyyy-MM)" >> $env:GITHUB_OUTPUT
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: research/cache
+          key: dukascopy-${{ steps.month.outputs.month }}-${{ github.run_id }}
+          restore-keys: dukascopy-
+      - name: v2.2 research backtest on real historical prices (12 months, informational, network)
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python scripts/research.py --months 12 --out research/report --workers 4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: research-report
+          path: research/report
+          retention-days: 30
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

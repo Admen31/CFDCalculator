@@ -243,6 +243,72 @@ nákladech, a i ty jsou na krátkém období jen orientační.
 * **Ceny Yahoo nejsou ceny CFD v Trading 212.** Zlato a ropa jsou futures, období je krátké a test nemá filtr
   zpráv. Výsledky proto berte jako **orientační, neověřené pro reálné obchodování**.
 
+## Výzkumný backtest (verze 2.2)
+
+Cílem verze 2.2 není víc signálů, ale **ověřit, zda strategie má po nákladech obchodní výhodu**. Výsledky
+musí být reprodukovatelné a podložené reálnými daty.
+
+### Data
+
+* SQLite databáze `research/history.sqlite` (lokální, není v repozitáři) uchovává u každé řady její původ:
+  * zdroj a symbol u poskytovatele;
+  * produkt (spot / akcie / futures / CFD), strana ceny (bid / ask / mid / last) a burza;
+  * zda jsou ceny upravené o splity a dividendy, a druh objemu;
+  * čas stažení a licenční poznámku.
+
+  Různé produkty se nikdy nemíchají. Všechny časy jsou v UTC.
+* Zdroje:
+  * **Dukascopy**: 1m **bid i ask** za 12 měsíců pro forex, zlato a další, podle dostupnosti ověřené
+    v CI. Minuty bez obchodu (bez ticků) se vynechávají.
+  * **Yahoo Finance**: akcie s burzovními objemy, 5m za 60 dní.
+  * **Twelve Data**: s vaším klíčem, stránkování a limit 8 dotazů za minutu.
+* Kontrola kvality hlídá chybějící svíčky v obchodní době, duplicity, posun času, neplatné OHLC, ask < bid,
+  podezřelé skoky a pravděpodobné splity. Postižená okna se z vyhodnocení **vyřadí**; nic se nedopočítává.
+* Cenová hladina Dukascopy se ověřuje proti Yahoo. Řada mimo 5 % se vyřadí.
+
+### Simulace obchodů
+
+* Signál počítá stejná funkce jako aplikace a vidí jen svíčky uzavřené v okamžiku rozhodnutí.
+* Vstup je na **otevření následující svíčky**: BUY za ask, SELL za bid. Spread je nejméně typický spread
+  Trading 212.
+* Výstup long probíhá na bid a short na ask, takže se spread platí jen jednou.
+* Skluz je 0,1× spreadu na tržních plněních (vstup, SL, nucené ukončení).
+* Mezera přes SL se plní horší otevírací cenou. Když SL i TP padnou do jedné svíčky, počítá se SL.
+* Respektuje se obchodní doba a časový limit trhu a vždy je otevřená jen jedna pozice.
+* Každý nerealizovaný signál se eviduje s důvodem. Financování se účtuje jen přes noc, což při časovém limitu
+  nenastává.
+* Rozpad „bez nákladů = po nákladech + spread + skluz + ostatní“ platí přesně u každého obchodu
+  (ověřeno testy).
+
+### Validační protokol (stanovený předem)
+
+* Rozdělení je **vývoj 50 %, validace 25 % a nedotčený závěrečný test 25 %**. Závěrečný test slouží jen pro
+  předem stanovenou strategii v2.1 s výchozími parametry.
+* Varianty parametrů (SL 1/2 ATR, TP 1,5/3 R, shoda 50/80 %) se počítají **jen na vývoji a validaci**. Report
+  ukazuje, jak dopadne „nejlepší na vývoji“ na validaci, aby byl vidět efekt výběru.
+* Walk-forward ve 6 časových úsecích, srovnání s v2.0 a s **náhodnými vstupy** se stejnými SL/TP a náklady.
+* Bootstrap 95% interval očekávání a korekce Bonferroni na počet zkoušených konfigurací. Obchodní výhoda se
+  uzná jen při **≥ 30 obchodech, dolní mezi intervalu > 0 a upraveném p < 0,05**.
+* Ekonomický kalendář: rozhraní umí historické události s časem „známo od“ (žádné informace z budoucnosti)
+  a deklarovaným pokrytím. **Věrohodný historický kalendář zatím nemáme, filtr zpráv proto není otestován**
+  a report to výslovně uvádí.
+
+### Spuštění
+
+```bat
+python scripts/research.py --months 12 --out research/report
+```
+
+Volby jsou `--symbols EUR/USD XAU/USD …`, `--skip-import`, `--calendar udalosti.csv`
+a `--calendar-coverage pokryti.csv`. Výstupem je `research/report/report.html` a CSV soubory:
+
+* `summary.csv`, `trades.csv`, `rejected.csv`;
+* `folds.csv`, `sensitivity.csv`;
+* `data.csv` s původem a otiskem dat.
+
+V CI se výzkum spouští automaticky a výsledek je v artefaktu `research-report`. Tlačítko **Backtest**
+v aplikaci počítá stejný protokol na 5000 svíčkách z Twelve Data.
+
 ## Předpoklady a omezení (neověřeno proti živému API)
 
 Vývojové prostředí nemělo přístup k api.twelvedata.com. Proti skutečnému API se tedy neověřovalo následující:
