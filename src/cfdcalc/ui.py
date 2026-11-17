@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
                                QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar,
                                QPushButton, QSpinBox, QTimeEdit, QVBoxLayout, QWidget)
 
-from . import __version__
+from . import __version__, widgets
+from . import strategies as st
 from .analysis import BUY, ERROR, MODULES, NO_DATA, PROFILES, SELL, TITLES, Result, Settings, run_analysis
 from .backtest import HISTORY, journal_add, journal_read, journal_verify
 from .engine import Costs, Market
@@ -25,10 +26,10 @@ from .report import research_text
 from .validation import research
 from .availability import Availability, state_text
 from .calendar import Calendar
-from .data import DataError, SyntheticData, TwelveData
+from .data import CachedProvider, DataError, SyntheticData, TwelveData
 from .instruments import BY_SYMBOL, Instrument
 from .ui_instrument import AUTO, InstrumentBar
-from .widgets import ACCENT, VERDICT_COLORS, Gauge, ResultPanel, Tile
+from .widgets import ACCENT, BIAS_COLORS, GREEN, RED, SLATE, VERDICT_COLORS, YELLOW, Gauge, ResultPanel, Tile
 
 APP = "CFD Signal Calculator"
 WIDTH = 380
@@ -41,8 +42,12 @@ QPushButton:disabled { color: #6b7280; }
 QPushButton:checked { background: #1d4ed8; border-color: #3b82f6; font-weight: 600; }
 QLineEdit, QSpinBox, QTimeEdit, QDoubleSpinBox { background: #1a2030; border: 1px solid #2b3446; border-radius: 6px;
   padding: 4px; }
-QFrame#result { background: #161b27; border-radius: 12px; }
+QFrame#result { background: transparent; }
+QWidget#page, QStackedWidget#pages { background: transparent; }
 QLabel#muted { color: #94a3b8; font-size: 11px; background: transparent; }
+QLabel#caption { color: #64748b; font-size: 9px; font-weight: 700; letter-spacing: 1px; background: transparent; }
+QLabel#reason { color: #e5e7eb; font-size: 11px; background: transparent; }
+QLabel#waiting { color: #fde68a; font-size: 11px; background: transparent; }
 QProgressBar { background: #1a2030; border-radius: 6px; text-align: center; }
 QProgressBar::chunk { background: #3b82f6; border-radius: 6px; }
 QTextBrowser { color: #cbd5e1; }
@@ -89,6 +94,10 @@ class SettingsDialog(QDialog):
         self.watch.setChecked(s.value("watch", True, type=bool))
         self.interval = QDoubleSpinBox(minimum=2.0, maximum=3.0, singleStep=0.5, suffix=" s",
                                        value=float(s.value("watch_interval", 2.5)))
+        self.motion = QCheckBox("Omezit animace (výchozí podle nastavení Windows)")
+        self.motion.setChecked(s.value("reduced_motion", widgets.system_reduced_motion(), type=bool))
+        self.rate = QSpinBox(minimum=1, maximum=600, value=int(s.value("td_per_minute", 8)), suffix=" dotazů/min")
+        self.rate.setToolTip("Limit vašeho tarifu Twelve Data (Basic/zdarma: 8 za minutu). Aplikace ho nepřekročí.")
         form = QFormLayout(self)
         form.addRow("Twelve Data API klíč", self.key)
         for k, edit in self.cutoffs.items():
@@ -97,6 +106,8 @@ class SettingsDialog(QDialog):
         form.addRow(self.demo)
         form.addRow(self.watch)
         form.addRow("Interval sledování", self.interval)
+        form.addRow(self.motion)
+        form.addRow("Limit Twelve Data", self.rate)
         note = QLabel(f"Klíč se ukládá nešifrovaně do {s.fileName()}.\n"
                       "Alternativa: proměnná prostředí TWELVEDATA_API_KEY.", objectName="muted")
         form.addRow(note)
@@ -118,6 +129,8 @@ class SettingsDialog(QDialog):
         self.s.setValue("demo", self.demo.isChecked())
         self.s.setValue("watch", self.watch.isChecked())
         self.s.setValue("watch_interval", self.interval.value())
+        self.s.setValue("reduced_motion", self.motion.isChecked())
+        self.s.setValue("td_per_minute", self.rate.value())
         self.accept()
 
 
@@ -145,6 +158,8 @@ class MainWindow(QWidget):
         self.analysed: Instrument | None = None     # instrument of the running / last analysis
         self.shown: Instrument | None = None        # instrument of the result on screen (None = no result)
         self.started = datetime.now(timezone.utc)
+        self._cache: tuple[tuple, CachedProvider] | None = None   # session candle cache (per API key + limit)
+        widgets.REDUCED_MOTION = self.s.value("reduced_motion", widgets.system_reduced_motion(), type=bool)
         self.setWindowTitle(APP)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
 
@@ -164,7 +179,7 @@ class MainWindow(QWidget):
         self.tiles = {k: Tile(TITLES[k]) for k in MODULES}
         for n, k in enumerate(MODULES):
             grid.addWidget(self.tiles[k], n // 2, n % 2)
-        self.result = ResultPanel(WIDTH - 28, 228)
+        self.result = ResultPanel(WIDTH - 28, 290)
 
         self.spread = QLineEdit()
         self.spread.setToolTip("Aktuální spread z Trading 212 (rozdíl BUY − SELL) v cenových jednotkách")
@@ -181,7 +196,7 @@ class MainWindow(QWidget):
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 8, 14, 6)
-        lay.setSpacing(5)
+        lay.setSpacing(4)
         lay.addWidget(self.bar)
         lay.addWidget(self.gauge, alignment=Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(self.step)
@@ -208,9 +223,15 @@ class MainWindow(QWidget):
         return self.s.value("demo", False, type=bool)
 
     def provider(self):
+        """Demo: synthetic data. Live: one Twelve Data client with a candle cache for the whole session (the per-
+        minute limit and the cache survive between analyses; a new key or limit starts a fresh client)."""
         if self.demo():
             return SyntheticData()
-        return TwelveData(os.environ.get("TWELVEDATA_API_KEY") or self.s.value("api_key", ""))
+        key = os.environ.get("TWELVEDATA_API_KEY") or self.s.value("api_key", "")
+        ident = (key, int(self.s.value("td_per_minute", 8)))
+        if not self._cache or self._cache[0] != ident:
+            self._cache = (ident, CachedProvider(TwelveData(key, per_minute=ident[1])))
+        return self._cache[1]
 
     def spread_of(self, inst: Instrument) -> float:
         try:
@@ -238,6 +259,7 @@ class MainWindow(QWidget):
         inst = self.inst
         probe = self.probe_data if inst and not self.demo() else None
         if SettingsDialog(self.s, self, probe, f"{inst.name} ({inst.symbol})" if inst else "").exec():
+            widgets.REDUCED_MOTION = self.s.value("reduced_motion", False, type=bool)
             self.bar.apply_settings()
             self.refresh_header()
 
@@ -352,7 +374,9 @@ class MainWindow(QWidget):
         sub = {NO_DATA: "nedostatek dat · znovu", ERROR: "technická chyba · znovu"}.get(
             r.verdict, "ukončeno · znovu" if r.aborted else "hotovo · znovu")
         self.gauge.show_state(pct, r.verdict, sub, color)
-        self.step.setText(f"{r.completed}/{r.total} kroků" if r.total else "")
+        took = sum(r.timings.values())
+        self.step.setText((f"{r.completed}/{r.total} kroků" if r.total else "")
+                          + (f" · {took / 1000:.1f} s" if took else ""))
         for k, t in self.tiles.items():
             m = r.modules.get(k)
             t.set(m.state, m.value, m.note, m.stance) if m else t.set("na", "–", "nevyhodnoceno", "")
@@ -360,14 +384,17 @@ class MainWindow(QWidget):
         if r.is_signal:
             e = float(r.entry)
             dist = lambda x: f"{abs(float(x) - e):g} / {abs(float(x) - e) / e:.2%}"  # noqa: E731
-            levels = f"Vstup {r.entry}\nSL {r.sl}  (−{dist(r.sl)})\nTP {r.tp}  (+{dist(r.tp)})"
+            rr = abs(float(r.tp) - e) / abs(e - float(r.sl)) if float(r.sl) != e else 0
+            levels = (f"Vstup {r.entry}   R:R 1:{rr:.1f}\nSL {r.sl}  (−{dist(r.sl)})\n"
+                      f"TP {r.tp}  (+{dist(r.tp)})")
         data = (f"data do {r.data_time:%H:%M} UTC ({r.data_time.astimezone():%H:%M} místního)" if r.data_time
                 else "bez dat")
-        stamp = (f"{inst.name} ({inst.symbol}) · {r.profile or PROFILES[inst.kind].name} · {data} · "
-                 f"analýza {self.started.astimezone():%H:%M:%S}")
+        stamp = f"{data} · analýza {self.started.astimezone():%H:%M:%S}"
         title = ("DEMO " if self.demo() and r.verdict in (BUY, SELL) else "") + r.verdict
-        self.result.levels.setStyleSheet("background: transparent; font-family: Consolas, monospace;")
-        self.result.show_result(r, title, levels, stamp, detail_html(r, inst))
+        v = view(r)
+        self.result.show_result(r, title, levels, stamp, detail_html(r, inst, self.bar.last_ocr_ms),
+                                instrument=f"{inst.name} ({inst.symbol}) · {r.profile or PROFILES[inst.kind].name}",
+                                **v)
         if inst != self.inst:  # the instrument changed while the analysis was running
             self.mark_historical()
             return
@@ -385,7 +412,7 @@ class MainWindow(QWidget):
         """Manual availability check of the current instrument at Twelve Data (worker thread, 4-5 requests)."""
         inst = self.inst
         try:
-            td = TwelveData(os.environ.get("TWELVEDATA_API_KEY") or self.s.value("api_key", ""))
+            td = self.provider().provider     # the same client: probe requests count towards the same limit
         except DataError as e:
             QMessageBox.warning(self, APP, str(e))
             return
@@ -517,7 +544,7 @@ class _NoNews:
         return []
 
 
-def detail_html(r: Result, inst: Instrument) -> str:
+def detail_html(r: Result, inst: Instrument, ocr_ms: float | None = None) -> str:
     """"Detail analýzy": every reason, every indicator with its role and every safety filter (wrapped lines)."""
     esc = html.escape
     icons = {"ok": "✓", "fail": "✗", "na": "–"}
@@ -525,8 +552,9 @@ def detail_html(r: Result, inst: Instrument) -> str:
     counts = (f"pro {c['pro']} · proti {c['proti']} · neutrální {c['neutrální']} · nedostupné {c['nedostupné']}"
               f" · nepoužito {c['nepoužito']}" if c else "–")
     parts = [f"<p><b>{esc(r.verdict)}</b> – {esc(inst.name)} ({esc(inst.symbol)}), profil "
-             f"{esc(r.profile or PROFILES[inst.kind].name)}, trend 1h: {esc(r.trend)}</p><p><b>Důvody</b><br>"
-             + "<br>".join(f"• {esc(x)}" for x in r.reasons) + "</p>",
+             f"{esc(r.profile or PROFILES[inst.kind].name)}, trend 1h: {esc(r.trend)}"
+             + (f", strategie {esc(r.strategy)}" if r.strategy else "") + "</p><p><b>Důvody</b><br>"
+             + "<br>".join(f"• {esc(x)}" for x in r.reasons) + "</p>", detail_extra(r, ocr_ms),
              f"<p><b>Indikátory</b> ({esc(counts)})<br>"
              + "<br>".join(f"<b>{esc(TITLES[k])}</b> – {esc(m.stance or m.state)} · {esc(m.value)}<br>"
                            f"&nbsp;&nbsp;{esc(m.note)}" for k, m in r.modules.items()) + "</p>",
@@ -537,6 +565,87 @@ def detail_html(r: Result, inst: Instrument) -> str:
              + ("<br>".join(f"Zdroj dat: {esc(src)} | Symbol: {esc(sym)} | Interval: {esc(iv)} | Stav: "
                             f"{esc(state_text(state))}" + ("" if state == "OK" else f"<br>&nbsp;&nbsp;{esc(detail)}")
                             for src, sym, iv, state, detail in r.sources) or "data nebyla stažena") + "</p>"]
+    return "".join(parts)
+
+
+OPP_TEXT = {"watch": "◆ WATCH", "trigger": "◆ SETUP SPLNĚN", "invalid": "✕ ZANIKLO"}
+
+
+def view(r: Result) -> dict:
+    """What the summary card says besides the verdict: strategy line, "čeká se na", bias and opportunity pills."""
+    out = {"strategy": "", "waiting": "", "bias": None, "opportunity": None}
+    if r.bias:
+        out["bias"] = (r.bias.direction, "Směr trhu (není pokyn k obchodu): "
+                       + (f"{r.bias.strength}, " if r.bias.strength else "") + "; ".join(r.bias.parts))
+    o = r.opportunity
+    if r.verdict in (BUY, SELL):
+        validated = r.strategy != st.NAMES["v21"]
+        out["strategy"] = (f"Strategie: {r.strategy} · {r.verdict}"
+                           + (" · ověřená strategie" if validated else " · pravidla v2.1"))
+    elif o:
+        side = {"BUY": "BUY", "SELL": "SELL"}.get(o.direction or "", "?")
+        out["strategy"] = f"Strategie: {o.name} · potenciálně {side}" + ("" if o.validated else " · výzkum")
+    else:
+        out["strategy"] = "Strategie: žádné aktivní nastavení"
+    if o:
+        rr = f", R:R 1:{o.rr:.1f}" if o.rr else ""
+        tip = f"{o.name}: {o.detail}" + (f" ({o.risk_note})" if o.risk_note else "")
+        if o.state == "watch":
+            out["opportunity"] = (OPP_TEXT["watch"], YELLOW, tip)
+        elif o.state == "trigger" and r.verdict in (BUY, SELL) and o.validated:
+            out["opportunity"] = (f"✓ POTVRZENO {o.direction}", GREEN if o.direction == BUY else RED, tip + rr)
+        elif o.state == "trigger":
+            out["opportunity"] = (OPP_TEXT["trigger"] + (" · BLOK" if o.blocked else " · VÝZKUM"), YELLOW, tip + rr)
+        else:
+            out["opportunity"] = (OPP_TEXT["invalid"], SLATE, tip)
+    if r.verdict in (BUY, SELL):
+        out["waiting"] = ""
+    elif r.verdict in (NO_DATA, ERROR):
+        out["waiting"] = "Čeká se na: platná a aktuální data" if r.verdict == NO_DATA else \
+            "Technická chyba – analýzu spusťte znovu, detail uvádí příčinu."
+    elif o and o.state == "watch":
+        out["waiting"] = "Čeká se na: " + "; ".join(o.missing)
+    elif o and o.state == "trigger":
+        out["waiting"] = ("Nastavení splněno, ale " + o.risk_note) if o.blocked else (
+            "Nastavení splněno – výzkumná strategie, NENÍ potvrzený signál (neprošla ověřením na historii).")
+    elif o and o.state == "invalid":
+        out["waiting"] = f"Nastavení zaniklo: {o.detail}"
+    else:
+        failed = [name for name, status, _ in r.filters if status == "fail"]
+        out["waiting"] = ("Čeká se na: " + ("jasný trend 1h" if "Trend 1h" in failed else
+                                            ", ".join(failed[:3]).lower() if failed else "vhodné nastavení trhu"))
+    return out
+
+
+def detail_extra(r: Result, ocr_ms: float | None) -> str:
+    """v2.3 sections of "Detail analýzy": bias, every setup, measured durations."""
+    esc = html.escape
+    parts = []
+    if r.bias:
+        b = r.bias
+        parts.append(f"<p><b>Market bias: <span style='color:{BIAS_COLORS[b.direction]}'>{esc(b.direction)}</span>"
+                     f"</b> (skóre {b.score:+d}{', ' + esc(b.strength) if b.strength else ''}) – popis směru, "
+                     "ne pokyn k obchodu<br>" + "<br>".join(f"• {esc(x)}" for x in b.parts) + "</p>")
+    if r.setups:
+        rows = []
+        for s in r.setups:
+            state = {"none": "nic", "watch": "WATCH", "trigger": "splněno", "invalid": "zaniklo"}[s.state]
+            status = "ověřená" if s.validated else "výzkum"
+            line = f"<b>{esc(s.name)}</b> ({status}) – {state}" + (f", {esc(s.direction)}" if s.direction else "")
+            line += f"<br>&nbsp;&nbsp;{esc(s.detail)}"
+            if s.missing:
+                line += "<br>&nbsp;&nbsp;chybí: " + esc("; ".join(s.missing))
+            if s.entry is not None and s.sl is not None and s.tp is not None:
+                line += (f"<br>&nbsp;&nbsp;vstup {s.entry:.6g} · SL {s.sl:.6g} · TP {s.tp:.6g} · R:R 1:{s.rr:.1f}")
+            if s.risk_note:
+                line += f"<br>&nbsp;&nbsp;{esc(s.risk_note)}"
+            rows.append(line)
+        parts.append("<p><b>Obchodní nastavení</b><br>" + "<br>".join(rows) + "</p>")
+    times = dict(r.timings)
+    if ocr_ms is not None:
+        times = {"OCR Trading 212": ocr_ms} | times
+    if times:
+        parts.append("<p><b>Měření</b><br>" + " · ".join(f"{esc(k)} {v:.0f} ms" for k, v in times.items()) + "</p>")
     return "".join(parts)
 
 

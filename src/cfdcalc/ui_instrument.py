@@ -113,6 +113,8 @@ class InstrumentBar(QWidget):
         self._shown: tuple = ()
         self._chips_key: tuple | None = None
         self._queued: list[tuple[int, Callable | None]] = []
+        self.last_ocr_ms: float | None = None   # duration of the last finished window reading (capture + OCR)
+        self._t0 = 0.0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
 
@@ -241,6 +243,7 @@ class InstrumentBar(QWidget):
         self._pending_then = then
         self._gen += 1
         gen = self._gen
+        self._t0 = time.monotonic()
         self._task = ReadTask(fn)
         self._task.done.connect(lambda r, st=stable, cb=then, g=gen, k=kind: self._on_done(r, st, cb, g, k))
         self._task.finished.connect(self._next)
@@ -261,6 +264,7 @@ class InstrumentBar(QWidget):
     def _on_done(self, reading: auto.Reading, stable, then, gen: int, kind: str):
         if kind == "warmup" or gen != self._gen or self._timed_out:
             return
+        self.last_ocr_ms = 1000 * (time.monotonic() - self._t0)
         self._pending_then = None
         callers, self._joined = self._joined, []
         self._apply(reading, 1 if callers else stable, [c for c in (then, *callers) if c])

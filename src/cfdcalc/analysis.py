@@ -21,6 +21,8 @@ Indicator calculations are unchanged from v2.0 (the v2.0 decision rules are froz
 from __future__ import annotations
 
 import math
+import time as clock
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
@@ -28,6 +30,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import indicators as ind
+from . import strategies as st
 from .calendar import Calendar, CalendarError, Event
 from .data import Bar, DataError, Provider, prepare
 from .instruments import Instrument
@@ -125,6 +128,11 @@ class Result:
     filters: list[tuple[str, str, str]] = field(default_factory=list)   # (filter, ok|fail|na, detail)
     sources: list[tuple[str, str, str, str, str]] = field(default_factory=list)  # (source, symbol, interval,
     #                                                                     OK | data problem kind, detail)
+    bias: st.Bias | None = None         # v2.3 market bias (description, never an instruction)
+    setups: list[st.Setup] = field(default_factory=list)
+    opportunity: st.Setup | None = None  # the setup shown first (WATCH / triggered)
+    strategy: str = ""                   # rule set behind a confirmed BUY/SELL
+    timings: dict[str, float] = field(default_factory=dict)   # measured durations in ms
 
     @property
     def is_signal(self) -> bool:
@@ -474,8 +482,42 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
                               _q(close - params.tp_r * sl_dist, d, ROUND_CEILING))
             r.reasons = [f"trend 1h {r.trend}, {len(pro)} z {len(usable)} použitelných indikátorů pro, 0 proti, "
                          f"všechny bezpečnostní filtry prošly"]
+    if r.verdict in (BUY, SELL):
+        r.strategy = st.NAMES["v21"]
+    if r.verdict not in (ERROR, NO_DATA):
+        _opportunities(r, inst, m5, m15, h1, events, spread, now, cfg, end, left)
     r.summary = r.reasons[0]
     return r
+
+
+def _opportunities(r: Result, inst: Instrument, m5, m15, h1, events, spread, now, cfg, end, left):
+    """v2.3: market bias and setups. Only a VALIDATED strategy may turn a WAIT into a confirmed signal."""
+    try:
+        x = st.context(m5, m15, h1)
+        r.bias = st.bias(x)
+        r.setups = st.scan(x, inst.decimals, _has_volume(m5))
+    except Exception as e:  # noqa: BLE001 - the extra layer must never break the v2.1 result
+        r.bias, r.setups = None, [st.Setup("pullback", detail=f"nelze vyhodnotit: {type(e).__name__}")]
+        return
+    blocking = news_window(events or [], inst.currencies, now, cfg, end or now)[0]
+    regime = st.atr_regime(m5)
+    for s in r.setups:
+        if s.state == "trigger":
+            bad = st.safety(s, spread, left if end else 0.0, cfg.min_minutes_left, blocking, regime)
+            if bad:
+                s.risk_note = "; ".join([s.risk_note] * bool(s.risk_note) + [f"blokuje: {b}" for b in bad])
+                s.blocked = True
+    r.opportunity = st.best(r.setups)
+    o = r.opportunity
+    if (r.verdict == WAIT and o and o.state == "trigger" and o.validated and not o.blocked
+            and events is not None):
+        d = inst.decimals
+        r.verdict, r.strategy, r.direction = o.direction, o.name, o.direction
+        r.entry = _q(o.entry, d, ROUND_HALF_EVEN)
+        rnd = ROUND_FLOOR if o.direction == BUY else ROUND_CEILING   # SL away from price, TP towards entry
+        r.sl, r.tp = _q(o.sl, d, rnd), _q(o.tp, d, rnd)
+        r.sl_dist = abs(o.entry - o.sl)
+        r.reasons = [f"{o.name}: {o.detail}; všechny bezpečnostní filtry prošly"] + r.reasons
 
 
 EVALUATE_STEPS = 12
@@ -497,11 +539,12 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
 
     source = getattr(provider, "name", "zdroj dat")
     sources: list[tuple[str, str, str, str, str]] = []   # bookkeeping for the detail page; no effect on decisions
+    timings: dict[str, float] = {}
 
     def stop(verdict: str, reason: str) -> Result:
         extra = "signál se z neúplných dat negeneruje" if verdict != WAIT else "bez analýzy, API se nevolalo"
         return Result(verdict=verdict, reasons=[reason, extra], summary=reason, completed=done, total=total,
-                      aborted=True, profile=prof.name, sources=list(sources))
+                      aborted=True, profile=prof.name, sources=list(sources), timings=dict(timings))
 
     step(f"Instrument {inst.name}")
     if not inst.td_verified:
@@ -510,18 +553,38 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
     end, closed_reason = market_end(inst, now, cfg)
     if end is None:
         return stop(WAIT, f"trh je zavřený – {closed_reason}")
-    frames = {}
-    for interval in ("5min", "15min", "1h"):
-        if cancelled():
-            return stop(NO_DATA, "analýza zrušena")
+    frames, timings = {}, {}
+
+    def fetch(interval: str):
+        t0 = clock.perf_counter()
         try:
-            raw = provider.bars(inst.symbol, interval, FETCH)
-        except DataError as e:
-            sources.append((source, inst.symbol, interval, getattr(e, "kind", "unknown"), str(e)))
-            return stop(NO_DATA, str(e))
-        except Exception as e:  # noqa: BLE001 - unexpected failure is a technical error, never a signal
-            sources.append((source, inst.symbol, interval, "invalid", f"{type(e).__name__}"))
-            return stop(ERROR, f"technická chyba při stahování {interval}: {type(e).__name__}: {e}")
+            return provider.bars(inst.symbol, interval, FETCH), None
+        except Exception as e:  # noqa: BLE001 - classified below
+            return None, e
+        finally:
+            timings[f"data {interval}"] = 1000 * (clock.perf_counter() - t0)
+
+    # the three timeframes are requested at once; results are checked in a fixed order (5m, 15m, 1h)
+    if cancelled():
+        return stop(NO_DATA, "analýza zrušena")
+    pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="fetch")
+    futures = {iv: pool.submit(fetch, iv) for iv in ("5min", "15min", "1h")}
+    pool.shutdown(wait=False)
+    for interval, fut in futures.items():
+        while True:
+            if cancelled():
+                return stop(NO_DATA, "analýza zrušena")
+            try:
+                raw, err = fut.result(timeout=0.1)
+                break
+            except TimeoutError:
+                continue
+        if isinstance(err, DataError):
+            sources.append((source, inst.symbol, interval, getattr(err, "kind", "unknown"), str(err)))
+            return stop(NO_DATA, str(err))
+        if err is not None:   # unexpected failure is a technical error, never a signal
+            sources.append((source, inst.symbol, interval, "invalid", f"{type(err).__name__}"))
+            return stop(ERROR, f"technická chyba při stahování {interval}: {type(err).__name__}: {err}")
         step(f"Data {interval} stažena")
         bars, problem = prepare(raw, interval, now, NEED, session_open(inst, now))
         if problem:
@@ -534,16 +597,21 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
     if cancelled():
         return stop(NO_DATA, "analýza zrušena")
     events = None
+    t0 = clock.perf_counter()
     if calendar is not None:
         try:
             events = calendar.events()
         except CalendarError:
             events = None  # evaluate() reports NO DATA
+    timings["kalendář"] = 1000 * (clock.perf_counter() - t0)
     step("Kalendář zpráv")
+    t0 = clock.perf_counter()
     try:
         r = evaluate(inst, frames["5min"], frames["15min"], frames["1h"], events, spread, now, cfg, tick=step)
     except Exception as e:  # noqa: BLE001
         return stop(ERROR, f"technická chyba vyhodnocení: {type(e).__name__}: {e}")
+    timings["výpočet"] = 1000 * (clock.perf_counter() - t0)
     r.completed, r.total = done, total
     r.sources = sources
+    r.timings = dict(timings)
     return r

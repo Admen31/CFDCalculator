@@ -55,6 +55,7 @@ def test_eur_and_gold_still_analyse_after_silver_fails(app, make, monkeypatch): 
     reader = Reader("Silver")
     w = make(reader)
     w.s.setValue("api_key", KEY)
+    w.s.setValue("td_per_minute", 60)       # a paid plan: 9 requests in a minute are allowed (free plan: see below)
     w.start()
     settle(app, w)
     assert w.result.verdict.text() == "NO DATA"

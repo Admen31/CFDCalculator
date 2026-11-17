@@ -54,6 +54,7 @@ class Setup:
     sl: float | None = None
     tp: float | None = None
     risk_note: str = ""
+    blocked: bool = False               # triggered, but a safety filter forbids acting on it
 
     @property
     def name(self) -> str:

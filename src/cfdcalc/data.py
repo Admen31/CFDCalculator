@@ -6,10 +6,13 @@ import math
 import random
 import re
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from itertools import pairwise
 from typing import Callable, Protocol
@@ -114,10 +117,34 @@ class TwelveData:
     BASE = "https://api.twelvedata.com"
     name = "Twelve Data"
 
-    def __init__(self, api_key: str, timeout: float = 15.0):
+    MAX_WAIT = 10.0     # seconds a request may wait for a free slot of the per-minute limit
+
+    def __init__(self, api_key: str, timeout: float = 15.0, per_minute: int = 8):
         if not api_key:
             raise DataError("Chybí API klíč Twelve Data (Nastavení).", "auth", source=self.name)
         self._key, self._timeout = api_key, timeout
+        self.per_minute = per_minute          # free plan: 8 requests per minute
+        self._sent: deque[float] = deque()
+        self._lock = threading.Lock()
+        self.requests = 0
+
+    def _throttle(self, symbol: str, interval: str):
+        """Keep under the plan's per-minute limit: wait briefly for a free slot, otherwise fail with rate_limit
+        before Twelve Data has to refuse (and count) the request."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._sent and now - self._sent[0] >= 60:
+                    self._sent.popleft()
+                if len(self._sent) < self.per_minute:
+                    self._sent.append(now)
+                    self.requests += 1
+                    return
+                wait = 60 - (now - self._sent[0])
+            if wait > self.MAX_WAIT:
+                raise self._error("rate_limit", True, symbol, interval, None,
+                                  f"místní ochrana limitu {self.per_minute} dotazů za minutu – volno za {wait:.0f} s")
+            time.sleep(wait + 0.05)
 
     def redact(self, text: str) -> str:
         """Remove the API key (and anything that looks like an apikey parameter) and control characters."""
@@ -143,6 +170,7 @@ class TwelveData:
                          provider_message=msg, confirmed=confirmed)
 
     def _get(self, path: str, params: dict, symbol: str = "", interval: str = "") -> dict:
+        self._throttle(symbol, interval)
         url = f"{self.BASE}/{path}?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={"Authorization": f"apikey {self._key}",
                                                    "User-Agent": "cfd-signal-calculator"})
@@ -236,6 +264,59 @@ class TwelveData:
         except DataError as e:
             out.append(("Tarif API", "info", f"nezjištěno ({KIND_TEXT[e.kind].lower()})", ""))
         return out
+
+
+class CachedProvider:
+    """Session cache per (symbol, interval) in front of a provider.
+
+    * no request at all while nothing new can have closed: the series was fetched at least SETTLE after the start
+      of the current bar period (so the last bar that can be closed now was already final when it was fetched);
+    * otherwise only the newest bars are requested and merged by time (newer values win); without an overlap with
+      the cached series the full window is downloaded again;
+    * errors are never hidden behind cached data (the analysis then reports NO DATA, as without the cache).
+    Freshness is still checked by prepare() on every analysis."""
+
+    SETTLE = timedelta(seconds=20)
+
+    def __init__(self, provider, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+        self.provider, self._clock = provider, clock
+        self.name = getattr(provider, "name", "zdroj dat")
+        self._store: dict[tuple[str, str], tuple[list[Bar], datetime]] = {}
+        self._lock = threading.Lock()
+        self.hits = self.partial = self.full = 0
+
+    def clear(self):
+        with self._lock:
+            self._store.clear()
+
+    def bars(self, symbol: str, interval: str, n: int) -> list[Bar]:
+        step = timedelta(minutes=INTERVALS[interval])
+        now = self._clock()
+        period = datetime.fromtimestamp(now.timestamp() // step.total_seconds() * step.total_seconds(), timezone.utc)
+        with self._lock:
+            cached = self._store.get((symbol, interval))
+        if cached and len(cached[0]) >= n:
+            bars, fetched = cached
+            if fetched >= period + self.SETTLE:
+                with self._lock:
+                    self.hits += 1
+                return list(bars[-n:])
+            missing = int((now - bars[-1].t) / step) + 2
+            if missing < n // 2:
+                fresh = self.provider.bars(symbol, interval, max(missing, 5))
+                if fresh and fresh[0].t <= bars[-1].t:
+                    merged = {b.t: b for b in bars}
+                    merged.update({b.t: b for b in fresh})
+                    out = sorted(merged.values(), key=lambda b: b.t)[-max(n, len(bars)):]
+                    with self._lock:
+                        self._store[(symbol, interval)] = (out, now)
+                        self.partial += 1
+                    return out[-n:]
+        fresh = self.provider.bars(symbol, interval, n)
+        with self._lock:
+            self._store[(symbol, interval)] = (list(fresh), now)
+            self.full += 1
+        return list(fresh)
 
 
 def synthetic_bars(now: datetime, minutes: int, n: int, drift: float = 0.0, amp: float = 0.0,
