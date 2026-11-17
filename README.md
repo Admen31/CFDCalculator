@@ -3,7 +3,8 @@
 Malá desktopová aplikace pro Windows, kterou lze nechat nad Trading 212. Rozpozná zvolený instrument
 z vybrané oblasti obrazovky, stáhne svíčky z Twelve Data a vrátí **BUY / SELL / WAIT** s vysvětlením
 a návrhem stop-lossu a take-profitu. Od verze 2.3 navíc ukazuje **MARKET BIAS** (směr trhu) a **WATCH**
-(blížící se obchodní nastavení s tím, co přesně chybí).
+(blížící se obchodní nastavení s tím, co přesně chybí). Verze 2.4 přidává **RISK MANAGEMENT**: maximální velikost
+pozice podle hodnoty účtu, rizika v %, vstupu a stop-lossu.
 
 **Aplikace nikdy nezadává obchody.** Neobsahuje žádné napojení na broker, obchod zadáváte ručně.
 Výsledky nejsou investiční doporučení a ziskovost strategie není ověřena.
@@ -50,6 +51,68 @@ Požadavky: Windows 10/11, Python ≥ 3.12. OCR (RapidOCR) běží offline, nic 
 * OCR model se načítá na pozadí hned po zobrazení okna. START použije čtení Trading 212, které právě běží,
   místo aby čekal ve frontě. Čtení, které visí déle než 8 s, START neblokuje.
 * Při zavření okna se pracovní vlákna bezpečně ukončí.
+
+## Verze 2.4: Risk management – velikost pozice podle rizika účtu
+
+![Stránka RISK MANAGEMENT: vypočtená pozice a stav NEDOSTATEK DAT (syntetická testovací data)](docs/v24-risk.png)
+
+Tlačítko **Risk ▸** na výsledkové kartě otevře stránku **RISK MANAGEMENT**. Spočítá největší množství CFD, při
+kterém plánovaná ztráta při stop-lossu nepřekročí zvolené procento účtu. **Aplikace nic neobchoduje** a hodnotu
+účtu nikdy nečte z Trading 212.
+
+### Nastavení
+
+1. **Účet…**: hodnota účtu (equity), měna (CZK, EUR, USD, GBP, PLN, CHF), maximální riziko na obchod (výchozí
+   **2 %**, rychlé volby 0,5 / 1 / 1,5 / 2 %), volitelně limit nominální hodnoty pozice (např. 10 % účtu)
+   a volná marže.
+2. **Specifikace…**: pro každý instrument opište z Trading 212 (detail instrumentu) velikost kontraktu, minimální
+   množství a krok množství. Nepovinně i maximální množství a maržový požadavek v %. **Aplikace tyto údaje nikdy
+   nedoplňuje sama.** Jedna CFD jednotka nemusí znamenat jednu akcii nebo jednu jednotku měny, proto bez specifikace
+   výpočet ukáže **NELZE SPOČÍTAT**.
+3. Kurz měny kotace → měna účtu se načte z Twelve Data (`/exchange_rate`, platí 1 h). Načítá se jen tehdy, když je
+   to poslední chybějící údaj, nikdy při pouhém rozpoznání instrumentu. Druhá možnost je ruční kurz
+   ve Specifikaci, platný 24 h.
+
+Nastavení se ukládá jen lokálně do INI souboru aplikace.
+
+### Výpočet
+
+```
+rizikový rozpočet      = equity × riziko %                         (50 000 Kč × 2 % = 1 000 Kč)
+riziko na 1 jednotku   = (|vstup − SL| + spread) × kontrakt × kurz
+množství podle rizika  = rozpočet / riziko na jednotku
+množství               = min(podle rizika, limit expozice, volná marže, max. množství), zaokrouhleno DOLŮ na krok
+nominální hodnota      = množství × kontrakt × vstup × kurz
+požadovaná marže       = nominální hodnota × marže %                 (bez zadané marže: NEDOSTUPNÁ)
+ztráta při SL          = množství × riziko na jednotku
+zisk při TP            = množství × (|TP − vstup| − spread) × kontrakt × kurz
+```
+
+Měna kotace se bere z kótování instrumentu: druhá měna páru (EUR/USD → USD, XAU/USD → USD), u akcií a indexů měna
+trhu z katalogu (US akcie a indexy USD, Germany 40 EUR, UK 100 GBP). Spread se počítá celý jednou za obchod.
+Všechny částky se počítají v `Decimal`.
+
+### Stavy
+
+| Stav | Význam |
+|---|---|
+| ✓ **V RÁMCI LIMITU** (zelená) | potvrzený BUY/SELL z analýzy, všechny limity splněné |
+| ◆ **ORIENTAČNÍ** (žlutá) | ruční scénář, ručně upravený signál nebo výzkumné nastavení. Nejde o potvrzený vstup. |
+| ○ **NEDOSTATEK DAT** (žlutá) | chybí účet, specifikace, vstup/SL, spread nebo kurz, nebo jsou data či kurz zastaralé (tržní data > 15 min). Množství se nezobrazí. |
+| ✕ **PŘEKROČENÍ LIMITU** (červená) | neplatný stop-loss nebo TP, nebo ani minimální množství nesplní limit: **POZICE JE PŘÍLIŠ RIZIKOVÁ – NEOTVÍRAT PODLE TOHOTO PLÁNU**, NEDOSTATEČNÁ MARŽE, PŘEKROČEN LIMIT EXPOZICE |
+
+* Potvrzený BUY/SELL automaticky předá vstup, SL a TP a souhrnná karta ukáže „max N ks“.
+* U WAIT, WATCH, NO DATA a ERROR se nic nepředvyplní; lze zadat jen ruční orientační scénář.
+* Po změně instrumentu se starý plán zahodí.
+
+> Výpočet stanovuje plánované riziko při předpokládaném provedení stop-lossu. Skutečná ztráta může být vyšší kvůli
+> skluzu, cenovým gapům, nákladům nebo podmínkám trhu.
+
+**Omezení:**
+* Specifikace a maržové požadavky zadává uživatel a aplikace je nemůže ověřit proti Trading 212.
+* Poplatek Trading 212 za převod měny, financování přes noc a případné další náklady se nepočítají (nejsou spolehlivě
+  známé). Počítá se jen spread, který zadáte.
+* Endpoint `/exchange_rate` je ověřen jen testy s napodobenou odpovědí, ne živým klíčem.
 
 ## Verze 2.3: market bias, WATCH a barevné rozhraní
 

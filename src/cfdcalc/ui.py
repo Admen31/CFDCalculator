@@ -28,7 +28,9 @@ from .availability import Availability, state_text
 from .calendar import Calendar
 from .data import CachedProvider, DataError, SyntheticData, TwelveData
 from .instruments import BY_SYMBOL, Instrument
+from . import risk
 from .ui_instrument import AUTO, InstrumentBar
+from .ui_risk import RiskPage, manual_fx
 from .widgets import ACCENT, BIAS_COLORS, GREEN, RED, SLATE, VERDICT_COLORS, YELLOW, Gauge, ResultPanel, Tile
 
 APP = "CFD Signal Calculator"
@@ -47,6 +49,7 @@ QWidget#page, QStackedWidget#pages { background: transparent; }
 QLabel#muted { color: #94a3b8; font-size: 11px; background: transparent; }
 QLabel#caption { color: #64748b; font-size: 9px; font-weight: 700; letter-spacing: 1px; background: transparent; }
 QLabel#reason { color: #e5e7eb; font-size: 11px; background: transparent; }
+QLabel#value { color: #e5e7eb; font-size: 10px; font-weight: 600; background: transparent; }
 QLabel#waiting { color: #fde68a; font-size: 11px; background: transparent; }
 QProgressBar { background: #1a2030; border-radius: 6px; text-align: center; }
 QProgressBar::chunk { background: #3b82f6; border-radius: 6px; }
@@ -180,6 +183,13 @@ class MainWindow(QWidget):
         for n, k in enumerate(MODULES):
             grid.addWidget(self.tiles[k], n // 2, n % 2)
         self.result = ResultPanel(WIDTH - 28, 290)
+        self.fx_cache: dict[tuple[str, str], risk.Fx] = {}      # rates fetched from Twelve Data this session
+        self._fx_failed: dict[tuple[str, str], datetime] = {}
+        self._levels = ""
+        self.risk_page = RiskPage(self.s, self.spread_of, self.fx_for)
+        self.result.add_page(self.risk_page, "Risk ▸", self.risk_page.back)
+        self.risk_page.summary.connect(self.on_risk_summary)
+        self.risk_page.needs_fx.connect(self.fetch_fx)
 
         self.spread = QLineEdit()
         self.spread.setToolTip("Aktuální spread z Trading 212 (rozdíl BUY − SELL) v cenových jednotkách")
@@ -205,6 +215,7 @@ class MainWindow(QWidget):
         lay.addLayout(sp)
         lay.addWidget(self.footer)
         self.refresh_header()
+        self.risk_page.load(self.inst, None)
         self.setFixedWidth(WIDTH)
         self.adjustSize()
         self.setFixedSize(self.size())                 # never resizes afterwards: no visible jumping
@@ -246,6 +257,7 @@ class MainWindow(QWidget):
             except ValueError:
                 value = 0.0  # invalid input -> analysis reports "spread není zadán"
             self.s.setValue(f"spread/{self.inst.symbol}", value)
+            self.risk_page.recompute()
 
     @property
     def inst(self) -> Instrument | None:
@@ -278,6 +290,8 @@ class MainWindow(QWidget):
         self.refresh_header()
         if self.shown and inst != self.shown:
             self.mark_historical()
+        elif inst != self.risk_page.inst:
+            self.risk_page.load(inst, None)
         if not self.running():
             self.gauge.show_state(0, "START", "spustit analýzu" if inst else "vyberte instrument", ACCENT)
             if inst and not self.demo():   # local record only - no network request on recognition
@@ -288,6 +302,7 @@ class MainWindow(QWidget):
     def mark_historical(self):
         """The instrument changed: the result on screen no longer applies to what Trading 212 shows."""
         old = self.shown
+        self.risk_page.load(self.inst, None)     # an old signal is never sized for the new instrument
         self.result.mark_historical(f"Instrument se změnil – signál platil jen pro {old.name} ({old.symbol}) "
                                     f"a je historický.")
         for t in self.tiles.values():
@@ -317,6 +332,7 @@ class MainWindow(QWidget):
         calendar = _NoNews() if self.demo() else Calendar(data_dir() / "calendar.json")
         self.analysed, self.shown = inst, None
         self.bar.remember(inst)
+        self._levels = ""
         self.result.clear()
         self._gen += 1
         gen, self._cancel = self._gen, threading.Event()
@@ -395,15 +411,61 @@ class MainWindow(QWidget):
         self.result.show_result(r, title, levels, stamp, detail_html(r, inst, self.bar.last_ocr_ms),
                                 instrument=f"{inst.name} ({inst.symbol}) · {r.profile or PROFILES[inst.kind].name}",
                                 **v)
+        self._levels = levels
         if inst != self.inst:  # the instrument changed while the analysis was running
             self.mark_historical()
             return
+        self.risk_page.load(inst, r)             # a confirmed BUY/SELL hands entry, SL and TP over
         if not self.demo():
             av = self.availability()
             for source, symbol, interval, state, detail in r.sources:
                 av.record(source, symbol, interval, state, detail)
         if r.is_signal and not self.demo():
             journal_add(data_dir() / "journal.csv", inst.symbol, r.verdict, r.data_time, r.entry, r.sl, r.tp)
+
+    # ---- risk management ----
+    def on_risk_summary(self, line: str):
+        """Max quantity of a confirmed signal on the summary card (first line of the levels)."""
+        if self._levels and not self.result.verdict.text().startswith("HISTORICKÝ"):
+            first, *rest = self._levels.split("\n")
+            self.result.levels.setText("\n".join([first + (f"  · {line}" if line else "")] + rest))
+
+    def fx_for(self, quote: str, acc: str) -> risk.Fx | None:
+        """Rate quote -> account currency: the same currency, a fresh Twelve Data rate, or the user's manual rate.
+        Returns the best one available (size() then decides whether it is recent enough)."""
+        now = datetime.now(timezone.utc)
+        if quote == acc:
+            return risk.Fx(risk.Decimal(1), now, "stejná měna")
+        fetched, manual = self.fx_cache.get((quote, acc)), manual_fx(self.s, quote, acc)
+        if fetched and now - fetched.time <= risk.MAX_FX_AGE:
+            return fetched
+        if manual and now - manual.time <= risk.MAX_MANUAL_FX_AGE:
+            return manual
+        return fetched or manual
+
+    def fetch_fx(self, quote: str, acc: str):
+        """Fetch a missing rate in the background (live mode only, one request, retried at most every 5 min)."""
+        pair, now = (quote, acc), datetime.now(timezone.utc)
+        failed = self._fx_failed.get(pair)
+        if self.demo() or pair in self._fx_failed and failed and (now - failed).total_seconds() < 300:
+            return
+        try:
+            td = self.provider().provider
+        except (DataError, AttributeError):
+            return
+        self._fx_failed[pair] = now          # also marks "in progress"; cleared on success
+        task = Task(lambda _: td.exchange_rate(quote, acc))
+
+        def done(res):
+            rate, when = res
+            self.fx_cache[pair] = risk.Fx(rate, when, "Twelve Data")
+            self._fx_failed.pop(pair, None)
+            self.risk_page.recompute()
+        task.done.connect(done)
+        task.failed.connect(lambda msg: self.step.setText(f"Kurz {quote}→{acc}: {td.redact(msg)[:80]}"))
+        self._retired.append(task)
+        task.finished.connect(lambda t=task: self._retired.remove(t) if t in self._retired else None)
+        task.start()
 
     def availability(self) -> Availability:
         return Availability(data_dir() / "availability.json")

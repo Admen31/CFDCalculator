@@ -14,6 +14,7 @@ import urllib.request
 from dataclasses import dataclass
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from itertools import pairwise
 from typing import Callable, Protocol
 
@@ -234,6 +235,29 @@ class TwelveData:
             raise self._error("no_data", True, symbol, interval, 200, "0 svíček")
         out.sort(key=lambda b: b.t)
         return out
+
+    def exchange_rate(self, base: str, quote: str) -> tuple[Decimal, datetime]:
+        """1 `base` in `quote` (e.g. USD -> CZK) from GET /exchange_rate; tries the inverse pair when the direct one is
+        not listed. Returns (rate, quote time UTC). Never guesses: any doubt raises DataError."""
+        errors = []
+        for pair, invert in ((f"{base}/{quote}", False), (f"{quote}/{base}", True)):
+            try:
+                body = self._get("exchange_rate", {"symbol": pair}, pair)
+            except DataError as e:
+                errors.append(e)
+                if e.kind not in ("not_found", "request", "unknown"):
+                    raise
+                continue
+            got = str(body.get("symbol", "")).upper()
+            try:
+                rate = Decimal(str(body["rate"]))
+                when = datetime.fromtimestamp(int(body["timestamp"]), timezone.utc)
+            except (KeyError, ValueError, TypeError, ArithmeticError):
+                raise self._error("invalid", True, pair, "", 200, "kurz bez hodnoty nebo času") from None
+            if got != pair or not rate.is_finite() or rate <= 0:
+                raise self._error("invalid", True, pair, "", 200, f"neplatný kurz {got} {rate}")
+            return (1 / rate if invert else rate), when
+        raise errors[-1]
 
     def probe(self, symbol: str, intervals=("5min", "15min", "1h")) -> list[tuple[str, str, str, str]]:
         """Availability check for one symbol: catalogue listing + a 2-bar request per interval + plan usage.

@@ -313,10 +313,10 @@ class ResultPanel(QFrame):
         self.lower.addWidget(self.levels)
         sl.addWidget(self.lower)
         sl.addLayout(self.filters)
-        bottom = QHBoxLayout()
-        bottom.addWidget(self.stamp, 1)
-        bottom.addWidget(self.detail_btn, 0, Qt.AlignmentFlag.AlignBottom)
-        sl.addLayout(bottom)
+        self.bottom = QHBoxLayout()
+        self.bottom.addWidget(self.stamp, 1)
+        self.bottom.addWidget(self.detail_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        sl.addLayout(self.bottom)
 
         self.detail = QTextBrowser()
         self.detail.setStyleSheet("background: transparent; border: none; font-size: 11px;")
@@ -333,6 +333,16 @@ class ResultPanel(QFrame):
         lay.addWidget(self.pages)
         self._paint_verdict()
         self.set_pills(None, None)
+
+    def add_page(self, page: QWidget, button: str, back: QPushButton) -> QPushButton:
+        """Extra page reachable from the summary (v2.4: RISK MANAGEMENT)."""
+        index = self.pages.addWidget(page)
+        btn = QPushButton(button)
+        btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        btn.clicked.connect(lambda: self.pages.setCurrentIndex(index))
+        back.clicked.connect(lambda: self.pages.setCurrentIndex(0))
+        self.bottom.insertWidget(1, btn, 0, Qt.AlignmentFlag.AlignBottom)
+        return btn
 
     # ---- colour of the card (animated) ----
     def _get_vcolor(self) -> QColor:

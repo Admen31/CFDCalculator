@@ -1,0 +1,358 @@
+"""v2.4 UI: "Můj účet" dialog, instrument specification dialog and the RISK MANAGEMENT page of the result card.
+
+Everything the calculation needs is typed in by the user or comes from the analysis / Twelve Data; nothing is read
+from Trading 212 and nothing is ordered anywhere. Settings live in the app's local INI file (QSettings).
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Callable
+
+from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget)
+
+from . import risk
+from .analysis import BUY, ERROR, NO_DATA, SELL, Result
+from .instruments import Instrument
+from .risk import LIMIT, NODATA, OK, ORIENTATION, Account, Fx, Plan, Spec
+from .widgets import GREEN, RED, YELLOW, tint
+
+STATE_COLORS = {OK: GREEN, ORIENTATION: YELLOW, NODATA: YELLOW, LIMIT: RED}
+STATE_ICONS = {OK: "✓", ORIENTATION: "◆", NODATA: "○", LIMIT: "✕"}
+
+
+def _key(symbol: str) -> str:
+    return symbol.replace("/", "_")
+
+
+def load_account(s: QSettings) -> Account:
+    pct = risk.num(s.value("account/risk_pct", "2")) or risk.DEFAULT_RISK
+    notional = risk.num(s.value("account/notional_pct", "")) if s.value("account/notional_on", False, type=bool) \
+        else None
+    return Account(risk.num(s.value("account/equity", "")), str(s.value("account/currency", "CZK")), pct, notional,
+                   risk.num(s.value("account/free_margin", "")))
+
+
+def load_spec(s: QSettings, inst: Instrument) -> Spec:
+    k = f"spec/{_key(inst.symbol)}"
+    return Spec(*(risk.num(s.value(f"{k}/{f}", "")) for f in ("contract", "min_qty", "step", "max_qty", "margin_pct")))
+
+
+def manual_fx(s: QSettings, quote: str, acc: str) -> Fx | None:
+    rate = risk.num(s.value(f"fx/{quote}{acc}/rate", ""))
+    try:
+        when = datetime.fromisoformat(str(s.value(f"fx/{quote}{acc}/time", "")))
+    except ValueError:
+        return None
+    return Fx(rate, when, "ruční zadání") if rate else None
+
+
+def _decimal_text(x) -> str:
+    return "" if x is None else f"{Decimal(x).normalize():f}" if isinstance(x, Decimal) else str(x)
+
+
+class AccountDialog(QDialog):
+    """MŮJ ÚČET / RISK MANAGEMENT: equity, currency, risk per trade, optional exposure limit and free margin."""
+
+    def __init__(self, s: QSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Můj účet / Risk management")
+        self.s = s
+        acc = load_account(s)
+        self.equity = QLineEdit(_decimal_text(acc.equity), placeholderText="např. 50 000")
+        self.currency = QComboBox()
+        self.currency.addItems(risk.CURRENCIES)
+        self.currency.setCurrentText(acc.currency)
+        self.risk = QDoubleSpinBox(minimum=0.1, maximum=100.0, singleStep=0.1, decimals=2, suffix=" %",
+                                   value=float(acc.risk_pct))
+        quick = QHBoxLayout()
+        for q in risk.QUICK_RISK:
+            b = QPushButton(f"{q.replace('.', ',')} %")
+            b.clicked.connect(lambda _=False, q=q: self.risk.setValue(float(q)))
+            quick.addWidget(b)
+        self.notional_on = QCheckBox("Omezit nominální hodnotu pozice na")
+        self.notional_on.setChecked(s.value("account/notional_on", False, type=bool))
+        self.notional = QDoubleSpinBox(minimum=1.0, maximum=10000.0, decimals=1, suffix=" % účtu",
+                                       value=float(risk.num(s.value("account/notional_pct", "10")) or 10))
+        self.margin = QLineEdit(_decimal_text(acc.free_margin), placeholderText="nepovinné")
+        self.error = QLabel("", objectName="muted")
+        form = QFormLayout(self)
+        form.addRow("Hodnota účtu (equity)", self.equity)
+        form.addRow("Měna účtu", self.currency)
+        form.addRow("Max. riziko na obchod", self.risk)
+        form.addRow("", quick)
+        row = QHBoxLayout()
+        row.addWidget(self.notional_on)
+        row.addWidget(self.notional)
+        form.addRow(row)
+        form.addRow("Volná marže (v měně účtu)", self.margin)
+        form.addRow(QLabel("Hodnotu účtu zadáváte ručně – aplikace se k Trading 212 nepřipojuje.\n"
+                           f"Ukládá se jen lokálně do {s.fileName()}.", objectName="muted"))
+        form.addRow(self.error)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.save)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def save(self):
+        for field, text in ((self.equity, "Hodnota účtu"), (self.margin, "Volná marže")):
+            if field.text().strip() and risk.num(field.text()) is None:
+                self.error.setText(f"{text}: zadejte kladné číslo.")
+                return
+        s = self.s
+        s.setValue("account/equity", str(risk.num(self.equity.text()) or ""))
+        s.setValue("account/currency", self.currency.currentText())
+        s.setValue("account/risk_pct", f"{self.risk.value():g}")
+        s.setValue("account/notional_on", self.notional_on.isChecked())
+        s.setValue("account/notional_pct", f"{self.notional.value():g}")
+        s.setValue("account/free_margin", str(risk.num(self.margin.text()) or ""))
+        self.accept()
+
+
+class SpecDialog(QDialog):
+    """Trading 212 specification of one instrument, typed in by the user (never filled in by the app)."""
+
+    FIELDS = (("contract", "Velikost kontraktu (jednotek podkladu na 1 CFD)", True),
+              ("min_qty", "Minimální množství", True), ("step", "Krok množství", True),
+              ("max_qty", "Maximální množství", False), ("margin_pct", "Maržový požadavek (%)", False))
+
+    def __init__(self, s: QSettings, inst: Instrument, account_ccy: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Specifikace – {inst.name} ({inst.symbol})")
+        self.s, self.inst, self.acc = s, inst, account_ccy
+        self.quote = risk.quote_currency(inst)
+        spec = load_spec(s, inst)
+        self.edits = {}
+        form = QFormLayout(self)
+        form.addRow(QLabel("Opište údaje z Trading 212 (detail instrumentu). Aplikace je nikdy nedoplňuje sama;\n"
+                           "bez nich výpočet ukáže NELZE SPOČÍTAT.", objectName="muted"))
+        for key, label, required in self.FIELDS:
+            e = QLineEdit(_decimal_text(getattr(spec, key)), placeholderText="povinné" if required else "nepovinné")
+            self.edits[key] = e
+            form.addRow(label, e)
+        form.addRow("Měna kotace", QLabel(f"{self.quote} (z kótování {inst.symbol})"))
+        fx = manual_fx(s, self.quote, account_ccy)
+        self.rate = QLineEdit(_decimal_text(fx.rate if fx else None), placeholderText="nepovinné – jinak Twelve Data")
+        self.rate.setEnabled(self.quote != account_ccy)
+        form.addRow(f"Ruční kurz: 1 {self.quote} = ? {account_ccy}", self.rate)
+        if fx:
+            form.addRow("", QLabel(f"zadáno {fx.time.astimezone():%d.%m.%Y %H:%M}, platí 24 h", objectName="muted"))
+        self.error = QLabel("", objectName="muted")
+        form.addRow(self.error)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.save)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def save(self):
+        for key, label, _ in self.FIELDS:
+            t = self.edits[key].text().strip()
+            if t and risk.num(t) is None:
+                self.error.setText(f"{label}: zadejte kladné číslo.")
+                return
+        if self.rate.text().strip() and risk.num(self.rate.text()) is None:
+            self.error.setText("Kurz: zadejte kladné číslo.")
+            return
+        k = f"spec/{_key(self.inst.symbol)}"
+        for key, _, _ in self.FIELDS:
+            self.s.setValue(f"{k}/{key}", str(risk.num(self.edits[key].text()) or ""))
+        self.s.setValue(f"{k}/updated", datetime.now(timezone.utc).isoformat())
+        rate = risk.num(self.rate.text())
+        old = manual_fx(self.s, self.quote, self.acc)
+        if rate and (old is None or old.rate != rate):
+            self.s.setValue(f"fx/{self.quote}{self.acc}/rate", str(rate))
+            self.s.setValue(f"fx/{self.quote}{self.acc}/time", datetime.now(timezone.utc).isoformat())
+        elif not rate:
+            self.s.remove(f"fx/{self.quote}{self.acc}")
+        self.accept()
+
+
+def plan_from_result(r: Result | None) -> tuple[Plan, str]:
+    """What the analysis hands to the risk page, and a note. Only a confirmed BUY/SELL is a confirmed plan."""
+    if r is None:
+        return Plan(None, None, origin="ruční zadání"), "Zadejte vstup a stop-loss."
+    if r.verdict in (NO_DATA, ERROR):
+        return Plan(None, None, origin="ruční zadání"), f"Výsledek {r.verdict} – údaje analýzy se nepoužijí."
+    if r.verdict in (BUY, SELL) and r.is_signal:
+        return Plan(r.entry, r.sl, r.tp, True, "potvrzený signál", r.data_time), f"Potvrzený {r.verdict} z analýzy."
+    o = r.opportunity
+    if o and o.state == "trigger" and o.entry is not None and o.sl is not None:
+        def dec(x):
+            return Decimal(repr(x))
+        return (Plan(dec(o.entry), dec(o.sl), dec(o.tp) if o.tp is not None else None, False,
+                     f"výzkumné nastavení {o.name}", r.data_time),
+                f"{o.name}: výzkumné nastavení, ne potvrzený signál.")
+    what = "WATCH" if o and o.state == "watch" else r.verdict
+    return Plan(None, None, origin="ruční zadání"), f"{what} – bez potvrzeného vstupu; jen ruční orientační scénář."
+
+
+class RiskPage(QWidget):
+    """RISK MANAGEMENT page. Recomputes on every input change; never opens a trade."""
+    summary = Signal(str)          # one line for the main card ("max 12 ks · ztráta 980 CZK"), "" = nothing
+    needs_fx = Signal(str, str)    # quote, account currency: ask the window to fetch a rate
+
+    def __init__(self, s: QSettings, spread_of: Callable, fx_of: Callable, clock=lambda: datetime.now(timezone.utc)):
+        super().__init__(objectName="page")
+        self.s, self.spread_of, self.fx_of, self.clock = s, spread_of, fx_of, clock
+        self.inst: Instrument | None = None
+        self.base = Plan(None, None)
+        self.note = ""
+        self._loaded: tuple[str, ...] = ("", "", "")
+        self.last: risk.Sizing | None = None
+        title = QLabel("RISK MANAGEMENT", objectName="caption")
+        self.state = QLabel("", objectName="pill")
+        self.state.setFixedHeight(20)
+        self.account = QLabel("", objectName="muted")
+        self.instrument = QLabel("", objectName="muted")
+        acc_btn, spec_btn = QPushButton("Účet…"), QPushButton("Specifikace…")
+        for b in (acc_btn, spec_btn):
+            b.setStyleSheet("padding: 1px 6px; font-size: 11px;")
+        acc_btn.clicked.connect(self.edit_account)
+        spec_btn.clicked.connect(self.edit_spec)
+        self.entry, self.sl, self.tp = (QLineEdit(placeholderText=t) for t in ("vstup", "stop-loss", "take-profit"))
+        for e in (self.entry, self.sl, self.tp):
+            e.setFixedHeight(22)
+            e.setStyleSheet("padding: 1px 4px; font-size: 11px;")
+            e.textEdited.connect(lambda _=None: self.recompute())
+        self.qty = QLabel("NELZE SPOČÍTAT")
+        self.qty.setFixedHeight(26)
+        self.values = {}
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(0)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        for n, name in enumerate(("Nominální hodnota", "Požadovaná marže", "Ztráta při SL", "Zisk při TP",
+                                  "Risk/reward", "Riziko účtu")):
+            lab, val = QLabel(name, objectName="muted"), QLabel("–", objectName="value")
+            lab.setStyleSheet("font-size: 10px; color: #94a3b8; background: transparent;")
+            for w in (lab, val):
+                w.setFixedHeight(15)
+            col = 0 if n < 3 else 2              # left: exposure, margin, loss; right: profit, R:R, risk %
+            grid.addWidget(lab, n % 3, col)
+            grid.addWidget(val, n % 3, col + 1)
+            self.values[name] = val
+        self.message = QLabel("", wordWrap=True, objectName="reason")
+        self.message.setFixedHeight(42)
+        self.message.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        warn = QLabel(risk.WARNING, wordWrap=True, objectName="muted")
+        warn.setStyleSheet("font-size: 9px; color: #94a3b8; background: transparent;")
+        self.back = QPushButton("◂ Zpět")
+        self.back.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 6)
+        lay.setSpacing(2)
+        top = QHBoxLayout()
+        top.addWidget(title, 1)
+        top.addWidget(self.state)
+        lay.addLayout(top)
+        for label, btn in ((self.account, acc_btn), (self.instrument, spec_btn)):
+            row = QHBoxLayout()
+            row.addWidget(label, 1)
+            row.addWidget(btn)
+            lay.addLayout(row)
+        edits = QHBoxLayout()
+        edits.setSpacing(4)
+        for text, e in (("Vstup", self.entry), ("SL", self.sl), ("TP", self.tp)):
+            lab = QLabel(text, objectName="muted")
+            lab.setBuddy(e)
+            edits.addWidget(lab)
+            edits.addWidget(e, 1)
+        lay.addLayout(edits)
+        lay.addWidget(self.qty)
+        lay.addLayout(grid)
+        lay.addWidget(self.message)
+        lay.addWidget(warn)
+        lay.addWidget(self.back, 0, Qt.AlignmentFlag.AlignRight)
+
+    # ---- inputs ----
+    def load(self, inst: Instrument | None, r: Result | None):
+        """New analysis result or instrument: refill entry/SL/TP from what the analysis may hand over."""
+        self.inst = inst
+        self.base, self.note = plan_from_result(r)
+        d = inst.decimals if inst else 5
+        for e, v in ((self.entry, self.base.entry), (self.sl, self.base.sl), (self.tp, self.base.tp)):
+            e.setText("" if v is None else f"{v.quantize(Decimal(1).scaleb(-d)):f}")
+        self._loaded = self._texts()
+        if self.base.entry is not None:     # the plan uses exactly the rounded values shown
+            entry, sl, tp = (risk.num(t) for t in self._loaded)
+            self.base = replace(self.base, entry=entry, sl=sl, tp=tp)
+        self.recompute()
+
+    def _texts(self) -> tuple[str, ...]:
+        return tuple(e.text().strip() for e in (self.entry, self.sl, self.tp))
+
+    def plan(self) -> Plan:
+        """The analysis plan while the fields are untouched; any edit makes it a manual (orientational) scenario."""
+        if self.base.entry is not None and self._texts() == self._loaded:
+            return self.base
+        entry, sl, tp = (risk.num(t) for t in self._texts())
+        return Plan(entry, sl, tp, False, "ruční úprava" if self.base.entry is not None else "ruční zadání")
+
+    def edit_account(self):
+        if AccountDialog(self.s, self).exec():
+            self.recompute()
+
+    def edit_spec(self):
+        if self.inst and SpecDialog(self.s, self.inst, load_account(self.s).currency, self).exec():
+            self.recompute()
+
+    # ---- calculation + display ----
+    def recompute(self):
+        acc = load_account(self.s)
+        inst = self.inst
+        self.account.setText(
+            "Účet: nezadán – klikněte na Účet…" if acc.equity is None else
+            f"Účet {risk.money(acc.equity, acc.currency)} · riziko {acc.risk_pct.normalize():f} % = "
+            f"{risk.money(acc.budget, acc.currency)}")
+        if inst is None:
+            self.instrument.setText("Instrument: nevybrán")
+            self._show(risk.Sizing(messages=["Vyberte instrument."]), acc)
+            return
+        spec = load_spec(self.s, inst)
+        quote = risk.quote_currency(inst)
+        self.instrument.setText(f"{inst.name} ({inst.symbol}) · spec. "
+                                + ("CHYBÍ" if spec.missing() else "zadána"))
+        fx = self.fx_of(quote, acc.currency)
+        plan = self.plan()
+        spread = risk.num(f"{self.spread_of(inst)}")
+        out = risk.size(acc, spec, plan, spread, fx, self.clock(), quote)
+        # network only when the rate is the last missing piece (never on a mere instrument change)
+        if out.state == NODATA and quote != acc.currency and acc.equity is not None and not spec.missing() \
+                and plan.entry is not None and plan.sl is not None and spread is not None \
+                and (fx is None or fx.source != "stejná měna" and "kurz" in out.messages[0]):
+            self.needs_fx.emit(quote, acc.currency)
+        self._show(out, acc)
+
+    def _show(self, out: risk.Sizing, acc: Account):
+        self.last = out
+        color = STATE_COLORS[out.state]
+        self.state.setText(f"{STATE_ICONS[out.state]} {out.state}")
+        self.state.setStyleSheet(f"background: {tint(color, 34)}; color: {color}; border: 1px solid "
+                                 f"{tint(color, 90)}; border-radius: 10px; padding: 0 8px; font-weight: 700; "
+                                 "font-size: 10px;")
+        big = f"MAX. MNOŽSTVÍ: {out.headline}" if out.qty is not None else out.headline
+        self.qty.setText(big)
+        self.qty.setStyleSheet(f"font-size: 17px; font-weight: 800; background: transparent; color: {color};")
+        c = acc.currency
+        rr = "–" if out.rr is None else f"1:{out.rr:.2f}".replace(".", ",")
+        pct = "–" if out.risk_pct is None else f"{out.risk_pct:.2f} %".replace(".", ",")
+        margin = "NEDOSTUPNÁ" if out.qty is not None and out.margin is None else risk.money(out.margin, c)
+        for name, text in (("Nominální hodnota", risk.money(out.notional, c)), ("Požadovaná marže", margin),
+                           ("Ztráta při SL", risk.money(out.loss_sl, c)), ("Zisk při TP", risk.money(out.profit_tp, c)),
+                           ("Risk/reward", rr), ("Riziko účtu", pct)):
+            self.values[name].setText(text)
+        fx = f" Kurz: 1 {risk.quote_currency(self.inst)} = {out.fx.rate:.4f} {c} ({out.fx.source})." \
+            if out.fx and out.fx.source != "stejná měna" and self.inst else ""
+        self.message.setText(" ".join([self.note] + out.messages) + fx)
+        self.message.setStyleSheet(f"color: {'#fca5a5' if out.state == LIMIT else '#e5e7eb'}; font-size: 10px; "
+                                   "background: transparent;")
+        line = ""
+        if out.qty is not None and out.state == OK:
+            line = f"max {out.headline}"
+        self.summary.emit(line)
+

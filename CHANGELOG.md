@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.4.0 – Risk management: velikost CFD pozice podle rizika účtu (větev `v2.4-risk-position-sizing`)
+
+* **Můj účet** (Risk ▸ → Účet…): hodnota účtu, měna (CZK, EUR, USD, GBP, PLN, CHF), riziko na obchod (výchozí 2 %,
+  rychlé volby 0,5 / 1 / 1,5 / 2 %), volitelný limit nominální hodnoty pozice v % účtu a volitelná volná marže.
+  Ukládá se jen lokálně, nic se nečte z Trading 212.
+* **Specifikace instrumentu** (Risk ▸ → Specifikace…): velikost kontraktu, minimální množství, krok, maximální
+  množství, maržový požadavek. Vyplňuje je uživatel podle Trading 212. Aplikace žádnou hodnotu nedoplňuje, takže
+  bez nich ukáže NELZE SPOČÍTAT.
+* **Výpočet** (`risk.py`, Decimal): rizikový rozpočet = equity × riziko %, riziko na jednotku =
+  (|vstup − SL| + spread) × kontrakt × kurz, množství = rozpočet / riziko na jednotku, zaokrouhlené dolů na krok.
+  Platí zároveň limit expozice, volná marže a maximální množství. Riziko, nominální hodnota a marže jsou
+  oddělené veličiny.
+* Je-li i minimální množství nad limitem, výsledek je „POZICE JE PŘÍLIŠ RIZIKOVÁ – NEOTVÍRAT PODLE TOHOTO PLÁNU“
+  (nebo NEDOSTATEČNÁ MARŽE / PŘEKROČEN LIMIT EXPOZICE). Větší riziko se nikdy nenavrhuje.
+* **Kurz** měny kotace → měna účtu: Twelve Data `/exchange_rate` (na pozadí, jen když je to poslední chybějící údaj,
+  platný 1 h), nebo ruční kurz (platný 24 h). Bez kurzu se množství nespočítá.
+* **Napojení na analýzu**: potvrzený BUY/SELL předá vstup, SL a TP a souhrnná karta ukáže „max N ks“. Výzkumné
+  nastavení a ručně upravená čísla dávají jen ORIENTAČNÍ scénář. U WAIT, WATCH, NO DATA a ERROR se nic
+  nepředvyplní. Data starší než 15 min a změna instrumentu množství zablokují.
+* Barvy: zelená = v rámci limitu, žlutá = orientační nebo chybí údaje, červená = překročený limit nebo neplatný SL.
+  Každý stav má i ikonu a slovo.
+* Upozornění na skluz a gapy je přímo na stránce. Nic se neobchoduje.
+
+
 ## 2.3.0 – chytřejší signály, WATCH a barevné rozhraní (větev `v2.3-smart-signals-color-ui`)
 
 ### Rozhodování
