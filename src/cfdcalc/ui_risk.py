@@ -176,6 +176,9 @@ def plan_from_result(r: Result | None) -> tuple[Plan, str]:
         return Plan(None, None, origin="ruční zadání"), "Zadejte vstup a stop-loss."
     if r.verdict in (NO_DATA, ERROR):
         return Plan(None, None, origin="ruční zadání"), f"Výsledek {r.verdict} – údaje analýzy se nepoužijí."
+    if r.reference:     # prices of another product never become CFD entry, SL or position size
+        return Plan(None, None, origin="ruční zadání"), ("Analýza běžela na referenčních datech – vstup a SL "
+                                                         "z ní nelze převzít; jen ruční orientační scénář.")
     if r.verdict in (BUY, SELL) and r.is_signal:
         return Plan(r.entry, r.sl, r.tp, True, "potvrzený signál", r.data_time), f"Potvrzený {r.verdict} z analýzy."
     o = r.opportunity

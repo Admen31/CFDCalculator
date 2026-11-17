@@ -11,13 +11,20 @@ from cfdcalc.instruments import BY_SYMBOL, CATALOG
 
 
 def test_catalogue_mapping_rules():
+    from cfdcalc.instruments import sources
     for sym in ("SPX", "NDX", "DJI", "DAX", "FTSE", "NG/USD"):   # Twelve Data lists ETFs/other firms or nothing
         assert not BY_SYMBOL[sym].td_verified
+        assert sources(BY_SYMBOL[sym]) and not any(s.exact for s in sources(BY_SYMBOL[sym]))   # references only
+        assert all(s.label and s.exchange for s in sources(BY_SYMBOL[sym]))
     for inst in CATALOG:
-        if inst.kind == "stock":
-            assert inst.exchange in ("NASDAQ", "NYSE") and inst.td_verified, inst
+        if inst.kind in ("stock", "etf"):
+            assert inst.exchange in ("NASDAQ", "NYSE", "CBOE", "XETR", "Euronext", "LSE", "SIX") and inst.td_verified
+            assert inst.currency and all(s.exchange == inst.exchange for s in sources(inst)), inst
         if inst.kind == "forex" or inst.symbol in ("XAU/USD", "XAG/USD", "WTI/USD", "XBR/USD"):
             assert inst.td_verified and not inst.exchange
+        if inst.kind == "crypto":
+            assert [s.provider for s in sources(inst)] == ["coinbase", "twelvedata"]
+    assert BY_SYMBOL["XAG/USD"].sources[0].plan == "Grow" and BY_SYMBOL["XAU/USD"].td_verified
 
 
 class Resp(io.BytesIO):

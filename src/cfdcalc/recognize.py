@@ -72,6 +72,7 @@ class Recognition:
     candidates: tuple[Instrument, ...]
     text: str
     competing: tuple[Instrument, ...] = ()   # other instruments found with (almost) the same certainty
+    top: float = 0.0                         # score of the best candidate, even when it was not accepted
 
     @property
     def confident(self) -> bool:
@@ -86,7 +87,7 @@ class Recognition:
             return "v oblasti není žádný text"
         if len(self.competing) > 1:
             return "nejednoznačné – v oblasti je více instrumentů: " + ", ".join(i.name for i in self.competing[:3])
-        if not self.candidates or self.score < 0.6:
+        if not self.candidates or max(self.score, self.top) < 0.6:
             return f"text „{self.text[:40]}“ neodpovídá žádnému podporovanému instrumentu"
         return f"nízká jistota rozpoznání (text „{self.text[:40]}“)"
 
@@ -107,4 +108,4 @@ def match(lines: list[str], catalog: tuple[Instrument, ...] = CATALOG) -> Recogn
     candidates = tuple(i for s, _, i in scored[:6] if s >= 0.5)
     best = i1 if s1 > 0 and not rivals else None
     competing = (i1, *rivals) if rivals and floor else ()
-    return Recognition(best, s1 if best else 0.0, candidates, " | ".join(lines), competing)
+    return Recognition(best, s1 if best else 0.0, candidates, " | ".join(lines), competing, s1)

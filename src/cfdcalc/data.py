@@ -56,6 +56,9 @@ KIND_TEXT = {
     "no_data": "Poskytovatel nevrátil dostatek historických dat",
     "request": "Poskytovatel odmítl parametry požadavku",
     "unknown": "Příčinu poskytovatel neupřesnil",
+    "unmapped": "Symbol není namapován na ověřený zdroj dat",
+    "stale": "Data jsou zastaralá (trh stojí, nebo poskytovatel data zpožďuje)",
+    "short": "Nedostatek historických svíček",
 }
 NEXT_STEP = {
     "not_found": "ověř zápis symbolu (Nastavení → Ověřit dostupnost dat).",
@@ -69,6 +72,9 @@ NEXT_STEP = {
     "no_data": "trh může být zavřený nebo symbol nemá data v tomto intervalu.",
     "request": "spusť Ověřit dostupnost dat a výsledek pošli k analýze.",
     "unknown": "ověř dostupnost symbolu a oprávnění API tarifu (Nastavení → Ověřit dostupnost dat).",
+    "unmapped": "vyber instrument z katalogu nebo ho přidej přes Trhy → Přidat instrument.",
+    "stale": "ověř, zda trh právě obchoduje; zpožděná data tarifu nelze použít pro 5min signál.",
+    "short": "zkus to později (nový nebo málo obchodovaný instrument).",
 }
 _PLAN_WORDS = ("plan", "upgrade", "subscription", "pricing", "available starting", "grow", "pro plan")
 
@@ -128,6 +134,21 @@ class TwelveData:
         self._sent: deque[float] = deque()
         self._lock = threading.Lock()
         self.requests = 0
+        self.per_day = 800                    # free plan daily cap; counted locally per UTC day
+        self._day: tuple[str, int] = ("", 0)
+        self._blocked_until = 0.0             # monotonic time from a Retry-After answer
+        self.credits: dict[str, str] = {}     # api-credits-used / -left from the last response, if sent
+
+    def usage(self) -> str:
+        """Human summary of the known limits (no network)."""
+        day, n = self._day
+        parts = [f"dnes {n}/{self.per_day} dotazů (místní počet)", f"limit {self.per_minute}/min"]
+        if self.credits:
+            parts.append("server: " + ", ".join(f"{k} {v}" for k, v in self.credits.items()))
+        wait = self._blocked_until - time.monotonic()
+        if wait > 0:
+            parts.append(f"pauza podle Retry-After ještě {wait:.0f} s")
+        return " · ".join(parts)
 
     def _throttle(self, symbol: str, interval: str):
         """Keep under the plan's per-minute limit: wait briefly for a free slot, otherwise fail with rate_limit
@@ -135,11 +156,22 @@ class TwelveData:
         while True:
             with self._lock:
                 now = time.monotonic()
+                if now < self._blocked_until:
+                    left = self._blocked_until - now
+                    raise self._error("rate_limit", True, symbol, interval, None,
+                                      f"poskytovatel požádal o pauzu (Retry-After) – ještě {left:.0f} s")
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if self._day[0] != today:
+                    self._day = (today, 0)
+                if self._day[1] >= self.per_day:
+                    raise self._error("rate_limit", True, symbol, interval, None,
+                                      f"místní ochrana denního limitu {self.per_day} dotazů – další den po půlnoci UTC")
                 while self._sent and now - self._sent[0] >= 60:
                     self._sent.popleft()
                 if len(self._sent) < self.per_minute:
                     self._sent.append(now)
                     self.requests += 1
+                    self._day = (today, self._day[1] + 1)
                     return
                 wait = 60 - (now - self._sent[0])
             if wait > self.MAX_WAIT:
@@ -178,11 +210,15 @@ class TwelveData:
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as r:  # nosec B310 - fixed https base URL
                 raw = r.read()
+                self._remember_credits(getattr(r, "headers", None))
         except urllib.error.HTTPError as e:
             try:
                 body = json.loads(e.read().decode("utf-8", "replace"))
             except (ValueError, OSError):
                 body = None
+            self._remember_credits(getattr(e, "headers", None))
+            if e.code == 429:
+                self._retry_after(e.headers)
             kind, confirmed, msg = classify(e.code, body)
             raise self._error(kind, confirmed, symbol, interval, e.code, msg) from None
         except (TimeoutError, socket.timeout):
@@ -202,20 +238,54 @@ class TwelveData:
                                                                                                 int) else 200, msg)
         return body
 
-    def bars(self, symbol: str, interval: str, n: int) -> list[Bar]:
+    def _remember_credits(self, headers):
+        if headers:
+            got = {k.lower(): v for k, v in headers.items() if "credit" in k.lower()}
+            if got:
+                self.credits = got
+
+    def _retry_after(self, headers):
+        """Honour Retry-After (seconds or an HTTP date); never retry earlier."""
+        value = (headers or {}).get("Retry-After") if headers else None
+        if not value:
+            return
+        try:
+            secs = float(value)
+        except ValueError:
+            try:
+                from email.utils import parsedate_to_datetime
+                secs = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError):
+                return
+        with self._lock:
+            self._blocked_until = max(self._blocked_until, time.monotonic() + max(0.0, min(secs, 3600)))
+
+    pins_exchange = True     # bars() accepts exchange= (sources with a pinned listing)
+
+    def bars(self, symbol: str, interval: str, n: int, exchange: str | None = None) -> list[Bar]:
+        """`exchange` given: an explicitly verified listing (catalogue source); otherwise the catalogue entry of
+        `symbol` decides (an unverified mapping is refused)."""
         from .instruments import BY_SYMBOL
         inst = BY_SYMBOL.get(symbol)
-        if inst and not inst.td_verified:
-            raise DataError(f"symbol {symbol} nemá ověřené mapování na Twelve Data", "unmapped", source=self.name,
-                            symbol=symbol, interval=interval)
+        if exchange is None:
+            if inst and not inst.td_verified:
+                raise DataError(f"symbol {symbol} nemá ověřené mapování na Twelve Data", "unmapped",
+                                source=self.name, symbol=symbol, interval=interval)
+            exchange = inst.exchange if inst else ""
+        elif inst and inst.exchange != exchange:
+            inst = None                  # another listing of the same ticker: no catalogue identity to compare
         params = {"symbol": symbol, "interval": interval, "outputsize": n, "timezone": "UTC", "order": "asc"}
-        if inst and inst.exchange:
-            params["exchange"] = inst.exchange
+        if exchange:
+            params["exchange"] = exchange
         body = self._get("time_series", params, symbol, interval)
         meta = body.get("meta") or {}
         got = str(meta.get("exchange", "")).upper()
-        if inst and inst.exchange and got and got != inst.exchange:
-            raise DataError(f"Twelve Data vrátila {symbol} z burzy {got}, očekávána {inst.exchange}", "invalid",
+        if exchange and got and got != exchange.upper():
+            raise DataError(f"Twelve Data vrátila {symbol} z burzy {got}, očekávána {exchange}", "invalid",
+                            source=self.name, symbol=symbol, interval=interval)
+        cur = str(meta.get("currency", "")).upper()
+        if inst and inst.currency and cur and cur != inst.currency.upper():   # identity check: quote currency
+            raise DataError(f"Twelve Data vrátila {symbol} v měně {cur}, očekávána {inst.currency}", "invalid",
                             source=self.name, symbol=symbol, interval=interval)
         returned = str(meta.get("symbol", "")).upper()
         if returned and returned != symbol.upper():   # never accept a different instrument than requested
@@ -234,6 +304,18 @@ class TwelveData:
         if not out:
             raise self._error("no_data", True, symbol, interval, 200, "0 svíček")
         out.sort(key=lambda b: b.t)
+        return out
+
+    def search(self, query: str) -> list[dict]:
+        """Symbol directory (GET /symbol_search, with the plan each listing needs). User-triggered only."""
+        body = self._get("symbol_search", {"symbol": query, "outputsize": 30, "show_plan": "true"}, query)
+        keep = ("symbol", "instrument_name", "exchange", "mic_code", "currency", "instrument_type", "country")
+        out = []
+        for row in body.get("data") or []:
+            if isinstance(row, dict) and row.get("symbol"):
+                item = {k: str(row.get(k) or "") for k in keep}
+                item["plan"] = str((row.get("access") or {}).get("plan") or "")
+                out.append(item)
         return out
 
     def exchange_rate(self, base: str, quote: str) -> tuple[Decimal, datetime]:
@@ -290,6 +372,77 @@ class TwelveData:
         return out
 
 
+class Coinbase:
+    """Coinbase Exchange public market data (no key): GET /products/{BASE-QUOTE}/candles?granularity=300|900|3600.
+    Spot crypto with real exchange volume; one request returns the latest candles (newest first, at most a few
+    hundred). Never serves anything but the requested product."""
+
+    BASE = "https://api.exchange.coinbase.com"
+    name = "Coinbase Exchange"
+    GRANULARITY = {"5min": 300, "15min": 900, "1h": 3600}
+    MIN_GAP = 0.35                 # seconds between requests (public endpoints are throttled per IP)
+
+    def __init__(self, timeout: float = 15.0):
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self.requests = 0
+
+    def _error(self, kind, confirmed, symbol, interval, status, msg):
+        where = f" pro interval {interval}" if interval else ""
+        text = (f"{symbol}: {self.name} neposkytla data{where}. " + (f"HTTP {status}. " if status else "")
+                + KIND_TEXT[kind] + ("." if confirmed else " (příčina nepotvrzena).")
+                + (f" Odpověď poskytovatele: „{msg[:160]}“." if msg else "") + f" Další krok: {NEXT_STEP[kind]}")
+        return DataError(text, kind, source=self.name, symbol=symbol, interval=interval, status=status,
+                         provider_message=msg[:160], confirmed=confirmed)
+
+    def bars(self, symbol: str, interval: str, n: int) -> list[Bar]:
+        product = symbol.replace("/", "-").upper()
+        with self._lock:
+            wait = self.MIN_GAP - (time.monotonic() - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+            self.requests += 1
+        url = f"{self.BASE}/products/{urllib.parse.quote(product)}/candles?granularity={self.GRANULARITY[interval]}"
+        req = urllib.request.Request(url, headers={"User-Agent": "cfd-signal-calculator"})
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as r:  # nosec B310 - fixed https base URL
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            try:
+                body = json.loads(e.read().decode("utf-8", "replace"))
+            except (ValueError, OSError):
+                body = None
+            msg = str((body or {}).get("message", "")) if isinstance(body, dict) else ""
+            kind = ("not_found" if e.code == 404 else "rate_limit" if e.code == 429 else "server" if e.code >= 500
+                    else "request" if e.code == 400 else "unknown")
+            raise self._error(kind, e.code in (404, 429) or e.code >= 500, symbol, interval, e.code, msg) from None
+        except (TimeoutError, socket.timeout):
+            raise self._error("timeout", True, symbol, interval, None, "") from None
+        except urllib.error.URLError as e:
+            kind = "timeout" if isinstance(e.reason, (TimeoutError, socket.timeout)) else "connection"
+            raise self._error(kind, True, symbol, interval, None, type(e.reason).__name__) from None
+        try:
+            rows = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise self._error("invalid", True, symbol, interval, 200, "odpověď není JSON") from None
+        if not isinstance(rows, list):
+            raise self._error("invalid", True, symbol, interval, 200, "odpověď není seznam svíček")
+        out = []
+        for row in rows:     # [time, low, high, open, close, volume]
+            try:
+                t, lo, h, o, c, v = row
+                out.append(Bar(datetime.fromtimestamp(int(t), timezone.utc), float(o), float(h), float(lo),
+                               float(c), float(v)))
+            except (TypeError, ValueError):
+                raise self._error("invalid", True, symbol, interval, 200, f"neplatná svíčka {str(row)[:40]}") from None
+        if not out:
+            raise self._error("no_data", True, symbol, interval, 200, "0 svíček")
+        out.sort(key=lambda b: b.t)
+        return out[-n:]
+
+
 class CachedProvider:
     """Session cache per (symbol, interval) in front of a provider.
 
@@ -305,7 +458,7 @@ class CachedProvider:
     def __init__(self, provider, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
         self.provider, self._clock = provider, clock
         self.name = getattr(provider, "name", "zdroj dat")
-        self._store: dict[tuple[str, str], tuple[list[Bar], datetime]] = {}
+        self._store: dict[tuple[str, str, str], tuple[list[Bar], datetime]] = {}
         self._lock = threading.Lock()
         self.hits = self.partial = self.full = 0
 
@@ -313,12 +466,17 @@ class CachedProvider:
         with self._lock:
             self._store.clear()
 
-    def bars(self, symbol: str, interval: str, n: int) -> list[Bar]:
+    @property
+    def pins_exchange(self) -> bool:
+        return getattr(self.provider, "pins_exchange", False)
+
+    def bars(self, symbol: str, interval: str, n: int, **kw) -> list[Bar]:
         step = timedelta(minutes=INTERVALS[interval])
         now = self._clock()
+        key = (symbol, interval, kw.get("exchange") or "")
         period = datetime.fromtimestamp(now.timestamp() // step.total_seconds() * step.total_seconds(), timezone.utc)
         with self._lock:
-            cached = self._store.get((symbol, interval))
+            cached = self._store.get(key)
         if cached and len(cached[0]) >= n:
             bars, fetched = cached
             if fetched >= period + self.SETTLE:
@@ -327,18 +485,18 @@ class CachedProvider:
                 return list(bars[-n:])
             missing = int((now - bars[-1].t) / step) + 2
             if missing < n // 2:
-                fresh = self.provider.bars(symbol, interval, max(missing, 5))
+                fresh = self.provider.bars(symbol, interval, max(missing, 5), **kw)
                 if fresh and fresh[0].t <= bars[-1].t:
                     merged = {b.t: b for b in bars}
                     merged.update({b.t: b for b in fresh})
                     out = sorted(merged.values(), key=lambda b: b.t)[-max(n, len(bars)):]
                     with self._lock:
-                        self._store[(symbol, interval)] = (out, now)
+                        self._store[key] = (out, now)
                         self.partial += 1
                     return out[-n:]
-        fresh = self.provider.bars(symbol, interval, n)
+        fresh = self.provider.bars(symbol, interval, n, **kw)
         with self._lock:
-            self._store[(symbol, interval)] = (list(fresh), now)
+            self._store[key] = (list(fresh), now)
             self.full += 1
         return list(fresh)
 

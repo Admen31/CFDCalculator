@@ -1,6 +1,6 @@
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -63,3 +63,21 @@ def test_calendar_caches_and_fails_closed(tmp_path):
     with pytest.raises(CalendarError):
         Calendar(tmp_path / "none.json", fetch=lambda: {"bad": 1}).events()
 
+
+
+def test_weekly_cache_is_trusted_for_a_day_only_while_it_covers_today(tmp_path):
+    cache = tmp_path / "cal.json"
+    now = datetime.now(timezone.utc)
+    week = [{"title": "CPI", "country": "USD", "date": (now - timedelta(days=1)).isoformat(), "impact": "High"},
+            {"title": "NFP", "country": "USD", "date": (now + timedelta(days=1)).isoformat(), "impact": "High"}]
+    Calendar(cache, fetch=lambda: week).events()
+
+    def down():
+        raise OSError("429")
+    old = time.time() - 20 * 3600
+    os.utime(cache, (old, old))
+    assert len(Calendar(cache, fetch=down).events()) == 2            # 20 h, but this week's schedule
+    old = time.time() - 25 * 3600
+    os.utime(cache, (old, old))
+    with pytest.raises(CalendarError, match="stará"):
+        Calendar(cache, fetch=down).events()

@@ -23,7 +23,8 @@ from . import indicators as ind
 
 BULLISH, BEARISH, NEUTRAL = "BULLISH", "BEARISH", "NEUTRAL"
 PULLBACK, BREAKOUT, MEANREV = "pullback", "breakout", "meanrev"
-NAMES = {PULLBACK: "TREND PULLBACK", BREAKOUT: "BREAKOUT", MEANREV: "MEAN REVERSION", "v21": "SHODA TRENDU (v2.1)"}
+NAMES = {PULLBACK: "TREND PULLBACK", BREAKOUT: "BREAKOUT", MEANREV: "MEAN REVERSION", "v21": "SHODA TRENDU (v2.1)",
+         "v21_max1": "v2.1 s ≤ 1 indikátorem proti"}
 ORDER = (PULLBACK, BREAKOUT, MEANREV)
 
 # Strategies whose triggers are allowed to be shown as confirmed BUY/SELL. Filled only from a passed

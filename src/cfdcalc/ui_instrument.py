@@ -137,13 +137,7 @@ class InstrumentBar(QWidget):
         self.status = QLabel("", objectName="muted")
         self.status.setFixedHeight(16)
         self.search = QLineEdit(placeholderText="Hledat instrument (název, ticker)…")
-        self._entries = {f"{a} – {describe(i)}" if a not in (i.name, i.symbol) else describe(i): i
-                         for i in CATALOG for a in labels(i)}
-        completer = QCompleter(sorted(self._entries), self)
-        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        completer.activated.connect(self._picked_entry)
-        self.search.setCompleter(completer)
+        self.refresh_catalog()
         self.search.returnPressed.connect(self._search_enter)
 
         top = QHBoxLayout()
@@ -175,6 +169,16 @@ class InstrumentBar(QWidget):
         self.set_mode(self.mode(), initial=True)
 
     # ---- settings ----
+    def refresh_catalog(self):
+        """(Re)build the search completer from the catalogue, including instruments the user added."""
+        self._entries = {f"{a} – {describe(i)}" if a not in (i.name, i.symbol) else describe(i): i
+                         for i in CATALOG for a in labels(i)}
+        completer = QCompleter(sorted(self._entries), self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.activated.connect(self._picked_entry)
+        self.search.setCompleter(completer)
+
     def mode(self) -> str:
         return self.s.value("mode", AUTO)
 

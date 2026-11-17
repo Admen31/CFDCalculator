@@ -149,8 +149,10 @@ def test_closed_market_does_not_call_the_api():
 
 
 def test_unmapped_symbol_is_no_data_without_api_call():
+    from dataclasses import replace
     p = FakeProvider()
-    r = run_analysis(BY_SYMBOL["SPX"], p, FakeCalendar(), 0.6, T0)
+    unmapped = replace(BY_SYMBOL["SPX"], sources=())          # no exact and no reference source
+    r = run_analysis(unmapped, p, FakeCalendar(), 0.6, T0)
     assert r.verdict == NO_DATA and "mapování" in r.summary and not p.calls
 
 

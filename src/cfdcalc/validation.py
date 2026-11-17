@@ -156,10 +156,11 @@ def research(m: Market, costs: Costs, cfg: Settings = DEFAULTS, progress=lambda 
 
 # ---------------------------------------------------------------- v2.3: new strategies, pre-registered promotion
 
-STRATEGY_KEYS = ("pullback", "breakout", "meanrev")
-NEW_CONFIGS = len(STRATEGY_KEYS)            # Bonferroni factor: three new strategies, parameters fixed in advance
+RELAXED = "v21_max1"                        # v2.1 with one voter allowed against the trend (tests the "0 proti" rule)
+STRATEGY_KEYS = ("pullback", "breakout", "meanrev", RELAXED)
+NEW_CONFIGS = len(STRATEGY_KEYS)            # Bonferroni factor: candidates tested, parameters fixed in advance
 PROMOTION = ("souhrnně přes instrumenty na závěrečném testu: ≥ 100 obchodů, dolní mez 95% intervalu ⌀ R po "
-             "nákladech > 0, p × 3 < 0,05, ⌀ R na validaci > 0, ≥ 4 ze 6 walk-forward úseků s ⌀ R > 0 "
+             "nákladech > 0, p × 4 < 0,05, ⌀ R na validaci > 0, ≥ 4 ze 6 walk-forward úseků s ⌀ R > 0 "
              "a lepší než náhodné vstupy")
 
 
@@ -173,7 +174,8 @@ def strategy_study(m: Market, costs: Costs, cfg: Settings = DEFAULTS, progress=l
     runs["v2.1"] = run(m, v21, "v2.1", costs, cfg)
     for key in STRATEGY_KEYS:
         progress(f"{m.inst.symbol}: {key}")
-        runs[key] = run(m, backtest_strategy(key), key, costs, cfg)
+        runs[key] = (run(m, v21, key, costs, cfg, params=Params(max_against=1)) if key == RELAXED
+                     else run(m, backtest_strategy(key), key, costs, cfg))
     with_data = sum(1 for _, v, _ in runs["v2.1"].outcomes if v != NO_DATA) or 1
     rate = mean(len(runs[k].trades) for k in STRATEGY_KEYS) / with_data
     runs["náhodný"] = run(m, RandomEntries(rate, SEED ^ zlib.crc32(m.inst.symbol.encode())), "náhodný", costs, cfg)
@@ -213,7 +215,7 @@ def promotion(studies: list[dict]) -> dict:
         o = out[key]
         checks = {"≥ 100 obchodů v testu": o["test"]["n"] >= 100,
                   "dolní mez intervalu > 0": o["ci"]["lo"] is not None and o["ci"]["lo"] > 0,
-                  "p × 3 < 0,05": o["p_adjusted"] is not None and o["p_adjusted"] < 0.05,
+                  "p × 4 < 0,05": o["p_adjusted"] is not None and o["p_adjusted"] < 0.05,
                   "validace ⌀ R > 0": (o["validation"]["exp"] or 0) > 0,
                   "≥ 4/6 úseků kladných": o["folds_positive"] >= 4,
                   "lepší než náhodné vstupy": o["test"]["exp"] is not None and (rnd is None or o["test"]["exp"] > rnd)}

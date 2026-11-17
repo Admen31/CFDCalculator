@@ -48,9 +48,10 @@ def test_catalogue_labels_are_unique_and_symbols_well_formed():
             key = re.sub(r"[^A-Z0-9&]", "", a.upper())
             assert seen.setdefault(key, inst.symbol) == inst.symbol, (a, seen[key], inst.symbol)
     for inst in CATALOG:
-        pattern = r"[A-Z]{3}/[A-Z]{3}" if inst.kind == "forex" else r"[A-Z]{1,5}(/[A-Z]{3})?"
+        pattern = r"[A-Z]{3}/[A-Z]{3}" if inst.kind == "forex" else r"[A-Z0-9]{1,5}(/[A-Z]{3})?" \
+            if inst.kind != "crypto" else r"[A-Z]{3,4}/USD"
         assert re.fullmatch(pattern, inst.symbol), inst.symbol
-        assert inst.kind in ("forex", "index", "commodity", "stock")
+        assert inst.kind in ("forex", "index", "commodity", "stock", "etf", "crypto")
 
 
 def test_every_catalogue_name_recognises_itself():

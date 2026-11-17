@@ -13,9 +13,9 @@ from datetime import datetime, time, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QTime, QTimer, Signal
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar,
-                               QPushButton, QSpinBox, QTimeEdit, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+                               QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+                               QProgressBar, QPushButton, QSpinBox, QTimeEdit, QVBoxLayout, QWidget)
 
 from . import __version__, widgets
 from . import strategies as st
@@ -26,7 +26,9 @@ from .report import research_text
 from .validation import research
 from .availability import Availability, state_text
 from .calendar import Calendar
-from .data import CachedProvider, DataError, SyntheticData, TwelveData
+from .data import CachedProvider, Coinbase, DataError, SyntheticData, TwelveData
+from .instruments import COINBASE, PLANS, TWELVE
+from .ui_markets import MarketsDialog, load_custom
 from .instruments import BY_SYMBOL, Instrument
 from . import risk
 from .ui_instrument import AUTO, InstrumentBar
@@ -111,6 +113,12 @@ class SettingsDialog(QDialog):
         form.addRow("Interval sledování", self.interval)
         form.addRow(self.motion)
         form.addRow("Limit Twelve Data", self.rate)
+        self.plan = QComboBox()
+        self.plan.addItems(PLANS)
+        self.plan.setCurrentText(str(s.value("td_plan", "Basic")))
+        self.plan.setToolTip("Váš tarif Twelve Data. Instrumenty vyšších tarifů se nestahují (žádné zbytečné dotazy "
+                             "a chyby) a použije se ověřený referenční zdroj, pokud existuje.")
+        form.addRow("Tarif Twelve Data", self.plan)
         note = QLabel(f"Klíč se ukládá nešifrovaně do {s.fileName()}.\n"
                       "Alternativa: proměnná prostředí TWELVEDATA_API_KEY.", objectName="muted")
         form.addRow(note)
@@ -134,6 +142,7 @@ class SettingsDialog(QDialog):
         self.s.setValue("watch_interval", self.interval.value())
         self.s.setValue("reduced_motion", self.motion.isChecked())
         self.s.setValue("td_per_minute", self.rate.value())
+        self.s.setValue("td_plan", self.plan.currentText())
         self.accept()
 
 
@@ -166,6 +175,7 @@ class MainWindow(QWidget):
         self.setWindowTitle(APP)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
 
+        self.custom_problems = load_custom(self.s)    # user's instruments must exist before recognition starts
         self.bar = InstrumentBar(self.s, reader)
         self.bar.changed.connect(self.on_instrument_changed)
         gear = QPushButton("⚙", toolTip="Nastavení")
@@ -197,11 +207,14 @@ class MainWindow(QWidget):
         sp = QHBoxLayout()
         sp.addWidget(QLabel("Spread z T212:"))
         sp.addWidget(self.spread, 1)
-        bt, jr = QPushButton("Backtest"), QPushButton("Demo deník")
+        bt, jr, mk = QPushButton("Backtest"), QPushButton("Deník"), QPushButton("Trhy")
+        mk.setToolTip("Dostupnost tržních dat pro všechny instrumenty, přidání instrumentu")
+        mk.clicked.connect(self.markets)
         bt.clicked.connect(self.backtest)
         jr.clicked.connect(self.journal)
         sp.addWidget(bt)
         sp.addWidget(jr)
+        sp.addWidget(mk)
         self.footer = QLabel("", objectName="muted", alignment=Qt.AlignmentFlag.AlignCenter)
 
         lay = QVBoxLayout(self)
@@ -228,7 +241,8 @@ class MainWindow(QWidget):
         for k, prof in PROFILES.items():
             hh, mm = map(int, str(self.s.value(f"cutoff/{k}", f"{prof.cutoff:%H:%M}")).split(":"))
             cutoffs.append((k, time(hh, mm)))
-        return Settings(min_minutes_left=int(self.s.value("min_left", 60)), cutoffs=tuple(cutoffs))
+        return Settings(min_minutes_left=int(self.s.value("min_left", 60)), cutoffs=tuple(cutoffs),
+                        td_plan=str(self.s.value("td_plan", "Basic")))
 
     def demo(self) -> bool:
         return self.s.value("demo", False, type=bool)
@@ -243,6 +257,28 @@ class MainWindow(QWidget):
         if not self._cache or self._cache[0] != ident:
             self._cache = (ident, CachedProvider(TwelveData(key, per_minute=ident[1])))
         return self._cache[1]
+
+    def providers(self):
+        """Every data source of the live mode: {provider: cached client}; demo: the synthetic source."""
+        td = self.provider()
+        if isinstance(td, SyntheticData):
+            return td
+        if not getattr(self, "_coinbase", None):
+            self._coinbase = CachedProvider(Coinbase())
+        return {TWELVE: td, COINBASE: self._coinbase}
+
+    def markets(self):
+        try:
+            td = self.provider()
+            search = td.provider.search if isinstance(td, CachedProvider) else None
+            usage = td.provider.usage() if isinstance(td, CachedProvider) else "demo – bez API"
+        except DataError:
+            search, usage = None, "bez API klíče – přidávání instrumentů není dostupné"
+        note = ("\nPřeskočené vlastní instrumenty: " + "; ".join(self.custom_problems)) if self.custom_problems else ""
+        dlg = MarketsDialog(self.s, str(self.s.value("td_plan", "Basic")), self.availability(), usage + note, search,
+                            self)
+        dlg.exec()
+        self.bar.refresh_catalog()
 
     def spread_of(self, inst: Instrument) -> float:
         try:
@@ -322,7 +358,7 @@ class MainWindow(QWidget):
         if self.running() or inst != self.inst:
             return
         try:
-            provider = self.provider()
+            provider = self.providers()
         except DataError as e:
             self.step.setText("")
             QMessageBox.warning(self, APP, str(e))

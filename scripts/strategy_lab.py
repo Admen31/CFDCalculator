@@ -7,7 +7,7 @@ Data:   Yahoo Finance public chart data (5m/15m: last 60 days, 1h: up to 2 years
 Costs:  Trading 212 catalogue spread (paid once per trade), slippage 0.1x spread per market fill, entry on the next
         bar's open, SL first when SL and TP fall in one bar (engine.py).
 Protocol (fixed before the run): parameters fixed in strategies.py, chronological split 50/25/25 per instrument,
-        6 walk-forward segments, bootstrap 95 % interval, Bonferroni x3, promotion rule validation.PROMOTION.
+        6 walk-forward segments, bootstrap 95 % interval, Bonferroni x4, promotion rule validation.PROMOTION.
 No historical news calendar: the news filter is NOT tested.
 """
 from __future__ import annotations
@@ -115,7 +115,7 @@ def main() -> int:
              *data_rows, "", "## 1. Proč v2.1 tak často vrací WAIT", "", diagnostics.markdown(diags), "",
              "## 2. Strategie – souhrnně přes instrumenty", "",
              f"Pravidlo pro ověření (stanoveno předem): {PROMOTION}.",
-             "", "| strategie | vývoj | validace | závěrečný test | 95% interval ⌀ R (test) | p × 3 | kladné úseky |"
+             "", "| strategie | vývoj | validace | závěrečný test | 95% interval ⌀ R (test) | p × 4 | kladné úseky |"
              " stav |", "|---|---|---|---|---|---|---|---|"]
     for key in ("v2.1",) + STRATEGY_KEYS + ("náhodný",):
         o = prom[key]

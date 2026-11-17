@@ -168,9 +168,11 @@ def test_analysis_reports_interval_and_source_and_stops_cleanly(monkeypatch):
         return bars_json(p["symbol"], 300)
     install(monkeypatch, behaviour)
     r = run_analysis(SILVER, TwelveData(KEY), FakeCalendar(), 0.03, T0)
-    assert r.verdict == NO_DATA and r.completed == 3 and set(calls) == {"XAG/USD"}   # 5min ok, 15min fails
-    assert [(s[0], s[1], s[2], s[3]) for s in r.sources] == [("Twelve Data", "XAG/USD", "5min", "OK"),
-                                                             ("Twelve Data", "XAG/USD", "15min", "not_found")]
+    # silver: 5min ok, 15min fails; then the labelled reference ETF is tried (fails the same way here)
+    assert r.verdict == NO_DATA and r.completed == 3 and set(calls) == {"XAG/USD", "SLV"}
+    assert [(s[0], s[1], s[2], s[3]) for s in r.sources][:2] == [("Twelve Data", "XAG/USD", "5min", "OK"),
+                                                                 ("Twelve Data", "XAG/USD", "15min", "not_found")]
+    assert "XAG/USD" in r.summary and "zdrojů: 2" in r.summary
     assert "interval 15min" in r.summary and "HTTP 404" in r.summary and KEY not in r.summary
 
 

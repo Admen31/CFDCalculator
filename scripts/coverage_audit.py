@@ -20,33 +20,14 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from cfdcalc.instruments import CATALOG  # noqa: E402
+from cfdcalc.instruments import CATALOG, COINBASE, TWELVE, sources  # noqa: E402
 
 UA = {"User-Agent": "cfd-signal-calculator-audit"}
-# candidates for the wider catalogue (checked, never trusted blindly): (category, symbol, exchange or "")
-CANDIDATES = [
-    *[("ETF", s, "") for s in ("SPY", "QQQ", "DIA", "IWM", "GLD", "SLV", "USO", "UNG", "TLT", "VTI", "EEM", "XLE",
-                               "XLF", "XLK", "ARKK", "EWG", "EWU", "FXI")],
-    *[("Krypto", s, "") for s in ("BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "LTC/USD", "ADA/USD", "DOGE/USD",
-                                  "BCH/USD", "DOT/USD", "LINK/USD", "AVAX/USD", "XLM/USD")],
-    *[("Forex", s, "") for s in ("AUD/JPY", "CAD/JPY", "CHF/JPY", "EUR/AUD", "EUR/CAD", "EUR/NZD", "GBP/AUD",
-                                 "GBP/CAD", "GBP/CHF", "AUD/CAD", "AUD/CHF", "AUD/NZD", "NZD/JPY", "USD/SEK",
-                                 "USD/NOK", "USD/PLN", "USD/CZK", "EUR/PLN", "EUR/CZK", "USD/MXN", "USD/ZAR",
-                                 "USD/TRY", "USD/HUF", "EUR/HUF", "USD/SGD", "USD/HKD", "USD/CNH", "EUR/NOK",
-                                 "EUR/SEK", "GBP/NZD", "NZD/CAD", "CAD/CHF")],
-    *[("Komodita", s, "") for s in ("XPT/USD", "XPD/USD", "XCU/USD", "WTI/USD", "XBR/USD", "NG/USD")],
-    *[("Index", s, "") for s in ("SPX", "NDX", "DJI", "RUT", "DAX", "FTSE", "CAC", "N225", "IXIC", "GDAXI")],
-    *[("Akcie US", s, "") for s in ("AVGO", "COST", "PEP", "ADBE", "CRM", "ORCL", "CSCO", "QCOM", "TXN", "MU",
-                                    "PYPL", "SHOP", "UBER", "ABNB", "COIN", "SNOW", "PFE", "JNJ", "MRK", "ABBV",
-                                    "LLY", "UNH", "V", "MA", "BAC", "WFC", "GS", "MS", "C", "XOM", "CVX", "WMT",
-                                    "HD", "MCD", "NKE", "SBUX", "T", "VZ", "GE", "F", "GM", "RIVN", "LCID", "NIO",
-                                    "SMCI", "ARM", "MSTR", "HOOD", "SOFI", "RBLX")],
-    *[("Akcie EU", s, ex) for s, ex in (("SAP", "XETR"), ("SIE", "XETR"), ("ALV", "XETR"), ("BMW", "XETR"),
-                                        ("MBG", "XETR"), ("VOW3", "XETR"), ("DBK", "XETR"), ("ADS", "XETR"),
-                                        ("ASML", "Euronext"), ("MC", "Euronext"), ("TTE", "Euronext"),
-                                        ("SHEL", "LSE"), ("BP", "LSE"), ("HSBA", "LSE"), ("NESN", "SIX"),
-                                        ("NOVN", "SIX"), ("ROG", "SIX"))],
-]
+# every Twelve Data source of the catalogue is checked: (category, symbol, pinned exchange, plan the catalogue declares)
+ITEMS = [(f"{i.kind}{' (ref)' if not src.exact else ''}", src.symbol, src.exchange, src.plan)
+         for i in CATALOG for src in sources(i) if src.provider == TWELVE]
+ITEMS = list(dict.fromkeys(ITEMS))
+COINBASE_PRODUCTS = [src.symbol.replace("/", "-") for i in CATALOG for src in sources(i) if src.provider == COINBASE]
 
 
 def get(url: str):
@@ -90,22 +71,24 @@ def main() -> int:
     ap.add_argument("--out", default="audit")
     args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
-    items = [("Katalog " + i.kind, i.symbol, i.exchange) for i in CATALOG] + CANDIDATES
     res = {"twelvedata": {}, "coinbase": {}}
-    lines = ["| kategorie | symbol | TD výpis | název | burza / MIC | měna | typ | tarif (access) |",
+    lines = ["| kategorie | symbol | výsledek | název | burza / MIC | měna | typ | tarif TD (katalog) |",
              "|---|---|---|---|---|---|---|---|"]
-    for cat, sym, ex in items:
+    bad = 0
+    for cat, sym, ex, plan in ITEMS:
         r = search(sym, ex)
         res["twelvedata"][f"{sym}@{ex}"] = {"category": cat, **r}
         m = r["match"][0] if r["match"] else {}
-        lines.append(f"| {cat} | {sym}{' (' + ex + ')' if ex else ''} | {r['status']} {len(r['match'])}× | "
+        got = (m.get("access") or {}).get("plan", "?")
+        ok = bool(m) and got == plan
+        bad += not ok
+        lines.append(f"| {cat} | {sym}{' (' + ex + ')' if ex else ''} | {'OK' if ok else 'NESOUHLASÍ'} | "
                      f"{m.get('instrument_name', '–')} | {m.get('exchange', '–')} / {m.get('mic_code', '–')} | "
-                     f"{m.get('currency', '–')} | {m.get('instrument_type', '–')} | "
-                     f"{json.dumps(m.get('access'), ensure_ascii=False) if m.get('access') else '–'} |")
+                     f"{m.get('currency', '–')} | {m.get('instrument_type', '–')} | {got} ({plan}) |")
         print(lines[-1], flush=True)
         time.sleep(1.1)        # polite: public endpoint, no key
-    for sym in ("BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "LTC-USD", "ADA-USD", "DOGE-USD", "BCH-USD", "DOT-USD",
-                "LINK-USD", "AVAX-USD", "XLM-USD"):
+    print(f"AUDIT: {len(ITEMS) - bad}/{len(ITEMS)} zdrojů Twelve Data odpovídá katalogu (symbol, burza, tarif)")
+    for sym in COINBASE_PRODUCTS:
         res["coinbase"][sym] = coinbase(sym)
         print(f"Coinbase {sym}: {res['coinbase'][sym]}", flush=True)
     out = Path(args.out)

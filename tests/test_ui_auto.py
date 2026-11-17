@@ -219,12 +219,26 @@ def test_reading_requested_while_busy_is_never_lost(app, make):
     assert len(got) == 4 and reader.calls == 1 and not w.bar._busy and not w.bar._queued
 
 
-def test_unmapped_index_is_recognised_but_never_analysed(app, make, monkeypatch):
-    from cfdcalc import data
-    called = []
-    monkeypatch.setattr(data.urllib.request, "urlopen", lambda *a, **k: called.append(a))
+def test_index_is_analysed_only_on_labelled_reference_data(app, make, monkeypatch):
+    from datetime import datetime
+
+    from conftest import T0
+    from test_data_errors import bars_json, install
+
+    from cfdcalc import ui
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return T0
+    monkeypatch.setattr(ui, "datetime", Clock)
+    monkeypatch.setattr(ui, "Calendar", lambda path: ui._NoNews())
+    seen = install(monkeypatch, lambda p: bars_json(p["symbol"], 300))
     w = make(Reader("US 500"), demo=False)
     w.start()
     settle(app, w)
-    assert w.inst.symbol == "SPX" and not called and w.result.verdict.text() == "NO DATA"
-    assert "mapování neověřeno" in w.result.reason.text()
+    params = [q for u, _, q in seen if "twelvedata" in u]
+    assert w.inst.symbol == "SPX" and {q["symbol"] for q in params} == {"SPY"}       # never "SPX" itself
+    assert all(q["exchange"] == "NYSE" for q in params)
+    assert "REFERENČNÍ TRŽNÍ DATA" in w.result.detail.toPlainText() and w.result.levels.text() == ""
+    assert w.risk_page.entry.text() == "" and "referenční" in w.risk_page.message.text().lower()

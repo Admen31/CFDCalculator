@@ -34,6 +34,8 @@ from . import strategies as st
 from .calendar import Calendar, CalendarError, Event
 from .data import Bar, DataError, Provider, prepare
 from .instruments import Instrument
+from .instruments import PLANS, plan_ok
+from .instruments import sources as sources_of
 
 FETCH = 300      # bars requested per timeframe
 NEED = 250       # closed bars analysed per timeframe (same window in live and backtest)
@@ -56,6 +58,7 @@ class Profile:
     cutoff: time                                      # default evening limit, local time (Settings can override)
     session: tuple[str, time, time] | None = None     # exchange time zone, open, close; None = 24 h on weekdays
     min_share: float = 0.6                            # share of usable voters that must agree
+    weekend_closed: bool = True                       # 24 h markets closed Fri 17:00 - Sun 17:00 New York
 
 
 PROFILES = {
@@ -65,6 +68,9 @@ PROFILES = {
     # spot FX and metals/energy from Twelve Data carry no volume: VWAP and Volume do not apply
     "forex": Profile("forex", "Forex", ("ema", "rsi", "macd"), time(21, 0)),
     "commodity": Profile("commodity", "Komodity", ("ema", "rsi", "macd"), time(21, 0)),
+    "etf": Profile("etf", "ETF", VOTERS, time(21, 45), ("America/New_York", time(9, 30), time(16, 0))),
+    # spot crypto trades 24/7; exchange volume where the source has it (Coinbase)
+    "crypto": Profile("crypto", "Krypto", VOTERS, time(21, 0), weekend_closed=False),
 }
 
 
@@ -76,6 +82,7 @@ class Settings:
     news_before_min: int = 60         # block this long before a high-impact event...
     news_after_min: int = 30          # ...and this long after it
     cutoffs: tuple[tuple[str, time], ...] = ()   # per-market evening limits, e.g. (("stock", time(21, 45)),)
+    td_plan: str = "Ultra"            # the user's Twelve Data plan: sources above it are skipped without a request
 
     def cutoff_for(self, kind: str) -> time:
         return dict(self.cutoffs).get(kind, PROFILES[kind].cutoff)
@@ -91,6 +98,7 @@ class Params:
     sl_atr: float = SL_ATR
     tp_r: float = TP_R
     min_share: float | None = None    # None = the profile's value
+    max_against: int = 0              # voters allowed against the trend (live rule: none)
 
 
 BASE = Params()
@@ -133,6 +141,7 @@ class Result:
     opportunity: st.Setup | None = None  # the setup shown first (WATCH / triggered)
     strategy: str = ""                   # rule set behind a confirmed BUY/SELL
     timings: dict[str, float] = field(default_factory=dict)   # measured durations in ms
+    reference: str = ""                  # non-empty: analysed on REFERENCE data (label) - direction only, no levels
 
     @property
     def is_signal(self) -> bool:
@@ -157,8 +166,14 @@ def market_end(inst: Instrument, now: datetime, cfg: Settings) -> tuple[datetime
     None with a reason when the market is closed now."""
     prof = PROFILES[inst.kind]
     end = cutoff_utc(now, cfg, cfg.cutoff_for(inst.kind))
-    if prof.session:
-        tz, open_, close = prof.session
+    session = inst.session or prof.session
+    if not session and prof.weekend_closed:
+        ny = now.astimezone(ZoneInfo("America/New_York"))
+        if ny.weekday() == 5 or (ny.weekday() == 4 and ny.time() >= time(17)) or \
+                (ny.weekday() == 6 and ny.time() < time(17)):
+            return None, "trh je o víkendu zavřený (pátek 17:00 – neděle 17:00 New York)"
+    if session:
+        tz, open_, close = session
         local = now.astimezone(ZoneInfo(tz))
         if local.weekday() >= 5:
             return None, "burza je o víkendu zavřená"
@@ -174,10 +189,10 @@ def market_end(inst: Instrument, now: datetime, cfg: Settings) -> tuple[datetime
 
 def session_open(inst: Instrument, now: datetime) -> datetime | None:
     """Start of today's exchange session (UTC) for markets with trading hours, else None."""
-    prof = PROFILES[inst.kind]
-    if not prof.session:
+    session = inst.session or PROFILES[inst.kind].session
+    if not session:
         return None
-    tz, open_, _ = prof.session
+    tz, open_, _ = session
     return datetime.combine(now.astimezone(ZoneInfo(tz)).date(), open_, ZoneInfo(tz)).astimezone(timezone.utc)
 
 
@@ -351,7 +366,7 @@ def _safe(key: str, fn, *args):
 
 def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], events: list[Event] | None,
              spread: float, now: datetime, cfg: Settings = DEFAULTS,
-             tick: Callable[[str], None] = lambda _: None, params: Params = BASE) -> Result:
+             tick: Callable[[str], None] = lambda _: None, params: Params = BASE, reference: str = "") -> Result:
     """Decide on validated CLOSED bars. `events=None` means the calendar is unavailable (-> NO DATA).
     Calls tick() after each of the 12 steps."""
     prof = PROFILES[inst.kind]
@@ -436,8 +451,9 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
     f.append(("Aktuální data", "ok", f"poslední uzavřená svíčka 5m {r.data_time:%d.%m. %H:%M} UTC"))
     f.append(("Trend 1h", "ok" if trend else "fail" if t20 is not None else "na", f"trend {r.trend}"))
     if sign:
-        agree_ok = len(pro) >= need and not proti and "ema" in pro
-        why = (f"{len(pro)} pro, {len(proti)} proti, {len(neutral)} neutrální; potřeba ≥ {need} pro, 0 proti"
+        agree_ok = len(pro) >= need and len(proti) <= params.max_against and "ema" in pro
+        why = (f"{len(pro)} pro, {len(proti)} proti, {len(neutral)} neutrální; potřeba ≥ {need} pro, "
+               f"{'0' if not params.max_against else f'≤ {params.max_against}'} proti"
                + ("" if "ema" in pro else " a EMA 20/50 ve směru trendu"))
         f.append(("Shoda indikátorů", "ok" if agree_ok else "fail", why))
         for key, name in (("rsi", "RSI extrém"), ("atr", "Volatilita (ATR)"), ("sr", "Prostor k cíli"),
@@ -450,9 +466,12 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
         for name in ("RSI extrém", "Volatilita (ATR)", "Prostor k cíli", "Ekonomické zprávy"):
             f.append((name, "na", "nehodnoceno – chybí směr trendu"))
     spread_ok = bool(sl_dist) and spread > 0 and spread <= MAX_SPREAD_OF_SL * sl_dist
-    f.append(("Spread", "ok" if spread_ok else "na" if not sl_dist else "fail",
-              f"spread {spread:g} vs. max {MAX_SPREAD_OF_SL:.0%} stop-lossu" if spread > 0
-              else "spread není zadán"))
+    if reference:   # the Trading 212 spread is in CFD price units, not comparable with the reference product
+        f.append(("Spread", "ref", "spread Trading 212 nelze porovnat s cenou referenčního instrumentu"))
+    else:
+        f.append(("Spread", "ok" if spread_ok else "na" if not sl_dist else "fail",
+                  f"spread {spread:g} vs. max {MAX_SPREAD_OF_SL:.0%} stop-lossu" if spread > 0
+                  else "spread není zadán"))
     time_ok = end is not None and left >= cfg.min_minutes_left
     time_detail = (closed_reason if end is None else
                    f"do konce obchodování ({end.astimezone(ZoneInfo(cfg.tz)):%H:%M}) zbývá {max(left, 0):.0f} min,"
@@ -469,7 +488,7 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
     elif not direction:
         r.verdict, r.reasons = WAIT, ["1h graf je bez jasného trendu"]
     else:
-        failed = [f"{name}: {detail}" for name, status, detail in f if status != "ok"]
+        failed = [f"{name}: {detail}" for name, status, detail in f if status not in ("ok", "ref")]
         if failed:
             r.verdict, r.reasons = WAIT, failed
         else:
@@ -480,14 +499,23 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
             else:
                 r.sl, r.tp = (_q(close + sl_dist, d, ROUND_CEILING),
                               _q(close - params.tp_r * sl_dist, d, ROUND_CEILING))
-            r.reasons = [f"trend 1h {r.trend}, {len(pro)} z {len(usable)} použitelných indikátorů pro, 0 proti, "
+            r.reasons = [f"trend 1h {r.trend}, {len(pro)} z {len(usable)} použitelných indikátorů pro, "
+                         f"{len(proti)} proti, "
                          f"všechny bezpečnostní filtry prošly"]
     if r.verdict in (BUY, SELL):
         r.strategy = st.NAMES["v21"]
-    if r.verdict not in (ERROR, NO_DATA):
+    only_calendar = r.verdict == NO_DATA and events is None and len(missing) == 1
+    if r.verdict not in (ERROR, NO_DATA) or only_calendar:   # prices are fine: bias/WATCH still help
         _opportunities(r, inst, m5, m15, h1, events, spread, now, cfg, end, left)
-    r.summary = r.reasons[0]
+    if reference:
+        r.reference = reference
+        r.entry = r.sl = r.tp = r.sl_dist = None     # reference prices never become CFD levels
+        r.reasons.insert(0, f"{REFERENCE_NOTE} Zdroj: {reference}. Jen směr, bez vstupu, SL a TP.")
+    r.summary = r.reasons[0] if not reference else r.reasons[1]
     return r
+
+
+REFERENCE_NOTE = "REFERENČNÍ TRŽNÍ DATA – NEMUSÍ ODPOVÍDAT CENĚ TRADING 212 CFD."
 
 
 def _opportunities(r: Result, inst: Instrument, m5, m15, h1, events, spread, now, cfg, end, left):
@@ -523,6 +551,11 @@ def _opportunities(r: Result, inst: Instrument, m5, m15, h1, events, spread, now
 EVALUATE_STEPS = 12
 
 
+def providers_for(provider, name: str):
+    """One provider object serves every source (tests, demo), or a mapping {provider name: provider}."""
+    return provider if hasattr(provider, "bars") else provider.get(name)
+
+
 def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None, spread: float, now: datetime,
                  cfg: Settings = DEFAULTS, progress: Callable[[int, int, str], None] = lambda *_: None,
                  cancelled: Callable[[], bool] = lambda: False) -> Result:
@@ -537,7 +570,6 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
         done += 1
         progress(done, total, label)
 
-    source = getattr(provider, "name", "zdroj dat")
     sources: list[tuple[str, str, str, str, str]] = []   # bookkeeping for the detail page; no effect on decisions
     timings: dict[str, float] = {}
 
@@ -547,53 +579,98 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
                       aborted=True, profile=prof.name, sources=list(sources), timings=dict(timings))
 
     step(f"Instrument {inst.name}")
-    if not inst.td_verified:
-        return stop(NO_DATA, f"{inst.name}: Twelve Data pod symbolem {inst.symbol} neuvádí tento instrument "
-                             f"(mapování neověřeno)")
+    candidates = sources_of(inst)
+    if not candidates:
+        return stop(NO_DATA, f"{inst.name}: symbol není namapován na žádný ověřený zdroj dat (Twelve Data pod "
+                             f"symbolem {inst.symbol} uvádí jiný instrument – mapování neověřeno)")
     end, closed_reason = market_end(inst, now, cfg)
     if end is None:
         return stop(WAIT, f"trh je zavřený – {closed_reason}")
-    frames, timings = {}, {}
 
-    def fetch(interval: str):
-        t0 = clock.perf_counter()
-        try:
-            return provider.bars(inst.symbol, interval, FETCH), None
-        except Exception as e:  # noqa: BLE001 - classified below
-            return None, e
-        finally:
-            timings[f"data {interval}"] = 1000 * (clock.perf_counter() - t0)
+    def fetch_all(prov, src) -> tuple[dict | None, tuple[str, str] | None]:
+        """All three timeframes from ONE source (never mixed). Returns (frames, None) or (None, (verdict, why))."""
+        name = getattr(prov, "name", "zdroj dat")
 
-    # the three timeframes are requested at once; results are checked in a fixed order (5m, 15m, 1h)
+        def fetch(interval: str):
+            t0 = clock.perf_counter()
+            try:
+                pin = {"exchange": src.exchange} if src.exchange and getattr(prov, "pins_exchange", False) else {}
+                return prov.bars(src.symbol, interval, FETCH, **pin), None
+            except Exception as e:  # noqa: BLE001 - classified below
+                return None, e
+            finally:
+                timings[f"data {interval}"] = 1000 * (clock.perf_counter() - t0)
+
+        # the three timeframes are requested at once; results are checked in a fixed order (5m, 15m, 1h)
+        pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="fetch")
+        futures = {iv: pool.submit(fetch, iv) for iv in ("5min", "15min", "1h")}
+        pool.shutdown(wait=False)
+        got = {}
+        for interval, fut in futures.items():
+            while True:
+                if cancelled():
+                    return None, (NO_DATA, "analýza zrušena")
+                try:
+                    raw, err = fut.result(timeout=0.1)
+                    break
+                except TimeoutError:
+                    continue
+            if isinstance(err, DataError):
+                sources.append((name, src.symbol, interval, getattr(err, "kind", "unknown"), str(err)))
+                return None, (NO_DATA, str(err))
+            if err is not None:   # unexpected failure is a technical error, never a signal
+                sources.append((name, src.symbol, interval, "invalid", f"{type(err).__name__}"))
+                return None, (ERROR, f"technická chyba při stahování {interval}: {type(err).__name__}: {err}")
+            step(f"Data {interval} stažena")
+            bars, problem = prepare(raw, interval, now, NEED, session_open(inst, now))
+            if problem:
+                kind = "stale" if "zastaralá" in problem else "short" if "málo" in problem else "invalid"
+                sources.append((name, src.symbol, interval, kind, problem))
+                return None, (NO_DATA, problem)
+            sources.append((name, src.symbol, interval, "OK", f"{len(raw)} svíček, poslední uzavřená "
+                                                              f"{bars[-1].t:%d.%m. %H:%M} UTC"))
+            got[interval] = bars
+            step(f"Data {interval} ověřena")
+        return got, None
+
     if cancelled():
         return stop(NO_DATA, "analýza zrušena")
-    pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="fetch")
-    futures = {iv: pool.submit(fetch, iv) for iv in ("5min", "15min", "1h")}
-    pool.shutdown(wait=False)
-    for interval, fut in futures.items():
-        while True:
-            if cancelled():
-                return stop(NO_DATA, "analýza zrušena")
-            try:
-                raw, err = fut.result(timeout=0.1)
-                break
-            except TimeoutError:
-                continue
-        if isinstance(err, DataError):
-            sources.append((source, inst.symbol, interval, getattr(err, "kind", "unknown"), str(err)))
-            return stop(NO_DATA, str(err))
-        if err is not None:   # unexpected failure is a technical error, never a signal
-            sources.append((source, inst.symbol, interval, "invalid", f"{type(err).__name__}"))
-            return stop(ERROR, f"technická chyba při stahování {interval}: {type(err).__name__}: {err}")
-        step(f"Data {interval} stažena")
-        bars, problem = prepare(raw, interval, now, NEED, session_open(inst, now))
-        if problem:
-            sources.append((source, inst.symbol, interval, "no_data", problem))
-            return stop(NO_DATA, problem)
-        sources.append((source, inst.symbol, interval, "OK", f"{len(raw)} svíček, poslední uzavřená "
-                                                             f"{bars[-1].t:%d.%m. %H:%M} UTC"))
-        frames[interval] = bars
-        step(f"Data {interval} ověřena")
+    frames, failure, used = None, None, None
+    skipped = [s for s in candidates if not plan_ok(s, cfg.td_plan)]
+    for src in skipped:
+        sources.append(("Twelve Data", src.symbol, "–", "plan",
+                        f"vyžaduje tarif Twelve Data {src.plan} (nastaveno: {cfg.td_plan}) – bez dotazu"))
+    candidates = [s for s in candidates if plan_ok(s, cfg.td_plan)]
+    if not candidates:
+        need = min((s.plan for s in skipped), key=PLANS.index)
+        return stop(NO_DATA, f"{inst.name}: data Twelve Data pro {inst.symbol} vyžadují tarif {need} "
+                             f"(nastavený tarif: {cfg.td_plan}) a jiný ověřený zdroj není. Další krok: vyšší tarif "
+                             f"nebo jiný instrument; tarif nastavíte v ⚙ Nastavení.")
+    for src in candidates:
+        prov = providers_for(provider, src.provider)
+        if prov is None:
+            sources.append((src.provider, src.symbol, "–", "unmapped", "poskytovatel není nastaven"))
+            continue
+        mark = done
+        frames, why = fetch_all(prov, src)
+        if frames:
+            used = src
+            break
+        failure = failure or why
+        if why[0] == ERROR or why[1] == "analýza zrušena":
+            break
+        if src is not candidates[-1]:   # progress restarts for the next source (the ring never passes 100 %)
+            done = mark
+            progress(done, total, f"{getattr(prov, 'name', src.provider)} bez dat – zkouším další zdroj")
+    if not frames:
+        verdict, why = failure or (NO_DATA, "žádný zdroj dat není k dispozici")
+        if len([s for s in candidates if providers_for(provider, s.provider)]) > 1 and why != "analýza zrušena":
+            why += f" (vyzkoušeno zdrojů: {len(candidates)})"
+        if skipped and why != "analýza zrušena":
+            need = min((s.plan for s in skipped), key=PLANS.index)
+            why = (f"{inst.name}: přesná data vyžadují tarif Twelve Data {need} (nastaveno {cfg.td_plan}); "
+                   f"referenční zdroj selhal: {why}")
+        return stop(verdict, why)
     if cancelled():
         return stop(NO_DATA, "analýza zrušena")
     events = None
@@ -607,7 +684,8 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
     step("Kalendář zpráv")
     t0 = clock.perf_counter()
     try:
-        r = evaluate(inst, frames["5min"], frames["15min"], frames["1h"], events, spread, now, cfg, tick=step)
+        r = evaluate(inst, frames["5min"], frames["15min"], frames["1h"], events, spread, now, cfg, tick=step,
+                     reference="" if used.exact else (used.label or used.symbol))
     except Exception as e:  # noqa: BLE001
         return stop(ERROR, f"technická chyba vyhodnocení: {type(e).__name__}: {e}")
     timings["výpočet"] = 1000 * (clock.perf_counter() - t0)
