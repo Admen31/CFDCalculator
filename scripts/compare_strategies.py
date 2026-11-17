@@ -47,7 +47,8 @@ def yahoo(symbol: str, interval: str, rng: str, volume: bool) -> list[Bar]:
         if None in (o, h, lo, c) or min(o, h, lo, c) <= 0:
             continue
         h, lo = max(h, o, c), min(lo, o, c)
-        out.append(Bar(datetime.fromtimestamp(ts, timezone.utc), o, h, lo, c, float(v) if volume and v else None))
+        # a single missing volume becomes 0 (the frozen v2.0 rules cannot handle a partial None)
+        out.append(Bar(datetime.fromtimestamp(ts, timezone.utc), o, h, lo, c, float(v or 0) if volume else None))
     return out
 
 
@@ -92,7 +93,13 @@ def main() -> int:
             continue
         ok += 1
         t0 = time.monotonic()
-        res = compare(inst, m5, m15, h1, inst.spread, EXTRA_COST)
+        try:
+            res = compare(inst, m5, m15, h1, inst.spread, EXTRA_COST)
+        except Exception as e:  # noqa: BLE001 - one instrument must not stop the whole comparison
+            lines += [f"## {inst.name} ({sym}) – chyba výpočtu: {type(e).__name__}: {e}", ""]
+            print(f"{sym}: compare error {type(e).__name__}: {e}", flush=True)
+            ok -= 1
+            continue
         print(f"{sym}: {len(m5)} bars 5m, {time.monotonic() - t0:.0f} s", flush=True)
         src = f"{ysym} (Yahoo)" if args.source == "yahoo" else "Twelve Data"
         lines += [f"## {inst.name} ({sym}, data {src}, {m5[0].t:%d.%m.} – {m5[-1].t:%d.%m.%Y}, spread {inst.spread:g})",

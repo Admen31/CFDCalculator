@@ -226,6 +226,9 @@ def _vwap(m5, d) -> Module:
         m.note = "zdroj dat nemá objemy – indikátor nedostupný (nepočítá se jako hlas proti)"
         return m
     today = [b for b in m5 if b.t.date() == m5[-1].t.date()]
+    if any(b.v is None for b in today):
+        m.note = "dnešní objemy nejsou úplné – VWAP nedostupný (nepočítá se jako hlas proti)"
+        return m
     vw = ind.vwap([(b.h + b.l + b.c) / 3 for b in today], [b.v for b in today])
     close = m5[-1].c
     if vw is None:

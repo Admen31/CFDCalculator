@@ -194,3 +194,11 @@ def test_closed_market_hours_do_not_make_stock_data_stale():
     later = now + timedelta(hours=3)
     _, problem = prepare(bars, "1h", later, 250, session_open(AAPL, later))
     assert problem and "zastaralá" in problem                       # a gap inside the session stays stale
+
+
+def test_partial_volume_makes_vwap_unavailable_not_an_error():
+    """Real data (Yahoo, CI run 44049903157) had single bars without volume: VWAP must be 'unavailable'."""
+    bars = [replace(b, v=None) if n == len(UP["5min"]) - 30 else b for n, b in enumerate(UP["5min"])]
+    r = evaluate(AAPL, bars, UP["15min"], UP["1h"], [], 0.01, T0)
+    assert r.modules["vwap"].state == "na" and r.modules["vwap"].stance == "nedostupné"
+    assert r.verdict != ERROR and r.modules["volume"].state != "error"
