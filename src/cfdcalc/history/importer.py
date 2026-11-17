@@ -20,10 +20,11 @@ def _store_series(st: Store, source: str, symbol: str, provider: str, kind: str,
     return s
 
 
-def import_dukascopy(st: Store, symbol: str, start: datetime, end: datetime, http: sources.Http) -> dict:
+def import_dukascopy(st: Store, symbol: str, start: datetime, end: datetime, http: sources.Http,
+                     deadline: float | None = None) -> dict:
     """Download 1m bid/ask, aggregate to 5m/15m/1h, build mid, run quality checks. Returns a summary."""
     provider, _, kind = sources.DUKASCOPY[symbol]
-    raw = sources.dukascopy(symbol, start, end, http)
+    raw = sources.dukascopy(symbol, start, end, http, deadline)
     if not raw["bid"] or not raw["ask"]:
         raise sources.SourceError(f"{symbol}: Dukascopy nevrátil žádná data ({provider})")
     meta = {"licence": DUKA_LICENCE, "volume_kind": "tick", "adjusted": "no",

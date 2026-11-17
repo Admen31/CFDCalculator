@@ -16,7 +16,7 @@ import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,7 +28,7 @@ from cfdcalc.instruments import BY_SYMBOL  # noqa: E402
 from cfdcalc.report import write_csv, write_html  # noqa: E402
 from cfdcalc.validation import SEED, research  # noqa: E402
 
-DUKA = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD", "WTI/USD", "AAPL", "NVDA", "MSFT", "TSLA"]
+DUKA = ["EUR/USD", "XAU/USD", "GBP/USD", "USD/JPY", "AAPL", "NVDA", "MSFT", "TSLA", "WTI/USD"]   # priority order
 YAHOO_STOCKS = ["AAPL", "NVDA", "MSFT", "TSLA"]
 
 
@@ -48,21 +48,18 @@ def do_import(args) -> list[tuple[str, str]]:
     start = end - timedelta(days=31 * args.months)
     ok: list[tuple[str, str]] = []
 
-    def duka(symbol):
-        http = sources.Http(Path(args.cache) / "dukascopy", min_interval=0.15)
-        t0 = time.monotonic()
-        summary = importer.import_dukascopy(Store(args.db), symbol, start, end, http)
-        return symbol, summary, http.requests, time.monotonic() - t0
-
-    symbols = [s for s in args.symbols if s in sources.DUKASCOPY]
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        for fut in [pool.submit(duka, s) for s in symbols]:
-            try:
-                symbol, summary, req, secs = fut.result()
-                log(f"Dukascopy {symbol}: {summary} ({req} dotazů, {secs:.0f} s)")
-                ok.append((symbol, "dukascopy"))
-            except Exception as e:  # noqa: BLE001 - one provider failure must not stop the others
-                log(f"Dukascopy chyba: {type(e).__name__}: {e}")
+    # one download at a time, polite spacing, patient backoff (the feed answers 503 when pushed);
+    # a time budget keeps room for the analysis - the cache lets the next run continue
+    deadline = time.monotonic() + 60 * args.import_minutes
+    http = sources.Http(Path(args.cache) / "dukascopy", min_interval=0.6, retries=5, backoff=10.0)
+    for symbol in [s for s in args.symbols if s in sources.DUKASCOPY]:
+        t0, req0 = time.monotonic(), http.requests
+        try:
+            summary = importer.import_dukascopy(st, symbol, start, end, http, deadline)
+            log(f"Dukascopy {symbol}: {summary} ({http.requests - req0} dotazů, {time.monotonic() - t0:.0f} s)")
+            ok.append((symbol, "dukascopy"))
+        except Exception as e:  # noqa: BLE001 - one provider failure must not stop the others
+            log(f"Dukascopy {symbol} chyba: {type(e).__name__}: {e} ({http.requests - req0} dotazů)")
     http = sources.Http(None, min_interval=1.0)
     yahoo_1h = {}
     for symbol in sorted({s for s in args.symbols if s in sources.YAHOO}):
@@ -141,6 +138,7 @@ def main() -> int:
     ap.add_argument("--out", default="research/report")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2)
     ap.add_argument("--skip-import", action="store_true")
+    ap.add_argument("--import-minutes", type=float, default=35.0)
     ap.add_argument("--calendar")
     ap.add_argument("--calendar-coverage")
     args = ap.parse_args()

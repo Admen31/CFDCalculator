@@ -35,8 +35,10 @@ class Http:
     """GET with a minimum spacing between requests, an on-disk cache and at most `retries` retries
     (only on 429 / 5xx / timeouts; GET is idempotent)."""
 
-    def __init__(self, cache: Path | None, min_interval: float = 0.2, retries: int = 3, timeout: float = 30):
+    def __init__(self, cache: Path | None, min_interval: float = 0.2, retries: int = 3, timeout: float = 30,
+                 backoff: float = 1.0):
         self.cache, self.min_interval, self.retries, self.timeout = cache, min_interval, retries, timeout
+        self.backoff = backoff          # waits backoff * 2**attempt seconds (max 120 s) before a retry
         self._last = 0.0
         self.requests = 0
 
@@ -64,7 +66,7 @@ class Http:
             except (urllib.error.URLError, TimeoutError) as e:
                 if attempt == self.retries:
                     raise SourceError(f"síť nedostupná: {type(e).__name__}") from None
-            time.sleep(2 ** attempt)
+            time.sleep(min(120.0, self.backoff * 2 ** attempt))
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)
@@ -153,14 +155,18 @@ def parse_bi5(raw: bytes, day: datetime, point: float) -> list[Bar]:
     return out
 
 
-def dukascopy(symbol: str, start: datetime, end: datetime, http: Http) -> dict[str, list[Bar]]:
-    """1-minute bid and ask bars for [start, end). Weekends are skipped (no trading)."""
+def dukascopy(symbol: str, start: datetime, end: datetime, http: Http,
+              deadline: float | None = None) -> dict[str, list[Bar]]:
+    """1-minute bid and ask bars for [start, end). Weekends are skipped (no trading). `deadline` (time.monotonic)
+    stops the import; files already downloaded stay in the cache, so the next run resumes where this one stopped."""
     if symbol not in DUKASCOPY:
         raise SourceError(f"{symbol}: u Dukascopy není mapování")
     sym, point, _ = DUKASCOPY[symbol]
     out = {"bid": [], "ask": []}
     day = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
     while day < end:
+        if deadline is not None and time.monotonic() > deadline:
+            raise SourceError(f"{symbol}: časový rozpočet importu vyčerpán u {day:%Y-%m-%d} – pokračuje příští běh")
         if day.weekday() != 5:  # Saturday has no data; Sunday evening already trades
             for side in ("BID", "ASK"):
                 url = DUKA_URL.format(sym=sym, y=day.year, m=day.month - 1, d=day.day, side=side)

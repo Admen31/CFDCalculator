@@ -13,7 +13,7 @@ from cfdcalc.validation import research
 END = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
 
 
-def fake_dukascopy(symbol, start, end, http):
+def fake_dukascopy(symbol, start, end, http, deadline=None):
     mid = synthetic_bars(END, 1, 60 * 24 * 14, drift=0.00002, amp=0.3, noise=0.02, seed=9)[:-1]
     half = 0.004
     return {"bid": [replace(b, o=b.o - half, h=b.h - half, l=b.l - half, c=b.c - half, v=5.0) for b in mid],

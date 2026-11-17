@@ -139,3 +139,18 @@ def test_http_retries_only_transient_errors_and_caches(tmp_path, monkeypatch):
     with pytest.raises(sources.SourceError, match="HTTP 404"):
         http.get("https://example.invalid/c")
     assert len(calls) == n + 2                                                          # 404 is never retried
+
+
+def test_dukascopy_import_stops_at_the_time_budget_and_backoff_grows(monkeypatch, tmp_path):
+    import time as clock
+    with pytest.raises(sources.SourceError, match="časový rozpočet"):
+        sources.dukascopy("EUR/USD", T, T + timedelta(days=3), sources.Http(tmp_path), deadline=clock.monotonic() - 1)
+    waits = []
+    monkeypatch.setattr(sources.time, "sleep", waits.append)
+
+    def busy(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 503, "busy", {}, None)
+    monkeypatch.setattr(sources.urllib.request, "urlopen", busy)
+    with pytest.raises(sources.SourceError, match="HTTP 503"):
+        sources.Http(None, min_interval=0, retries=3, backoff=10.0).get("https://example.invalid/x")
+    assert waits == [10.0, 20.0, 40.0]
