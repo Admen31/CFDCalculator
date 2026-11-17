@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.6.0 – okamžitý směr trhu (větev `v2.6-instant-market-direction`)
+
+* **MARKET DIRECTION** (`direction.py`): transparentní vážené hlasování (EMA, sklon, cena vs EMA na 5m/15m/1h, RSI,
+  MACD a momentum, struktura 15m, VWAP a objem). Výsledek BUY/SELL/NEUTRAL, převaha 0–100, poměr argumentů,
+  kvalita dat a tři hlavní důvody.
+* **TRADE CONFIRMATION** zůstává samostatná vrstva s filtry v2.1. Vstup se nepotvrdí proti opačnému směru trhu.
+  Filtry nikdy neskryjí směr.
+* **Částečná data**: když chybí jeden rámec, směr se spočítá s nižší kvalitou dat. Vstup v takovém případě NO DATA.
+* **Nová hlavní obrazovka**: velký barevný směr, kruh s převahou, poměrový pruh BUY/SELL, trend, kvalita dat,
+  čip obchodního vstupu, důvod nepotvrzení, tři důvody. Tlačítko START/REFRESH/ZRUŠIT.
+* **Rychlost**: předchozí výsledek se zobrazí okamžitě a je označený; průběžné obnovování každou minutu. Odezva
+  se měří (medián a p95 pro cache hit/miss, krok v CI).
+* **Historické ověření** v laboratoři (kapitola 6): rozložení před/po, příčiny NO DATA, přesnost směru na 5m/15m/1h,
+  vývoj/validace/nedotčený test, interval spolehlivosti po dnech, citlivost na spread, srovnání s naivním momentem.
+  Výsledek: **žádná prediktivní výhoda směru**, převaha je popis, ne pravděpodobnost.
+
+
 ## 2.5.0 – široké pokrytí trhů a oprava NO DATA (větev `v2.5-multi-provider-market-coverage`)
 
 * **Audit pokrytí** (`scripts/coverage_audit.py`, samostatný job v CI) ověřuje přes veřejné endpointy Twelve Data

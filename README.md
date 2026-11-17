@@ -4,7 +4,8 @@ Malá desktopová aplikace pro Windows, kterou lze nechat nad Trading 212. Rozpo
 z vybrané oblasti obrazovky, stáhne svíčky z Twelve Data a vrátí **BUY / SELL / WAIT** s vysvětlením
 a návrhem stop-lossu a take-profitu. Od verze 2.3 navíc ukazuje **MARKET BIAS** (směr trhu) a **WATCH**
 (blížící se obchodní nastavení s tím, co přesně chybí). Verze 2.4 přidává **RISK MANAGEMENT**: maximální velikost
-pozice podle hodnoty účtu, rizika v %, vstupu a stop-lossu.
+pozice podle hodnoty účtu, rizika v %, vstupu a stop-lossu. Verze 2.6 dává jako hlavní výsledek **směr trhu
+BUY / SELL / NEUTRAL** s mírou převahy; obchodní vstup se potvrzuje samostatně.
 
 **Aplikace nikdy nezadává obchody.** Neobsahuje žádné napojení na broker, obchod zadáváte ručně.
 Výsledky nejsou investiční doporučení a ziskovost strategie není ověřena.
@@ -51,6 +52,72 @@ Požadavky: Windows 10/11, Python ≥ 3.12. OCR (RapidOCR) běží offline, nic 
 * OCR model se načítá na pozadí hned po zobrazení okna. START použije čtení Trading 212, které právě běží,
   místo aby čekal ve frontě. Čtení, které visí déle než 8 s, START neblokuje.
 * Při zavření okna se pracovní vlákna bezpečně ukončí.
+
+## Verze 2.6: okamžitý směr trhu (MARKET DIRECTION)
+
+![Hlavní obrazovka v2.6: BUY, SELL s nepotvrzeným vstupem, NEUTRAL, NO DATA (syntetická testovací data)](docs/v26-ui.png)
+
+### Dvě nezávislé vrstvy
+
+| Vrstva | Odpověď | Co rozhoduje |
+|---|---|---|
+| **MARKET DIRECTION** (hlavní, velký výsledek) | **BUY / SELL / NEUTRAL**, nebo NO DATA / ERROR | vážené hlasování indikátorů na 5m, 15m a 1h |
+| **TRADE CONFIRMATION** (obchodní vstup) | **POTVRZEN BUY/SELL** / **ČEKÁ NA POTVRZENÍ** / NO DATA | pravidla v2.1 se všemi bezpečnostními filtry (SL/TP, ATR, spread, S/R, čas, zprávy) a Risk Management |
+
+Obchodní filtry nikdy neblokují zobrazení směru. Vstup se ale nepotvrdí, pokud směr trhu ukazuje opačně.
+
+### Model směru (`direction.py`)
+
+Každý dostupný faktor hlasuje +1 (nahoru), −1 (dolů) nebo 0. Váhy jsou pevné, stanovené před testem; vyšší časový
+rámec váží víc:
+
+| Faktor | Váha |
+|---|---|
+| EMA20 vs EMA50 na 5m / 15m / 1h | 0,75 / 1,0 / 1,5 |
+| sklon EMA20 a cena vs EMA20 (každý rámec) | polovina váhy rámce |
+| RSI 5m (> 55 / < 45) a jeho směr | 0,5 + 0,25 |
+| MACD histogram 5m a jeho momentum, MACD 15m | 0,5 + 0,25, 0,75 |
+| struktura 15m (vyšší/nižší maxima i minima) | 1,0 |
+| VWAP 5m a objem 5m (jen u zdrojů se skutečným objemem) | 0,5 + 0,5 |
+
+* **skóre** = Σ váha × hlas / Σ váha dostupných faktorů (−1 až +1); **převaha** = |skóre| × 100 (0–100).
+* BUY při skóre ≥ 0,25, SELL při ≤ −0,25, jinak **NEUTRAL** s vysvětlením (vyrovnané argumenty).
+* Jeden nesouhlasný indikátor jen sníží převahu, nikdy výsledek nezmění na WAIT.
+* **Kvalita dat** = podíl dostupných vah. Při chybějícím 1h nebo 15m se směr spočítá z ostatních rámců s nižší
+  kvalitou. Pod 50 % kvality, nebo bez 5m dat a jednoho vyššího rámce, je výsledek poctivě **NO DATA**.
+* **Převaha je míra shody indikátorů, ne pravděpodobnost výhry.** Aplikace nezobrazuje žádné procento úspěšnosti.
+* Detail analýzy ukazuje každý faktor s váhou a hlasem a co chybí.
+
+### Rychlost
+
+* START → výsledek (napodobené API 300 ms na dotaz, 3 rámce paralelně, Windows CI): **cache miss medián ~322 ms
+  (p95 ~326 ms)**, **cache hit medián ~23 ms (p95 ~52 ms)** (`tests/test_latency.py`, krok v CI).
+* Předchozí výsledek instrumentu se po START zobrazí okamžitě, šedě označený „PŘEDCHOZÍ VÝSLEDEK z HH:MM –
+  aktualizuji data…“. Za aktuální se nikdy nevydává.
+* **Průběžné obnovování** výsledku každou minutu (vypnutelné v Nastavení). Díky cache svíček stojí jen jednotky
+  dotazů za hodinu.
+* Tlačítko **▶ START / ⟳ REFRESH / ■ ZRUŠIT** vedle stavového řádku (stejně jako klik do kruhu).
+
+### Historické ověření (Yahoo 25.08.–17.11.2026, 10 instrumentů, stejné funkce jako aplikace)
+
+Podrobně v `docs/v26-laborator.md` (kapitola 6) a v artefaktu `strategy-lab` každého běhu CI.
+
+| | BUY | SELL | NEUTRAL | WAIT | NO DATA |
+|---|---|---|---|---|---|
+| **před** (v2.1, hlavní výsledek) | 0,7 % | 1,3 % | – | 91,7 % | 6,3 % |
+| **po** – MARKET DIRECTION | ~37 % | ~45 % | ~17 % | – | 0,3 % |
+| **po** – TRADE CONFIRMATION | 0,7 % | 1,3 % | – | 91,7 % | 6,3 % |
+
+* **Směr nemá prokázanou prediktivní výhodu.** Na nedotčeném testu odpovídal směru ceny za 1 h zhruba v 51 %
+  případů. 95% interval (převzorkováno po dnech) zahrnuje 50 %. Na 5m a 15m horizontu je to kolem 50 %
+  a po odečtení spreadu je průměrný pohyb záporný. MARKET DIRECTION proto **popisuje aktuální stav trhu,
+  nepředpovídá ho**.
+* Předem stanovené pravidlo pro výběr prahu (nejlepší vývojový výsledek) nenašlo práh nad 50 %. Aplikace proto
+  drží předem zvolený popisný práh 0,25.
+* Potvrzené vstupy (TRADE CONFIRMATION, plné náklady) se vyhodnocují zvlášť, viz řádek v2.1 v kapitole 2 laboratoře.
+  Výhoda ani tam není prokázaná.
+* Varianta pravidla „≤ 1 indikátor proti“ (místo nuly) měla v testu +0,12 R, ale interval −0,12 až +0,35 R a záporné
+  výsledky na validaci. Neprošla, pravidlo „0 proti“ zůstává.
 
 ## Verze 2.5: široké pokrytí trhů a oprava NO DATA
 

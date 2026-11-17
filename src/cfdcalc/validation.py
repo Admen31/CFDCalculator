@@ -327,10 +327,14 @@ def direction_study(all_rows: list[dict]) -> dict:
     mom = lambda r: None if r["mom"] is None else "BUY" if r["mom"] > 0 else "SELL" if r["mom"] < 0 else None  # noqa
     out["momentum_test"] = {h: direction_metrics(part["test"], 0, h, side_of=mom) for h in HORIZONS}
     out["cost_test"] = {c: direction_metrics(part["test"], chosen, "1h", cost=c) for c in (0.0, 1.0, 2.0, 3.0)}
+    from .direction import THRESHOLD
+    out["app_threshold"] = THRESHOLD
+    out["app_test"] = {h: direction_metrics(part["test"], THRESHOLD, h) for h in HORIZONS}
+    out["app_test_ci"] = {h: cluster_ci(out["app_test"][h]["_clusters"]) for h in HORIZONS}
     out["dist"] = {}
     for k in PARTS + ("celkem",):
         rows = all_rows if k == "celkem" else part[k]
         out["dist"][k] = {"před (v2.1)": Counter(r["before"] for r in rows),
-                          "směr v2.6": Counter(_side(r["score"], chosen) or "NO DATA" for r in rows),
+                          "směr v2.6": Counter(_side(r["score"], THRESHOLD) or "NO DATA" for r in rows),
                           "vstup v2.6": Counter(r["after"] for r in rows)}
     return out

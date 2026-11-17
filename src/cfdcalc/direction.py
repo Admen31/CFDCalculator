@@ -5,8 +5,8 @@ score, it never turns the answer into WAIT. score = sum(w * vote) / sum(w) over 
 so it lies in [-1, 1]; "převaha" (strength) = |score| x 100. It is an agreement score of the indicators, NOT a
 probability of a winning trade.
 
-Weights were fixed before any test (longer timeframes weigh more). The only tuned number is THRESHOLD, chosen on the
-development part of the historical sample by a pre-registered rule (scripts/strategy_lab.py, README "v2.6").
+Weights were fixed before any test (longer timeframes weigh more). THRESHOLD is a fixed descriptive boundary; the lab
+(scripts/strategy_lab.py, README "v2.6") checks every threshold out of sample and reports that none has an edge.
 Missing factors lower the data quality; below MIN_QUALITY, or without 5m data plus one higher timeframe, the answer
 is NO DATA. Uses CLOSED bars only (the caller validates freshness).
 """
@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 from . import indicators as ind
 
 BUY, SELL, NEUTRAL, NO_DATA = "BUY", "SELL", "NEUTRAL", "NO DATA"
-THRESHOLD = 0.25            # |score| needed for BUY/SELL (see module doc)
+# |score| needed for BUY/SELL. Fixed in advance as a descriptive boundary ("převaha >= 25/100"): on the 2026 lab sample
+# no threshold predicted the next move better than 50 % on the development part, so none was chosen for prediction.
+THRESHOLD = 0.25
 MIN_QUALITY = 0.5           # share of the applicable weight that must be available
 TF_WEIGHT = {"5m": 0.75, "15m": 1.0, "1h": 1.5}
 

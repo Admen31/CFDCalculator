@@ -83,7 +83,9 @@ def direction_section(d: dict, causes: dict, n_inst: int) -> list[str]:
            f"Pravidlo výběru prahu (stanoveno předem): {d['rule']} **Zvolený práh: {t:.2f}** "
            f"(= převaha {round(100 * t)}/100). Směr používá stejnou funkci jako aplikace; budoucí pohyb ceny "
            "slouží jen k hodnocení. Instrumenty: " + str(n_inst) + ".", "",
-           "### Rozložení výsledků před a po (stejný vzorek)", "",
+           f"**Práh v aplikaci: {d['app_threshold']:.2f}** (stanoven předem). Pokud žádný práh na vývojovém období "
+           "nepřekoná 50 %, výběr podle predikce nemá oporu a aplikace drží předem zvolený popisný práh.", "",
+           "### Rozložení výsledků před a po (stejný vzorek, práh aplikace)", "",
            "| část | vrstva | BUY | SELL | NEUTRAL | WAIT | NO DATA | ERROR |", "|---|---|---|---|---|---|---|---|"]
     for part, layers in d["dist"].items():
         for name, c in layers.items():
@@ -113,6 +115,10 @@ def direction_section(d: dict, causes: dict, n_inst: int) -> list[str]:
         out.append(f"* horizont {h}: správný směr {pct(test[h]['hit'])} z {test[h]['calls']} signálů "
                    f"(95% interval po dnech {pct(lo)} – {pct(hi)}); naivní momentum (směr poslední hodiny) "
                    f"{pct(mom['hit'])}")
+    for h in HORIZONS:
+        g, (lo, hi) = d["app_test"][h], d["app_test_ci"][h]
+        out.append(f"* práh aplikace {d['app_threshold']:.2f}, horizont {h}: správný směr {pct(g['hit'])} z "
+                   f"{g['calls']} (95% interval {pct(lo)} – {pct(hi)})")
     out.append("* citlivost na náklady (horizont 1 h, ⌀ pohyb v ATR po odečtení násobku spreadu): " + "; ".join(
         f"{c:g}× spread {m['edge_net']:+.3f}" for c, m in d["cost_test"].items() if m["edge_net"] is not None))
     out.append("* Výkonnost potvrzených vstupů (vrstva TRADE CONFIRMATION, plné náklady): viz řádek v2.1 v kapitole 2 "
