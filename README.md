@@ -56,6 +56,8 @@ Požadavky: Windows 10/11, Python ≥ 3.12. OCR (RapidOCR) běží offline, nic 
 Přehled změn je v [CHANGELOG.md](CHANGELOG.md), úplný výzkumný report v
 [docs/v23-laborator-2026-11-17.md](docs/v23-laborator-2026-11-17.md).
 
+![Výsledkový panel v2.3: BUY, WAIT s WATCH, SELL, ERROR (syntetická testovací data)](docs/v23-ui.png)
+
 ### Co ukazuje výsledkový panel
 
 | Řádek | Význam |
