@@ -795,6 +795,15 @@ def detail_extra(r: Result, ocr_ms: float | None) -> str:
     """v2.3 sections of "Detail analýzy": bias, every setup, measured durations."""
     esc = html.escape
     parts = []
+    m = r.market
+    if m:
+        from .direction import THRESHOLD
+        vote = {1: "▲ BUY", -1: "▼ SELL", 0: "● 0"}
+        parts.append(f"<p><b>MARKET DIRECTION: {esc(m.side)}</b> – skóre {m.score:+.3f}, převaha {m.strength}/100 "
+                     f"(práh {round(THRESHOLD * 100)}), kvalita dat {m.quality:.0%}. Převaha je míra shody indikátorů, "
+                     "ne pravděpodobnost výhry.<br>" + esc(m.reason) + "<br>"
+                     + "<br>".join(f"{vote[f.vote]} · váha {f.weight:g} · {esc(f.text)}" for f in m.factors)
+                     + (f"<br><i>Chybí: {esc('; '.join(m.missing))}</i>" if m.missing else "") + "</p>")
     if r.bias:
         b = r.bias
         parts.append(f"<p><b>Market bias: <span style='color:{BIAS_COLORS[b.direction]}'>{esc(b.direction)}</span>"

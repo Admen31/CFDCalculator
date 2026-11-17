@@ -53,6 +53,11 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q -p no:cacheprovider
+      - name: Response time START -> result (mocked API 300 ms per request)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONIOENCODING: utf-8
+        run: python -m pytest -q -s -p no:cacheprovider tests/test_latency.py
       - name: End-to-end on the real Windows desktop (Win32 window search, capture, OCR, UI)
         env:
           CFD_E2E: "1"
