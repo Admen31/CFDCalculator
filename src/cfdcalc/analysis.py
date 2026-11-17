@@ -30,6 +30,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import indicators as ind
+from . import direction as dr
 from . import strategies as st
 from .calendar import Calendar, CalendarError, Event
 from .data import Bar, DataError, Provider, prepare
@@ -142,6 +143,7 @@ class Result:
     strategy: str = ""                   # rule set behind a confirmed BUY/SELL
     timings: dict[str, float] = field(default_factory=dict)   # measured durations in ms
     reference: str = ""                  # non-empty: analysed on REFERENCE data (label) - direction only, no levels
+    market: dr.Direction | None = None   # v2.6 MARKET DIRECTION (main answer); `verdict` = TRADE CONFIRMATION
 
     @property
     def is_signal(self) -> bool:
@@ -507,6 +509,15 @@ def evaluate(inst: Instrument, m5: list[Bar], m15: list[Bar], h1: list[Bar], eve
     only_calendar = r.verdict == NO_DATA and events is None and len(missing) == 1
     if r.verdict not in (ERROR, NO_DATA) or only_calendar:   # prices are fine: bias/WATCH still help
         _opportunities(r, inst, m5, m15, h1, events, spread, now, cfg, end, left)
+    if not errors:
+        try:
+            r.market = dr.direction(m5, m15, h1)
+        except Exception as e:  # noqa: BLE001 - the direction layer must never break the confirmation layer
+            r.market = dr.Direction(side=ERROR, reason=f"technická chyba směru: {type(e).__name__}: {e}")
+        side = r.market.side
+        if r.verdict in (BUY, SELL) and side in (BUY, SELL) and side != r.verdict:   # opposite direction only
+            r.reasons.insert(0, f"MARKET DIRECTION je {side} – vstup {r.verdict} se nepotvrzuje")
+            r.verdict, r.entry, r.sl, r.tp, r.sl_dist, r.strategy = WAIT, None, None, None, None, ""
     if reference:
         r.reference = reference
         r.entry = r.sl = r.tp = r.sl_dist = None     # reference prices never become CFD levels
@@ -585,7 +596,9 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
                              f"symbolem {inst.symbol} uvádí jiný instrument – mapování neověřeno)")
     end, closed_reason = market_end(inst, now, cfg)
     if end is None:
-        return stop(WAIT, f"trh je zavřený – {closed_reason}")
+        out = stop(WAIT, f"trh je zavřený – {closed_reason}")
+        out.market = dr.Direction(side=dr.NO_DATA, reason=f"trh je zavřený – {closed_reason}; aktuální směr není")
+        return out
 
     def fetch_all(prov, src) -> tuple[dict | None, tuple[str, str] | None]:
         """All three timeframes from ONE source (never mixed). Returns (frames, None) or (None, (verdict, why))."""
@@ -605,7 +618,7 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
         pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="fetch")
         futures = {iv: pool.submit(fetch, iv) for iv in ("5min", "15min", "1h")}
         pool.shutdown(wait=False)
-        got = {}
+        got, failure = {}, None
         for interval, fut in futures.items():
             while True:
                 if cancelled():
@@ -617,7 +630,8 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
                     continue
             if isinstance(err, DataError):
                 sources.append((name, src.symbol, interval, getattr(err, "kind", "unknown"), str(err)))
-                return None, (NO_DATA, str(err))
+                failure = failure or (NO_DATA, str(err))
+                continue
             if err is not None:   # unexpected failure is a technical error, never a signal
                 sources.append((name, src.symbol, interval, "invalid", f"{type(err).__name__}"))
                 return None, (ERROR, f"technická chyba při stahování {interval}: {type(err).__name__}: {err}")
@@ -626,16 +640,21 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
             if problem:
                 kind = "stale" if "zastaralá" in problem else "short" if "málo" in problem else "invalid"
                 sources.append((name, src.symbol, interval, kind, problem))
-                return None, (NO_DATA, problem)
+                failure = failure or (NO_DATA, problem)
+                continue
             sources.append((name, src.symbol, interval, "OK", f"{len(raw)} svíček, poslední uzavřená "
                                                               f"{bars[-1].t:%d.%m. %H:%M} UTC"))
             got[interval] = bars
             step(f"Data {interval} ověřena")
+        if failure:
+            partial[src] = got        # what this ONE source delivered (never mixed with another source)
+            return None, failure
         return got, None
 
     if cancelled():
         return stop(NO_DATA, "analýza zrušena")
     frames, failure, used = None, None, None
+    partial: dict = {}
     skipped = [s for s in candidates if not plan_ok(s, cfg.td_plan)]
     for src in skipped:
         sources.append(("Twelve Data", src.symbol, "–", "plan",
@@ -664,13 +683,22 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
             progress(done, total, f"{getattr(prov, 'name', src.provider)} bez dat – zkouším další zdroj")
     if not frames:
         verdict, why = failure or (NO_DATA, "žádný zdroj dat není k dispozici")
+        best = next(((src, got) for src, got in partial.items() if "5min" in got and len(got) >= 2), None)
         if len([s for s in candidates if providers_for(provider, s.provider)]) > 1 and why != "analýza zrušena":
             why += f" (vyzkoušeno zdrojů: {len(candidates)})"
         if skipped and why != "analýza zrušena":
             need = min((s.plan for s in skipped), key=PLANS.index)
             why = (f"{inst.name}: přesná data vyžadují tarif Twelve Data {need} (nastaveno {cfg.td_plan}); "
                    f"referenční zdroj selhal: {why}")
-        return stop(verdict, why)
+        out = stop(verdict, why)
+        if verdict == NO_DATA and best:      # enough valid data for the direction (lower quality), not for a trade
+            src, got = best
+            out.market = dr.direction(got.get("5min"), got.get("15min"), got.get("1h"))
+            out.market.reason += " · částečná data: " + why[:120]
+            out.data_time = got["5min"][-1].t + timedelta(minutes=5)
+            if not src.exact:
+                out.reference = src.label or src.symbol
+        return out
     if cancelled():
         return stop(NO_DATA, "analýza zrušena")
     events = None

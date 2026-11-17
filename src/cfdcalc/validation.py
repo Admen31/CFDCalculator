@@ -20,7 +20,7 @@ from datetime import datetime
 from statistics import mean, median
 
 from .analysis import BASE, BUY, DEFAULTS, NO_DATA, SELL, Params, Settings
-from .engine import Costs, Market, RandomEntries, Run, Trade, run, v20, v21
+from .engine import Costs, Market, RandomEntries, Run, Trade, run, v20, v21, windows
 
 SENSITIVITY = [("SL 1,0×ATR", Params(sl_atr=1.0)), ("SL 2,0×ATR", Params(sl_atr=2.0)),
                ("TP 1,5 R", Params(tp_r=1.5)), ("TP 3 R", Params(tp_r=3.0)),
@@ -221,4 +221,116 @@ def promotion(studies: list[dict]) -> dict:
                   "lepší než náhodné vstupy": o["test"]["exp"] is not None and (rnd is None or o["test"]["exp"] > rnd)}
         o["checks"] = checks
         o["validated"] = all(checks.values())
+    return out
+
+
+# ---------------------------------------------------------------- v2.6: MARKET DIRECTION study
+
+THRESHOLDS = (0.10, 0.20, 0.25, 0.30, 0.40, 0.50)
+HORIZONS = {"5m": 1, "15m": 3, "1h": 12}       # bars of 5m after the decision
+MIN_COVERAGE = 0.25
+DIRECTION_RULE = ("práh |skóre| se vybírá jen na vývojovém období: nejvyšší podíl správných směrů na horizontu 1 h "
+                  "mezi prahy, které dávají BUY/SELL aspoň v 25 % rozhodnutí; při shodě nižší práh. Váhy jsou pevné.")
+
+
+def direction_rows(m: Market, costs: Costs, cfg: Settings = DEFAULTS) -> dict:
+    """One row per decision time: direction score (all thresholds derive from it), confirmation before/after
+    v2.6, forward moves (graded afterwards only), spread and ATR. Uses exactly the app's functions."""
+    from . import direction as dr
+    from . import indicators as ind
+    from .analysis import ERROR, WAIT, evaluate
+    times = [b.t for b in m.mid5]
+    p = periods(times[249:]) if len(times) > 600 else periods(times)
+    closes = [b.c for b in m.mid5]
+    rows, causes = [], Counter()
+    for w in windows(m, costs):
+        ok = [x is None for x in w.problems]
+        before = after = "NO DATA"
+        score = quality = None
+        if w.problem:
+            causes[w.problem.split(" – ")[0].split(":")[0] + ": " + w.problem.split(":", 1)[-1].split("(")[0][:28]
+                   .strip()] += 1
+        if ok[0] and (ok[1] or ok[2]):                     # direction needs 5m + one higher timeframe
+            d = dr.direction(w.s5, w.s15 if ok[1] else None, w.s1 if ok[2] else None, threshold=0.0)
+            if d.side != dr.NO_DATA:
+                score, quality = d.score, d.quality
+        if not w.problem:
+            try:
+                r = evaluate(m.inst, w.s5, w.s15, w.s1, w.events, w.spread, w.now, cfg)
+                after = r.verdict
+                demoted = bool(r.reasons) and r.reasons[0].startswith("MARKET DIRECTION je")
+                before = r.reasons[0].split("vstup ")[1].split(" ")[0] if demoted else after
+            except Exception:  # noqa: BLE001 - counted as a technical error
+                before = after = ERROR
+        a15 = ind.atr([b.h for b in w.s15], [b.l for b in w.s15], [b.c for b in w.s15])[-1] if ok[1] else None
+        fwd = {k: (closes[w.i + h] - closes[w.i]) if w.i + h < len(closes) else None for k, h in HORIZONS.items()}
+        rows.append({"sym": m.inst.symbol, "t": w.now, "part": p.part(w.now), "score": score, "quality": quality,
+                     "before": before, "after": after if after != WAIT else "WAIT", "fwd": fwd, "atr": a15,
+                     "spread": w.spread, "day": w.now.date(),
+                     "mom": closes[w.i] - closes[w.i - 12] if w.i >= 12 else None})
+    return {"symbol": m.inst.symbol, "rows": rows, "causes": causes}
+
+
+def _side(score, t):
+    return None if score is None else "BUY" if score >= t else "SELL" if score <= -t else "NEUTRAL"
+
+
+def direction_metrics(rows: list[dict], t: float, horizon: str, side_of=None, cost: float = 1.0) -> dict:
+    """Coverage and quality of the direction on `rows` (pooled). Hit = the price moved the indicated way;
+    net hit = it moved further than the spread; edge = mean signed move in ATR(15m), gross and after the spread."""
+    side_of = side_of or (lambda r: _side(r["score"], t))
+    valid = [r for r in rows if r["score"] is not None]
+    sides = [(r, side_of(r)) for r in valid]
+    calls = [(r, s) for r, s in sides if s in ("BUY", "SELL") and r["fwd"][horizon] is not None and r["atr"]]
+    moved = [(r, s) for r, s in calls if r["fwd"][horizon] != 0]
+    hits = [(r["fwd"][horizon] > 0) if s == "BUY" else (r["fwd"][horizon] < 0) for r, s in moved]
+    signed = [(1 if s == "BUY" else -1) * r["fwd"][horizon] for r, s in calls]
+    net = [x - cost * r["spread"] for x, (r, _) in zip(signed, calls, strict=True)]
+    edge = [x / r["atr"] for x, (r, _) in zip(signed, calls, strict=True)]
+    edge_net = [x / r["atr"] for x, (r, _) in zip(net, calls, strict=True)]
+    n = len(rows)
+    return {"n": n, "valid": len(valid) / n if n else 0.0, "coverage": len(calls) / len(valid) if valid else 0.0,
+            "calls": len(calls), "hit": mean(hits) if hits else None,
+            "net_hit": mean(1.0 if x > 0 else 0.0 for x in net) if net else None,
+            "edge": mean(edge) if edge else None, "edge_net": mean(edge_net) if edge_net else None,
+            "_clusters": [((r["sym"], r["day"]), h) for (r, _), h in zip(moved, hits, strict=True)]}
+
+
+def cluster_ci(pairs: list[tuple], seed: int = SEED, n: int = 1000) -> tuple[float | None, float | None]:
+    """95 % interval of the hit rate, resampling whole instrument-days (neighbouring decisions overlap)."""
+    groups = defaultdict(list)
+    for key, h in pairs:
+        groups[key].append(1.0 if h else 0.0)
+    keys = list(groups)
+    if len(keys) < 5:
+        return None, None
+    rng = random.Random(seed)
+    stats = []
+    for _ in range(n):
+        pick = [groups[rng.choice(keys)] for _ in keys]
+        tot = sum(len(g) for g in pick)
+        stats.append(sum(sum(g) for g in pick) / tot if tot else 0.5)
+    stats.sort()
+    return stats[int(0.025 * n)], stats[int(0.975 * n) - 1]
+
+
+def direction_study(all_rows: list[dict]) -> dict:
+    """Pooled over instruments: threshold chosen on development data only, then validation and untouched test."""
+    part = {k: [r for r in all_rows if r["part"] == k] for k in PARTS}
+    grid = {t: {k: {h: direction_metrics(part[k], t, h) for h in HORIZONS} for k in PARTS} for t in THRESHOLDS}
+    eligible = [t for t in THRESHOLDS if grid[t]["vývoj"]["1h"]["coverage"] >= MIN_COVERAGE
+                and grid[t]["vývoj"]["1h"]["hit"] is not None]
+    chosen = max(eligible, key=lambda t: (round(grid[t]["vývoj"]["1h"]["hit"], 4), -t)) if eligible else THRESHOLDS[1]
+    out = {"grid": grid, "chosen": chosen, "rule": DIRECTION_RULE}
+    test = grid[chosen]["test"]
+    out["test_ci"] = {h: cluster_ci(test[h]["_clusters"]) for h in HORIZONS}
+    mom = lambda r: None if r["mom"] is None else "BUY" if r["mom"] > 0 else "SELL" if r["mom"] < 0 else None  # noqa
+    out["momentum_test"] = {h: direction_metrics(part["test"], 0, h, side_of=mom) for h in HORIZONS}
+    out["cost_test"] = {c: direction_metrics(part["test"], chosen, "1h", cost=c) for c in (0.0, 1.0, 2.0, 3.0)}
+    out["dist"] = {}
+    for k in PARTS + ("celkem",):
+        rows = all_rows if k == "celkem" else part[k]
+        out["dist"][k] = {"před (v2.1)": Counter(r["before"] for r in rows),
+                          "směr v2.6": Counter(_side(r["score"], chosen) or "NO DATA" for r in rows),
+                          "vstup v2.6": Counter(r["after"] for r in rows)}
     return out

@@ -28,7 +28,8 @@ from cfdcalc.engine import Costs, Market  # noqa: E402
 from cfdcalc.history import sources  # noqa: E402
 from cfdcalc.instruments import BY_SYMBOL  # noqa: E402
 from cfdcalc.strategies import NAMES  # noqa: E402
-from cfdcalc.validation import PROMOTION, STRATEGY_KEYS, metrics, promotion, strategy_study  # noqa: E402
+from cfdcalc.validation import (HORIZONS, PARTS, PROMOTION, STRATEGY_KEYS, THRESHOLDS, direction_rows,  # noqa: E402
+                                direction_study, metrics, promotion, strategy_study)
 
 UNIVERSE = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD", "XAG/USD", "WTI/USD", "AAPL", "NVDA", "MSFT", "TSLA"]
 
@@ -60,7 +61,8 @@ def work(job):
     t0 = time.monotonic()
     diag = diagnostics.diagnose(m, costs_for(symbol))
     study = strategy_study(m, costs_for(symbol))
-    return symbol, diag, study, time.monotonic() - t0
+    rows = direction_rows(m, costs_for(symbol))
+    return symbol, diag, study, rows, time.monotonic() - t0
 
 
 def m(x) -> str:
@@ -69,6 +71,53 @@ def m(x) -> str:
     pf = "–" if x["pf"] is None else f"{x['pf']:.2f}"
     return (f"{x['n']} obch., {100 * x['win']:.0f} % zisk., PF {pf}, ⌀ {x['exp']:+.3f} R, Σ {x['total']:+.1f} R, "
             f"max. pokles {x['dd']:.1f} R")
+
+
+def pct(x) -> str:
+    return "–" if x is None else f"{100 * x:.1f} %"
+
+
+def direction_section(d: dict, causes: dict, n_inst: int) -> list[str]:
+    t = d["chosen"]
+    out = ["", "## 6. v2.6 MARKET DIRECTION – historické ověření", "",
+           f"Pravidlo výběru prahu (stanoveno předem): {d['rule']} **Zvolený práh: {t:.2f}** "
+           f"(= převaha {round(100 * t)}/100). Směr používá stejnou funkci jako aplikace; budoucí pohyb ceny "
+           "slouží jen k hodnocení. Instrumenty: " + str(n_inst) + ".", "",
+           "### Rozložení výsledků před a po (stejný vzorek)", "",
+           "| část | vrstva | BUY | SELL | NEUTRAL | WAIT | NO DATA | ERROR |", "|---|---|---|---|---|---|---|---|"]
+    for part, layers in d["dist"].items():
+        for name, c in layers.items():
+            n = sum(c.values()) or 1
+            out.append(f"| {part} | {name} | " + " | ".join(
+                f"{100 * c.get(k, 0) / n:.1f} %" for k in ("BUY", "SELL", "NEUTRAL", "WAIT", "NO DATA", "ERROR"))
+                + " |")
+    out += ["", "Příčiny NO DATA (okno dat): " + "; ".join(f"{k} {v}×" for k, v in
+                                                          sorted(causes.items(), key=lambda kv: -kv[1])[:8]), "",
+            "### Kvalita směru podle prahu (podíl správného směru = cena se pohnula naznačeným směrem)", "",
+            "| práh | část | pokrytí BUY/SELL | 5 m | 15 m | 1 h | 1 h po spreadu | "
+            "⌀ pohyb 1 h v ATR (hrubě / po spreadu) |",
+            "|---|---|---|---|---|---|---|---|"]
+    for th in THRESHOLDS:
+        for part in PARTS:
+            g = d["grid"][th][part]
+            out.append(f"| {th:.2f}{' ✓' if th == t else ''} | {part} | {pct(g['1h']['coverage'])} | "
+                       + " | ".join(pct(g[h]["hit"]) for h in HORIZONS)
+                       + f" | {pct(g['1h']['net_hit'])} | "
+                       + (f"{g['1h']['edge']:+.3f} / {g['1h']['edge_net']:+.3f}" if g['1h']['edge'] is not None
+                          else "–") + " |")
+    test = d["grid"][t]["test"]
+    out += ["", "### Nedotčený test (zvolený práh)", ""]
+    for h in HORIZONS:
+        lo, hi = d["test_ci"][h]
+        mom = d["momentum_test"][h]
+        out.append(f"* horizont {h}: správný směr {pct(test[h]['hit'])} z {test[h]['calls']} signálů "
+                   f"(95% interval po dnech {pct(lo)} – {pct(hi)}); naivní momentum (směr poslední hodiny) "
+                   f"{pct(mom['hit'])}")
+    out.append("* citlivost na náklady (horizont 1 h, ⌀ pohyb v ATR po odečtení násobku spreadu): " + "; ".join(
+        f"{c:g}× spread {m['edge_net']:+.3f}" for c, m in d["cost_test"].items() if m["edge_net"] is not None))
+    out.append("* Výkonnost potvrzených vstupů (vrstva TRADE CONFIRMATION, plné náklady): viz řádek v2.1 v kapitole 2 "
+               "– od v2.6 se vstup proti MARKET DIRECTION nepotvrdí.")
+    return out
 
 
 def main() -> int:
@@ -99,12 +148,15 @@ def main() -> int:
     if not jobs:
         log("Žádná data – laboratoř NEPROVEDENA.")
         return 1
-    diags, studies = [], []
+    diags, studies, drows, causes = [], [], [], {}
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        for symbol, diag, study, sec in pool.map(work, jobs):
+        for symbol, diag, study, rows, sec in pool.map(work, jobs):
             log(f"{symbol}: hotovo za {sec:.0f} s")
             diags.append(diag)
             studies.append(study)
+            drows += rows["rows"]
+            for k, v in rows["causes"].items():
+                causes[k] = causes.get(k, 0) + v
     prom = promotion(studies)
     lines = [f"# v2.3 – diagnostika WAIT a test strategií ({datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC)", "",
              "Data Yahoo Finance (veřejná, ne ceny Trading 212; zlato/stříbro/ropa = futures jako výzkumná náhrada). "
@@ -151,10 +203,12 @@ def main() -> int:
     for key in ("v2.1",) + STRATEGY_KEYS + ("náhodný",):
         lines.append(f"| {NAMES.get(key, key)} | " + " | ".join(
             "–" if not f["n"] else f"{f['n']} / {f['exp']:+.2f} R" for f in prom[key]["folds"]) + " |")
+    lines += direction_section(direction_study(drows), causes, len(jobs))
     text = "\n".join(lines) + "\n"
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "lab.md").write_text(text, encoding="utf-8")
+    (out / "direction.json").write_text(json.dumps({"threshold_rule": "viz lab.md kapitola 6"}), encoding="utf-8")
     (out / "promotion.json").write_text(json.dumps(
         {k: {"validated": prom[k].get("validated", False), "checks": prom[k].get("checks", {}),
              "test_n": prom[k]["test"]["n"], "test_exp": prom[k]["test"]["exp"]} for k in prom},

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from conftest import T0, FakeCalendar, FakeProvider
-from test_data_errors import KEY, Resp, bars_json, http_error, install
+from test_data_errors import KEY, Resp, bars_json, install
 
 from cfdcalc import data
 from cfdcalc.analysis import BUY, NO_DATA, SELL, WAIT, Settings, market_end, run_analysis
@@ -146,6 +146,7 @@ def test_sources_are_never_mixed_between_timeframes():
     second = FakeProvider()
     r = run_analysis(BTC, {COINBASE: Half(), TWELVE: second}, FakeCalendar(), 1.0, T0)
     assert sorted(second.calls) == ["15min", "1h", "5min"]     # all three again from the second source
+    assert r.completed == r.total and [s[3] for s in r.sources if s[0] == "Half"].count("no_data") == 1
 
 
 # ---------------------------------------------------------------- plan, reference, closures

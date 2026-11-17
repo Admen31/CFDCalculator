@@ -162,6 +162,7 @@ class Window:
     spread: float
     events: list
     tested: bool
+    problems: tuple = (None, None, None)     # per timeframe (5m, 15m, 1h)
 
 
 def windows(m: Market, costs: Costs, start: datetime | None = None, end: datetime | None = None,
@@ -197,7 +198,7 @@ def windows(m: Market, costs: Costs, start: datetime | None = None, end: datetim
             spread = max(costs.spread_floor, ask[t5[i]].c - bid[t5[i]].c)
         tested = m.news_covered(now)
         events = m.events(now) if (m.events and tested and not problem) else []
-        yield Window(i, now, s5, s15, s1, problem, spread, events, tested)
+        yield Window(i, now, s5, s15, s1, problem, spread, events, tested, (p5, p15, p1))
     progress(n, n)
 
 

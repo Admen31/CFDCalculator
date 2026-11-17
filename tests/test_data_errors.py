@@ -169,10 +169,12 @@ def test_analysis_reports_interval_and_source_and_stops_cleanly(monkeypatch):
     install(monkeypatch, behaviour)
     r = run_analysis(SILVER, TwelveData(KEY), FakeCalendar(), 0.03, T0)
     # silver: 5min ok, 15min fails; then the labelled reference ETF is tried (fails the same way here)
-    assert r.verdict == NO_DATA and r.completed == 3 and set(calls) == {"XAG/USD", "SLV"}
+    assert r.verdict == NO_DATA and r.completed == 5 and set(calls) == {"XAG/USD", "SLV"}   # 5m + 1h still read
     assert [(s[0], s[1], s[2], s[3]) for s in r.sources][:2] == [("Twelve Data", "XAG/USD", "5min", "OK"),
                                                                  ("Twelve Data", "XAG/USD", "15min", "not_found")]
     assert "XAG/USD" in r.summary and "zdrojů: 2" in r.summary
+    # v2.6: 5m + 1h of ONE source are enough for the market direction (lower quality), never for a trade
+    assert r.market and r.market.side in ("BUY", "SELL", "NEUTRAL", "NO DATA") and r.market.quality < 1
     assert "interval 15min" in r.summary and "HTTP 404" in r.summary and KEY not in r.summary
 
 
