@@ -18,13 +18,18 @@ MARGIN = 0.08      # a runner-up this close makes the reading ambiguous
 _ocr = None
 
 
-def ocr_lines(rgb) -> list[str]:
-    """Text lines in an RGB numpy array (RapidOCR, offline). Loaded lazily: first call takes ~1 s."""
+def warm_up():
+    """Load the OCR model (imports onnxruntime/OpenCV, ~1-2 s); called once in a worker thread at start-up."""
     global _ocr
     if _ocr is None:
         from rapidocr_onnxruntime import RapidOCR
         _ocr = RapidOCR()
-    result, _ = _ocr(rgb)
+    return _ocr
+
+
+def ocr_lines(rgb) -> list[str]:
+    """Text lines in an RGB numpy array (RapidOCR, offline)."""
+    result, _ = warm_up()(rgb)
     return [line[1] for line in result or []]
 
 

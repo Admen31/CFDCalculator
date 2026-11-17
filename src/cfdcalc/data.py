@@ -131,8 +131,10 @@ class SyntheticData:
                               seed=seed + INTERVALS[interval], base=100 * f, volume="/" not in symbol)
 
 
-def prepare(bars: list[Bar], interval: str, now: datetime, need: int) -> tuple[list[Bar], str | None]:
-    """Keep closed bars only and validate them. Returns (bars, problem); a problem means: do not trade."""
+def prepare(bars: list[Bar], interval: str, now: datetime, need: int,
+            opened: datetime | None = None) -> tuple[list[Bar], str | None]:
+    """Keep closed bars only and validate them. Returns (bars, problem); a problem means: do not trade.
+    `opened` = start of today's exchange session: time while the market was closed does not age the data."""
     step = timedelta(minutes=INTERVALS[interval])
     closed = [b for b in bars if b.t + step <= now]
     if len(closed) < need:
@@ -145,6 +147,6 @@ def prepare(bars: list[Bar], interval: str, now: datetime, need: int) -> tuple[l
         if not all(math.isfinite(x) and x > 0 for x in vals) or b.h < max(b.o, b.c) or b.l > min(b.o, b.c):
             return closed, f"{interval}: neplatná svíčka {b.t:%d.%m. %H:%M} UTC"
     last_close = closed[-1].t + step
-    if now - last_close > step + GRACE:
+    if now - max(last_close, opened or last_close) > step + GRACE:
         return closed, f"{interval}: zastaralá data – poslední uzavřená svíčka {last_close:%d.%m. %H:%M} UTC"
     return closed[-need:], None

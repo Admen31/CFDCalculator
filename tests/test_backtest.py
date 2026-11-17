@@ -58,3 +58,31 @@ def test_journal_roundtrip_and_verify(tmp_path):
     assert rows[0]["how"] in ("SL", "TP", "večerní limit") and rows[0]["result_r"]
     assert journal_read(path)[0]["result_r"] == rows[0]["result_r"]  # persisted
 
+
+
+def test_no_look_ahead_and_split():
+    """Altering bars after time X must not change any decision taken before X; the split is chronological."""
+    from dataclasses import replace
+
+    from cfdcalc.backtest import backtest_bars, compare
+    p = FakeProvider()
+    p.now = T0 + timedelta(days=3)
+    m5, m15, h1 = (p.bars("X", iv, 1500) for iv in ("5min", "15min", "1h"))
+    cut = m5[1100].t
+    shock = lambda bars: [replace(b, o=b.o * 1.3, h=b.h * 1.3, l=b.l * 1.3, c=b.c * 1.3) if b.t >= cut else b  # noqa: E731
+                          for b in bars]
+    inst = BY_SYMBOL["EUR/USD"]
+    for rules in ("v2.0", "v2.1"):
+        a = backtest_bars(inst, m5, m15, h1, 0.01, rules=rules)
+        b = backtest_bars(inst, shock(m5), shock(m15), shock(h1), 0.01, rules=rules)
+        before = [o for o in a.outcomes if o[0] <= cut]
+        assert before and before == [o for o in b.outcomes if o[0] <= cut]
+    res = compare(inst, m5, m15, h1, 0.01)
+    for rules in ("v2.0", "v2.1"):
+        r = res[rules]
+        dev, test = r["parts"]["vývoj"], r["parts"]["test"]
+        assert sum(dev["verdicts"].values()) + sum(test["verdicts"].values()) == sum(r["verdicts"].values())
+        assert all(t.time < r["split_at"] for t in r["report"].closed[:dev["spread"]["trades"]])
+        net, spr = test["net"], test["spread"]
+        if spr["trades"]:
+            assert net["total"] < spr["total"] <= test["gross"]["total"]   # costs only ever reduce results

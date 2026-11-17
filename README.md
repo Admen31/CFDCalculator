@@ -35,14 +35,22 @@ Požadavky: Windows 10/11, Python ≥ 3.12. OCR (RapidOCR) běží offline, nic 
 3. Zadejte **spread z T212** (rozdíl BUY − SELL v cenových jednotkách). Předvyplněná hodnota je jen hrubý odhad.
 4. **START** (kliknutí do kruhu). Analyzuje se vždy jen potvrzený instrument (viz níže).
 
-### Ukazatel 1–100 %
+### Ukazatel 1–100 % a plynulé rozhraní (verze 2.1)
 
-Analýza má 20 skutečných kroků: instrument, 3× stažení a 3× ověření dat (5m, 15m, 1h), kalendář zpráv,
-8 modulů, trend 1h, spread, večerní limit a rozhodnutí. Procento je `hotové kroky / 20`. Když krok selže
-(API chyba, zastaralá data), analýza skončí s **WAIT** a ukazatel zůstane na dosaženém procentu
-s poznámkou „přerušeno“.
+* Analýza má 20 skutečných kroků: instrument, 3× stažení a 3× ověření dat (5m, 15m, 1h), kalendář zpráv,
+  8 modulů, trend 1h, spread, časový limit a rozhodnutí. Procento je `hotové kroky / 20`, kruh se k němu plynule
+  dotáčí.
+* Při čekání na Twelve Data se kolem kruhu točí krátký segment s textem „čekám na Twelve Data…“. Je to jen
+  znamení, že se čeká; nejde o smyšlená procenta.
+* **Kliknutím na kruh běžící analýzu zrušíte.** Analýza má navíc celkový časový limit 75 s a každý síťový dotaz
+  15 s. Výsledek zrušené analýzy se nikdy nezobrazí.
+* Okno má pevnou velikost a při změnách neposkakuje. Barvy START/BUY/SELL/WAIT/NO DATA a dlaždice indikátorů se
+  mění plynulým přechodem. Překresluje se jen to, co se opravdu změnilo.
+* OCR model se načítá na pozadí hned po zobrazení okna. START použije čtení Trading 212, které právě běží,
+  místo aby čekal ve frontě. Čtení, které visí déle než 8 s, START neblokuje.
+* Při zavření okna se pracovní vlákna bezpečně ukončí.
 
-## Automatické rozpoznávání Trading 212 (verze 2.0)
+## Automatické rozpoznávání Trading 212 (od verze 2.0)
 
 Nastavení stačí udělat **jednou**:
 
@@ -98,38 +106,96 @@ s titulkem „Trading 212“. Se skutečným Trading 212 jsem to ověřit nemohl
 
 Pokud něco nesedí, pošlete text ze stavového řádku a snímek okna.
 
-## Pravidla signálu
+## Výsledky analýzy (verze 2.1)
+
+| Výsledek | Význam |
+|---|---|
+| **BUY / SELL** | Indikátory profilu souhlasí s trendem 1h a **všechny** bezpečnostní filtry prošly. Jen tehdy se zobrazí SL a TP. |
+| **WAIT** | Legitimní „neobchodovat“: bez trendu, indikátory si odporují nebo některý filtr blokuje. Důvod je vždy vypsaný. |
+| **NO DATA** | Analýza nemá dost spolehlivých informací: chybějící nebo zastaralá data, výpadek API, nedostupný kalendář zpráv, nedostupný povinný indikátor, neověřené mapování symbolu, zrušená analýza. |
+| **ERROR** | Technická chyba (výjimka v programu nebo v indikátoru). Nikdy nevede k obchodnímu signálu. |
+
+Panel výsledku ukazuje:
+
+* přesný důvod rozhodnutí;
+* počet indikátorů **pro / proti / neutrální / nedostupné / nepoužito**;
+* stav 10 bezpečnostních filtrů (✓ prošel, ✗ blokuje, – nehodnoceno);
+* instrument, profil trhu, čas posledních dat a čas analýzy.
+
+Tlačítko **Detail analýzy** ukáže všechny důvody, každý indikátor s hodnotou a rolí a detail každého filtru.
+Každá dlaždice indikátoru ukazuje svou roli v rozhodnutí: pro, proti, neutrální, nedostupné (chybí data),
+nepoužito (v profilu trhu se nepoužívá) nebo chyba.
+
+## Pravidla signálu (verze 2.1)
+
+**Profily trhů**
+
+| Profil | Hlasující indikátory | Večerní limit (výchozí) | Obchodní hodiny |
+|---|---|---|---|
+| Akcie CFD | EMA 20/50, RSI, MACD, VWAP, Volume | 21:45 | NYSE/NASDAQ 9:30–16:00 New York |
+| Indexy | jako akcie (indexy se zatím neanalyzují, chybí ověřené mapování) | 21:45 | – |
+| Forex | EMA 20/50, RSI, MACD (VWAP a Volume se nepoužívají: zdroj nemá objemy) | 21:00 | 24 h v pracovní dny |
+| Komodity | EMA 20/50, RSI, MACD (bez objemů) | 21:00 | 24 h v pracovní dny |
+
+Večerní limit je v místním čase a v Nastavení ho lze změnit pro každý trh zvlášť. U akcií platí dřívější
+z limitu a uzavření burzy. Mimo obchodní hodiny vrátí aplikace WAIT („trh je zavřený“) a API vůbec nevolá.
+
+**Pravidla**
 
 | Část | Pravidlo |
 |---|---|
-| Data | Používají se jen **uzavřené** svíčky. Poslední uzavřená svíčka smí být stará nejvýš 1 interval + 3 min. Dále se kontroluje počet svíček (250), jejich pořadí a platnost OHLC. Když kterákoli kontrola selže, výsledek je WAIT. |
-| Trend 1h | EMA20 > EMA50 a close > EMA50 znamená rostoucí trend, opačně klesající. Jinak bez trendu a WAIT. |
-| EMA 20/50 | 15m EMA20 vs EMA50 a 5m close vs EMA20. Musí souhlasit s trendem 1h. |
-| RSI(14) 5m | 50–70 je hlas pro BUY, 30–50 hlas pro SELL. Nad 70 blokuje BUY, pod 30 blokuje SELL. |
-| MACD(12,26,9) 5m | Histogram > 0 je hlas pro BUY, < 0 hlas pro SELL. |
-| VWAP 5m | Close vs VWAP dne (UTC). Bez objemů (forex, část komodit) modul nehlasuje. |
-| Volume 5m | Objem ≥ průměr 20 svíček na rostoucí/klesající svíčce je hlas. Bez objemů nehlasuje. |
-| ATR(14) | ATR 15m určuje SL. Když je ATR 5m pod 0,5× nebo nad 2,5× svého průměru, signál se blokuje. |
-| Support/Resistance | Swingy 15m: když je protilehlá úroveň blíž než cíl (2R), směr se blokuje. |
-| Fundamenty | High-impact zprávy měn instrumentu 60 min před až 30 min po vydání blokují signál. **Bez dat kalendáře = WAIT.** |
+| Data | Jen **uzavřené** svíčky. Poslední smí být stará nejvýš 1 interval + 3 min; u akcií se doba, kdy byla burza zavřená, nezapočítává. Kontroluje se také počet svíček (250), pořadí a platnost OHLC. Selhání znamená NO DATA. |
+| Trend 1h | EMA20 > EMA50 a close > EMA50 znamená rostoucí trend, opačně klesající. Jinak WAIT („bez jasného trendu“). |
+| Hlasy | EMA 20/50, RSI (50–70 býčí, 30–50 medvědí), MACD (histogram), VWAP, Volume. Výpočty jsou stejné jako ve v2.0. |
+| Shoda | EMA 20/50 musí jít se směrem trendu. Pro signál je potřeba aspoň **max(2, 60 % použitelných hlasů)** pro a **žádný** proti. Nepoužitý nebo nedostupný indikátor se nikdy nepočítá jako hlas proti. Jsou-li použitelné méně než 3 hlasy, výsledek je NO DATA. |
+| RSI extrém | RSI ≥ 70 blokuje BUY, RSI ≤ 30 blokuje SELL. |
+| Volatilita | ATR 5m pod 0,5× nebo nad 2,5× svého průměru blokuje. |
+| Prostor k cíli | Protilehlá swingová úroveň 15m blíž než cíl (2R) blokuje. |
+| Zprávy | High-impact zpráva měn instrumentu 60 min před až 30 min po vydání blokuje. Bez kalendáře NO DATA. |
 | Spread | Musí být > 0 a ≤ 15 % vzdálenosti SL. |
-| Večerní limit | Do limitu musí zbývat aspoň nastavený počet minut. |
-| Rozhodnutí | Pro BUY/SELL je potřeba aspoň 3 souhlasných hlasů, žádný hlas proti a žádný blokující filtr. |
-| Úrovně | SL = 1,5 × ATR(15m), TP = 2R. Počítá se v `Decimal`, SL se zaokrouhluje **od ceny**, TP k vstupu. |
+| Časový limit | Do konce obchodování musí zbývat aspoň nastavený počet minut (výchozí 60). |
+| Úrovně | SL = 1,5 × ATR(15m), TP = 2R, v `Decimal`. SL se zaokrouhluje **od ceny**, TP k vstupu. |
+
+**Proč verze 2.0 tak často vracela WAIT** (podle kódu; četnosti z reálných dat viz níže):
+
+1. Chybějící nebo zastaralá data, výpadek kalendáře a neověřený symbol vedly na WAIT. Ve 2.1 je to NO DATA,
+   takže je vidět, že nejde o tržní situaci.
+2. Jeden večerní limit 21:00 pro všechny trhy. U amerických akcií (otevírají 15:30 našeho času) při
+   požadovaných 60 min rezervy zbývalo jen 15:30–20:00.
+3. Forex a komodity nemají objemy, takže VWAP a Volume chyběly. Pravidlo „3 souhlasné hlasy“ pak znamenalo
+   jednomyslnost všech tří zbylých indikátorů, zatímco akcie potřebovaly 3 z 5.
+4. U akcií byla data v první hodině po otevření burzy „zastaralá“, protože poslední hodinová svíčka byla
+   z předchozího dne.
+
+Prahy filtrů (RSI, ATR, prostor 2R, spread 15 %, zprávy) zůstaly beze změny. Pravidla v2.0 jsou zmrazená
+v `src/cfdcalc/legacy.py` kvůli porovnání.
 
 Ceny Twelve Data se mohou lišit od cen CFD v Trading 212 (spot vs. futures, přirážka brokera). Proto aplikace
 u SL/TP ukazuje i vzdálenost od vstupu, kterou přenesete k ceně v T212.
 
-## Backtest a demo režim
+## Backtest, porovnání pravidel a demo režim
 
-* **Backtest** – stejná funkce `evaluate()` jako živá analýza, na posledních až 5000 svíčkách 5m (zhruba
-  17 obchodních dní, 3 API dotazy). Pozice je vždy jen jedna. Vstup je za close, spread se odečítá. Když SL i TP
-  padnou do jedné svíčky, počítá se SL. Otevřené obchody se zavírají na večerním limitu. **Backtest nepoužívá
-  historický filtr zpráv** a krátká historie není statistický důkaz.
-* **Demo deník** – každý živý BUY/SELL se zapíše do `%APPDATA%\CFDSignalCalculator\journal.csv`. Tlačítko
-  „Ověřit výsledky podle dat“ dohledá, zda signál dosáhl SL, TP nebo večerního limitu (výsledek v R).
-* **Offline demo** (Nastavení) – syntetická data bez API klíče, jen pro vyzkoušení aplikace. Je jasně označené
-  bannerem a výsledkem „DEMO“ a do deníku se nezapisuje.
+* **Backtest** v aplikaci porovná pravidla **v2.0 a v2.1** na stejných datech Twelve Data. Bere až 5000 svíček
+  5m (zhruba 17 dní) a potřebuje 3 API dotazy. Ukáže:
+  * počty BUY/SELL/WAIT/NO DATA;
+  * počet obchodů, podíl vítězných obchodů, profit factor, průměrný výsledek v R a maximální pokles;
+  * výsledky bez nákladů, se spreadem a se spreadem a modelovanými náklady (dalších 0,5× spread);
+  * nejčastější důvody WAIT.
+
+  Období se dělí **60 % vývoj / 40 % následný test**. Signál v každém okamžiku vidí jen tehdy uzavřené svíčky
+  (bez budoucích informací, ověřeno testem). Pozice je vždy jen jedna. Když SL i TP padnou do jedné svíčky,
+  počítá se SL. Obchody se zavírají na časovém limitu trhu. **Bez historického filtru zpráv.**
+* **Skript** `python scripts/compare_strategies.py` dělá totéž pro 9 instrumentů na veřejných datech Yahoo
+  Finance (5m/15m za 60 dní, 1h za rok). S `--source twelvedata` a klíčem v `TWELVEDATA_API_KEY` použije
+  Twelve Data. Spouští se v CI a výsledek je v artefaktu `strategy-comparison`.
+* **Demo deník:** každý živý BUY/SELL (ne NO DATA ani ERROR) se zapíše do
+  `%APPDATA%\CFDSignalCalculator\journal.csv`. Tlačítko „Ověřit výsledky podle dat“ dohledá, zda signál dosáhl
+  SL, TP nebo časového limitu.
+* **Offline demo** (Nastavení): syntetická data bez API klíče, jen pro vyzkoušení aplikace. Je označené v patičce
+  a výsledkem „DEMO“ a do deníku se nezapisuje.
+
+**Vyšší počet signálů sám o sobě neznamená lepší strategii.** O tom rozhodují výsledky v testovací části po
+nákladech, a i ty jsou na krátkém období jen orientační.
 
 ## Předpoklady a omezení (neověřeno proti živému API)
 

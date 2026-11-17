@@ -19,6 +19,7 @@ from .recognize import match
 from .tracker import Tracker
 
 AUTO, MANUAL = "auto", "manual"
+READ_TIMEOUT_MS = 8000
 CHIPS = 5
 STATUS_COLORS = {auto.OK: "#22c55e", auto.NO_WINDOW: "#ef4444", auto.UNSUPPORTED: "#64748b"}
 
@@ -106,6 +107,11 @@ class InstrumentBar(QWidget):
         self.reading: auto.Reading | None = None
         self._task: ReadTask | None = None
         self._busy = False  # set/cleared in the UI thread only; QThread.isRunning() can lag behind `finished`
+        self._kind, self._gen, self._timed_out = "", 0, False
+        self._joined: list = []                 # START callbacks waiting for the reading already in progress
+        self._pending_then = None
+        self._shown: tuple = ()
+        self._chips_key: tuple | None = None
         self._queued: list[tuple[int, Callable | None]] = []
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -126,7 +132,8 @@ class InstrumentBar(QWidget):
         self.load_btn.clicked.connect(lambda: self.read_once())
         self.area_btn = QPushButton("▭", toolTip="Nastavit oblast s názvem instrumentu v okně Trading 212")
         self.area_btn.clicked.connect(self.pick_region)
-        self.status = QLabel("", objectName="muted", wordWrap=True)
+        self.status = QLabel("", objectName="muted")
+        self.status.setFixedHeight(16)
         self.search = QLineEdit(placeholderText="Hledat instrument (název, ticker)…")
         self._entries = {f"{a} – {describe(i)}" if a not in (i.name, i.symbol) else describe(i): i
                          for i in CATALOG for a in labels(i)}
@@ -147,7 +154,10 @@ class InstrumentBar(QWidget):
             self.buttons.addWidget(b)
         for b in (self.fav, self.load_btn, self.area_btn):
             b.setFixedWidth(34)
-        self.chips = QHBoxLayout()
+        chips_box = QWidget()
+        chips_box.setFixedHeight(26)   # same height with or without favourites: the window never changes size
+        self.chips = QHBoxLayout(chips_box)
+        self.chips.setContentsMargins(0, 0, 0, 0)
         self.chips.setSpacing(4)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -156,7 +166,7 @@ class InstrumentBar(QWidget):
         lay.addLayout(self.buttons)
         lay.addWidget(self.status)
         lay.addWidget(self.search)
-        lay.addLayout(self.chips)
+        lay.addWidget(chips_box)
 
         if self.mode() == MANUAL and self.s.value("symbol", "") in BY_SYMBOL:
             self.tracker.set_manual(BY_SYMBOL[self.s.value("symbol")])
@@ -206,19 +216,63 @@ class InstrumentBar(QWidget):
 
     # ---- readings ----
     def read_once(self, then: Callable[[auto.Reading], None] | None = None):
-        """One immediate reading (a single confident result is enough to confirm)."""
+        """One immediate reading (a single confident result is enough to confirm). If a reading of Trading 212
+        is already running (started at most a moment ago), its result is used instead of queueing another."""
+        if self._busy and self._kind == "read" and not self._timed_out:
+            self._joined.append(then)
+            return
         self._read(stable=1, then=then)
+
+    def warmup(self):
+        """Load the OCR model in the background right after start-up, so the first reading is fast."""
+        if self.backend.SUPPORTED and not self._busy:
+            from .recognize import warm_up
+            self._start(lambda: (warm_up(), auto.Reading(auto.UNREADABLE, ""))[1], "warmup", None, None)
 
     def _read(self, stable: int | None, then=None):
         if self._busy:
             self._queued.append((stable, then))
             return
-        self._busy = True
         region = self.region()
-        self._task = ReadTask(lambda: self.reader(region))
-        self._task.done.connect(lambda r, st=stable, cb=then: self._on_reading(r, st, cb))
+        self._start(lambda: self.reader(region), "read", stable, then)
+
+    def _start(self, fn, kind: str, stable, then):
+        self._busy, self._kind, self._timed_out, self._joined = True, kind, False, []
+        self._pending_then = then
+        self._gen += 1
+        gen = self._gen
+        self._task = ReadTask(fn)
+        self._task.done.connect(lambda r, st=stable, cb=then, g=gen, k=kind: self._on_done(r, st, cb, g, k))
         self._task.finished.connect(self._next)
         self._task.start()
+        QTimer.singleShot(READ_TIMEOUT_MS, lambda g=gen: self._watchdog(g))
+
+    def _watchdog(self, gen: int):
+        """A reading that hangs (e.g. an unresponsive window) must not block START: answer the waiting callers
+        with an "unreadable" result. The worker keeps running; its late result is ignored."""
+        if gen != self._gen or not self._busy or self._kind != "read":
+            return
+        self._timed_out = True
+        late = auto.Reading(auto.UNREADABLE, "Čtení Trading 212 trvá příliš dlouho (okno neodpovídá).")
+        callers, self._joined = self._joined, []
+        self._apply(late, None, [c for c in (self._pending_then, *callers) if c])
+        self._pending_then = None
+
+    def _on_done(self, reading: auto.Reading, stable, then, gen: int, kind: str):
+        if kind == "warmup" or gen != self._gen or self._timed_out:
+            return
+        self._pending_then = None
+        callers, self._joined = self._joined, []
+        self._apply(reading, 1 if callers else stable, [c for c in (then, *callers) if c])
+
+    def _apply(self, reading: auto.Reading, stable, callers):
+        self.reading = reading
+        if self.mode() == AUTO or stable == 1:
+            if self.tracker.feed(reading, stable):
+                self._emit()
+        self._show()
+        for cb in callers:
+            cb(reading)
 
     def _next(self):
         self._busy = False
@@ -226,14 +280,11 @@ class InstrumentBar(QWidget):
             stable, then = self._queued.pop(0)
             self._read(stable, then)
 
-    def _on_reading(self, reading: auto.Reading, stable: int | None, then):
-        self.reading = reading
-        if self.mode() == AUTO or stable == 1:
-            if self.tracker.feed(reading, stable):
-                self._emit()
-        self._show()
-        if then:
-            then(reading)
+    def shutdown(self, ms: int = 4000):
+        """Stop watching and let a running reading finish (bounded), so no thread outlives the window."""
+        self.timer.stop()
+        self._queued.clear()
+        self.wait_idle(ms)
 
     def wait_idle(self, ms: int = 15000):
         """Tests and shutdown: wait for the reading worker while still processing UI events (a window of
@@ -352,6 +403,10 @@ class InstrumentBar(QWidget):
         self._show()
 
     def _chips(self):
+        key = (tuple(self._list("favorites")), tuple(self._list("recent")))
+        if key == self._chips_key:
+            return  # unchanged: no widget churn while AUTO reads every few seconds
+        self._chips_key = key
         while self.chips.count():
             w = self.chips.takeAt(0).widget()
             if w:
@@ -391,9 +446,16 @@ class InstrumentBar(QWidget):
 
     def _show(self):
         inst = self.tracker.confirmed
-        self.name.setText(describe(inst) if inst else "Instrument neurčen")
-        self.fav.setChecked(bool(inst) and inst.symbol in self._list("favorites"))
-        self.fav.setText("★" if self.fav.isChecked() else "☆")
+        fav = bool(inst) and inst.symbol in self._list("favorites")
         text, color = self._status()
-        self.status.setText(f"<span style='color:{color}'>●</span> {text}")
+        state = (describe(inst) if inst else "Instrument neurčen", fav, text, color)
+        if state != self._shown:  # repaint only what changed
+            self._shown = state
+            self.name.setText(state[0])
+            self.fav.setChecked(fav)
+            self.fav.setText("★" if fav else "☆")
+            width = max(self.status.width(), 300) - 16
+            short = self.status.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, width)
+            self.status.setText(f"<span style='color:{color}'>●</span> {short}")
+            self.status.setToolTip(text)
         self._chips()

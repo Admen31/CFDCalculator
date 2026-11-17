@@ -89,24 +89,25 @@ def test_auto_recognises_without_marking_the_screen_again(app, make):
 
 
 def test_start_analyses_the_confirmed_instrument_then_change_makes_it_historical(app, make):
-    reader = Reader("Tesla")
+    reader = Reader("EUR/USD")
     w = make(reader)
     w.start()
     settle(app, w)
-    assert w.analysed.symbol == "TSLA" and w.gauge.pct == 100
-    assert "TSLA" in w.stamp.text() and "Analýza" in w.stamp.text()
-    assert not w.verdict.text().startswith("HISTORICKÝ")
-    reader.set("Apple")
+    assert w.analysed.symbol == "EUR/USD" and w.gauge.target == 100
+    assert "EUR/USD" in w.result.stamp.text() and "analýza" in w.result.stamp.text()
+    assert not w.result.verdict.text().startswith("HISTORICKÝ")
+    reader.set("Gold")
     ticks(app, w)
-    assert w.inst.symbol == "AAPL" and w.verdict.text().startswith("HISTORICKÝ")
-    assert "platí jen pro Tesla" in w.explain.text() and w.gauge.title == "START"
+    assert w.inst.symbol == "XAU/USD" and w.result.verdict.text().startswith("HISTORICKÝ")
+    assert "platil jen pro EUR/USD" in w.result.reason.text() and w.gauge.title == "START"
+    assert all(t.stance.text() == "historické" for t in w.tiles.values())
 
 
 def test_change_during_analysis_gives_historical_result_and_no_journal(app, make, monkeypatch, tmp_path):
     from cfdcalc import ui
     gate = threading.Event()
 
-    def slow(inst, provider, calendar, spread, now, cfg, progress):
+    def slow(inst, provider, calendar, spread, now, cfg, progress, cancelled=None):
         gate.wait(10)
         return Result(verdict=BUY, reasons=["test"], entry=Decimal("100"), sl=Decimal("99"), tp=Decimal("102"),
                       data_time=now, completed=20, total=20)
@@ -122,7 +123,7 @@ def test_change_during_analysis_gives_historical_result_and_no_journal(app, make
     ticks(app, w)                        # Trading 212 now shows Silver while Gold is being analysed
     gate.set()
     settle(app, w)
-    assert w.verdict.text().startswith("HISTORICKÝ") and "Gold" in w.explain.text()
+    assert w.result.verdict.text().startswith("HISTORICKÝ") and "Gold" in w.result.reason.text()
     assert not (tmp_path / "journal.csv").exists()
 
 
@@ -200,7 +201,7 @@ def test_unchanged_instrument_result_is_current_and_journaled(app, make, monkeyp
     w = make(Reader("Gold"), demo=False)
     w.start()
     settle(app, w)
-    assert w.verdict.text() == "BUY" and "XAU/USD" in (tmp_path / "journal.csv").read_text()
+    assert w.result.verdict.text() == "BUY" and "XAU/USD" in (tmp_path / "journal.csv").read_text()
 
 
 def test_reading_requested_while_busy_is_never_lost(app, make):
@@ -213,15 +214,16 @@ def test_reading_requested_while_busy_is_never_lost(app, make):
     for _ in range(3):
         w.bar.read_once(then=lambda r: got.append(r))
     w.bar.wait_idle()
-    assert len(got) == 4 and reader.calls == 5 and not w.bar._busy and not w.bar._queued
+    # all four callers share the reading already in progress: one OCR instead of five, nobody waits in a queue
+    assert len(got) == 4 and reader.calls == 1 and not w.bar._busy and not w.bar._queued
 
 
 def test_unmapped_index_is_recognised_but_never_analysed(app, make, monkeypatch):
-    from cfdcalc import ui
+    from cfdcalc import data
     called = []
-    monkeypatch.setattr(ui, "run_analysis", lambda *a: called.append(a))
+    monkeypatch.setattr(data.urllib.request, "urlopen", lambda *a, **k: called.append(a))
     w = make(Reader("US 500"), demo=False)
     w.start()
     settle(app, w)
-    assert w.inst.symbol == "SPX" and not called and w.verdict.text() == "WAIT"
-    assert "mapování neověřeno" in w.explain.text()
+    assert w.inst.symbol == "SPX" and not called and w.result.verdict.text() == "NO DATA"
+    assert "mapování neověřeno" in w.result.reason.text()

@@ -32,6 +32,35 @@ def mark(what):
     print(f"[{time.monotonic() - T0:7.1f} s] {what}", flush=True)
 
 
+class Latency:
+    """Measures how long the UI thread could not process its event loop (a 16 ms timer that records gaps)."""
+
+    def __init__(self):
+        from PySide6.QtCore import QTimer
+        self.gaps, self.last = [], None
+        self.timer = QTimer()
+        self.timer.setInterval(16)
+        self.timer.timeout.connect(self._tick)
+
+    def _tick(self):
+        now = time.monotonic()
+        if self.last is not None:
+            self.gaps.append((now - self.last) * 1000)
+        self.last = now
+
+    def __enter__(self):
+        self.gaps, self.last = [], None
+        self.timer.start()
+        return self
+
+    def __exit__(self, *a):
+        self.timer.stop()
+
+    @property
+    def worst(self) -> float:
+        return max(self.gaps, default=0.0)
+
+
 def pump(app, ms=600):
     end = time.monotonic() + ms / 1000
     while time.monotonic() < end:
@@ -157,39 +186,51 @@ def test_app_recognises_switches_and_marks_old_signal_historical(app, tmp_path, 
     s.setValue("watch", False)
     s.sync()
     app.setStyleSheet(ui.STYLE)
-    t212 = FakeT212(app, "Tesla", title="Tesla | Trading 212 (e2e)")
+    t212 = FakeT212(app, "EUR/USD", title="EUR/USD | Trading 212 (e2e)")
     w = ui.MainWindow()
     w.move(1000, 80)                       # the calculator stays on top next to / over Trading 212
     w.show()
     pump(app, 600)
     try:
         mark("app shown")
+        with Latency() as warm:            # OCR model loads in a worker thread right after start-up
+            w.bar.warmup()
+            w.bar.wait_idle()
+            pump(app, 200)
+        mark(f"UI stall while loading the OCR model: worst {warm.worst:.0f} ms")
         assert w.bar.save_region(t212.label_rect())   # set the region ONCE
         w.bar.wait_idle()
         pump(app, 300)
-        assert w.inst and w.inst.symbol == "TSLA", w.bar.status.text()
-        mark("region set, TSLA recognised")
+        assert w.inst and w.inst.symbol == "EUR/USD", w.bar.status.text()
+        mark("region set, EUR/USD recognised")
 
         w.start()                          # START: re-reads Trading 212, analyses only the confirmed one
         w.bar.wait_idle()
         pump(app, 300)
         mark("START read done")
-        w.task.wait(20000)
-        pump(app, 400)
-        mark("analysis done")
-        assert w.analysed.symbol == "TSLA" and w.gauge.pct == 100
-        w.grab().save(str(OUT / "3_app_tesla.png"))
+        with Latency() as analysing:
+            while w.running():
+                pump(app, 50)
+            pump(app, 400)
+        mark(f"analysis done; UI stall worst {analysing.worst:.0f} ms")
+        assert analysing.worst < 700, analysing.gaps
+        assert w.analysed.symbol == "EUR/USD" and w.gauge.target == 100
+        pump(app, 600)                     # let the colour transition finish for the screenshot
+        w.grab().save(str(OUT / "3_app_eurusd.png"))
 
         t212.w.move(200, 300)              # move the browser window and switch the instrument
-        t212.set("Apple")
-        for _ in range(2):
-            w.bar.tick()
-            w.bar.wait_idle()
-            pump(app, 200)
-        mark("two AUTO readings done")
-        assert w.inst.symbol == "AAPL", w.bar.status.text()
-        assert w.verdict.text().startswith("HISTORICKÝ")
-        w.grab().save(str(OUT / "4_app_switched_to_apple.png"))
+        t212.set("Gold")
+        with Latency() as reading:         # real Win32 capture + OCR in the worker thread
+            for _ in range(2):
+                w.bar.tick()
+                w.bar.wait_idle()
+                pump(app, 200)
+        mark(f"two AUTO readings done; UI stall worst {reading.worst:.0f} ms")
+        assert reading.worst < 700, reading.gaps
+        assert w.inst.symbol == "XAU/USD", w.bar.status.text()
+        assert w.result.verdict.text().startswith("HISTORICKÝ")
+        pump(app, 600)
+        w.grab().save(str(OUT / "4_app_switched_to_gold.png"))
         print("status:", w.bar.status.text())
     finally:
         w.close()

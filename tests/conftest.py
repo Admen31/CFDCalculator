@@ -5,7 +5,7 @@ import pytest
 
 from cfdcalc.data import synthetic_bars
 
-T0 = datetime(2026, 11, 17, 8, 0, 30, tzinfo=timezone.utc)  # Tuesday, well before the evening cut-off
+T0 = datetime(2026, 11, 17, 15, 0, 30, tzinfo=timezone.utc)  # Tuesday 10:00 New York: US session open
 FRAMES = (("5min", 5), ("15min", 15), ("1h", 60))
 
 

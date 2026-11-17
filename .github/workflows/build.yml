@@ -2,7 +2,7 @@ name: CFD Signal Calculator
 
 on:
   push:
-    branches: [main, "v2.0-auto-recognition"]
+    branches: [main, "v2.0-auto-recognition", "v2.1-signal-and-smooth-ui"]
   pull_request:
   workflow_dispatch:
 
@@ -13,7 +13,7 @@ jobs:
   windows:
     name: Tests + Windows EXE
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,6 +41,11 @@ jobs:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           PYTHONIOENCODING: utf-8
         run: python scripts/verify_symbols.py
+      - name: Strategy comparison v2.0 vs v2.1 on real historical prices (informational, network)
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python scripts/compare_strategies.py --out comparison.md
       - name: Build EXE (PyInstaller, folder build)
         run: pyinstaller --noconfirm --clean --windowed --name "CFD Signal Calculator" --collect-all rapidocr_onnxruntime --paths src src/cfdcalc/__main__.py
       - name: EXE starts and keeps running
@@ -55,6 +60,13 @@ jobs:
           name: cfd-signal-calculator-windows
           path: dist/CFD Signal Calculator
           retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: strategy-comparison
+          path: comparison.md
+          retention-days: 14
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

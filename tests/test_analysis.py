@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from conftest import T0, FakeCalendar, FakeProvider
 
-from cfdcalc.analysis import BUY, SELL, WAIT, Settings, run_analysis
+from cfdcalc.analysis import BUY, NO_DATA, SELL, WAIT, Settings, run_analysis
 from cfdcalc.calendar import Event
 from cfdcalc.data import Bar, prepare, synthetic_bars
 from cfdcalc.instruments import BY_SYMBOL
@@ -25,7 +25,7 @@ def test_buy_with_levels_rounded_away_from_price():
     assert r.sl < r.entry < r.tp
     assert all(isinstance(x, Decimal) and x.as_tuple().exponent == -2 for x in (r.entry, r.sl, r.tp))
     assert float(r.entry) - float(r.sl) >= r.sl_dist - 0.01  # rounding never tightens the stop
-    assert r.data_time == T0.replace(second=0)  # 08:00 = close of the 07:55 bar
+    assert r.data_time == T0.replace(second=0)  # 15:00 = close of the 14:55 bar
     # progress = real finished steps, strictly increasing to 100 %
     done = [c[0] for c in calls]
     assert done == list(range(1, calls[0][1] + 1)) and r.completed == r.total == calls[0][1]
@@ -37,23 +37,24 @@ def test_sell_mirror():
     assert r.tp < r.entry < r.sl
 
 
-def test_stale_data_aborts_with_wait():
+def test_stale_data_is_no_data():
     stale = FakeProvider()  # provider still returns bars ending at T0, the clock is 30 min later
     stale.bars = lambda s, i, n: FakeProvider().bars(s, i, n)
     stale.now = T0 + timedelta(minutes=30)
     r, calls = analyse(stale)
-    assert r.verdict == WAIT and r.aborted and "zastaralá" in r.reasons[0]
+    assert r.verdict == NO_DATA and r.aborted and "zastaralá" in r.reasons[0] and not r.is_signal
     assert r.completed < r.total and not r.modules
 
 
-def test_api_error_aborts():
+def test_api_error_is_no_data():
     r, _ = analyse(FakeProvider(fail="1h"))
-    assert r.verdict == WAIT and r.aborted and "plan" in r.reasons[0]
+    assert r.verdict == NO_DATA and r.aborted and "plan" in r.reasons[0]
 
 
-def test_calendar_down_fails_closed():
+def test_calendar_down_is_no_data_never_a_signal():
     r, _ = analyse(FakeProvider(), calendar=FakeCalendar(fail=True))
-    assert r.verdict == WAIT and r.modules["news"].state == "block"
+    assert r.verdict == NO_DATA and r.modules["news"].state == "na" and r.entry is None
+    assert any("kalendář" in x for x in r.reasons)
 
 
 def test_high_impact_news_blocks():
@@ -67,9 +68,9 @@ def test_high_impact_news_blocks():
 def test_spread_and_evening_limit():
     assert analyse(FakeProvider(), spread=5.0)[0].verdict == WAIT
     assert analyse(FakeProvider(), spread=0)[0].verdict == WAIT
-    late = Settings(cutoff=time(9, 30))  # 09:30 Prague = 08:30 UTC, only 30 min left
+    late = Settings(cutoffs=(("stock", time(16, 30)),))  # 16:30 Prague = 15:30 UTC, only 30 min left
     r, _ = analyse(FakeProvider(), cfg=late)
-    assert r.verdict == WAIT and any("večerního limitu" in x for x in r.reasons)
+    assert r.verdict == WAIT and any("Časový limit" in x for x in r.reasons)
 
 
 def test_prepare_drops_forming_bar_and_rejects_bad_candles():

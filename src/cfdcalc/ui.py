@@ -1,43 +1,52 @@
-"""PySide6 window. The app only shows analysis; it has no code path that sends orders anywhere."""
+"""PySide6 window. The app only shows analysis; it has no code path that sends orders anywhere.
+
+Responsiveness: OCR, network and model loading run in worker threads; the window has a fixed size (no layout
+jumps); widgets repaint only when their content changes; animations interpolate real values only.
+"""
 from __future__ import annotations
 
+import html
 import os
 import sys
+import threading
 from datetime import datetime, time, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QTime, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QFrame,
-                               QGridLayout, QHBoxLayout, QLabel, QLayout, QLineEdit, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QPushButton, QSpinBox, QTimeEdit, QVBoxLayout, QWidget)
+from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QTime, QTimer, Signal
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar,
+                               QPushButton, QSpinBox, QTimeEdit, QVBoxLayout, QWidget)
 
 from . import __version__
-from .analysis import BUY, MODULES, SELL, TITLES, WAIT, Result, Settings, run_analysis
-from .backtest import journal_add, journal_read, journal_verify, run_backtest
+from .analysis import BUY, ERROR, MODULES, NO_DATA, PROFILES, SELL, TITLES, Result, Settings, run_analysis
+from .backtest import HISTORY, comparison_text, compare, journal_add, journal_read, journal_verify
 from .calendar import Calendar
 from .data import DataError, SyntheticData, TwelveData
 from .instruments import BY_SYMBOL, Instrument
-from .ui_instrument import InstrumentBar
+from .ui_instrument import AUTO, InstrumentBar
+from .widgets import ACCENT, VERDICT_COLORS, Gauge, ResultPanel, Tile
 
 APP = "CFD Signal Calculator"
-COLORS = {"bull": "#22c55e", "bear": "#ef4444", "neutral": "#64748b", "block": "#f59e0b", "na": "#334155"}
-VERDICT_COLORS = {BUY: "#22c55e", SELL: "#ef4444", WAIT: "#f59e0b"}
-UNMAPPED = ("{name}: Twelve Data pod symbolem {symbol} neuvádí tento instrument (mapování neověřeno), "
-            "proto se neanalyzuje")
+WIDTH = 380
+ANALYSIS_TIMEOUT_MS = 75_000    # 3 requests x 15 s + calendar 15 s + margin; then the analysis is abandoned
 STYLE = """
 QWidget { background: #11151d; color: #e5e7eb; font-family: 'Segoe UI', sans-serif; font-size: 12px; }
 QPushButton { background: #1e2533; border: 1px solid #2b3446; border-radius: 8px; padding: 6px 10px; }
 QPushButton:hover { background: #273046; }
 QPushButton:disabled { color: #6b7280; }
 QPushButton:checked { background: #1d4ed8; border-color: #3b82f6; font-weight: 600; }
-QLineEdit, QSpinBox, QTimeEdit { background: #1a2030; border: 1px solid #2b3446; border-radius: 6px; padding: 4px; }
-QFrame#tile { background: #1a2030; border-radius: 10px; }
+QLineEdit, QSpinBox, QTimeEdit, QDoubleSpinBox { background: #1a2030; border: 1px solid #2b3446; border-radius: 6px;
+  padding: 4px; }
 QFrame#result { background: #161b27; border-radius: 12px; }
 QLabel#muted { color: #94a3b8; font-size: 11px; background: transparent; }
 QProgressBar { background: #1a2030; border-radius: 6px; text-align: center; }
 QProgressBar::chunk { background: #3b82f6; border-radius: 6px; }
+QTextBrowser { color: #cbd5e1; }
 """
+UNMAPPED = ("{name}: Twelve Data pod symbolem {symbol} neuvádí tento instrument (mapování neověřeno), "
+            "proto se neanalyzuje")
+NEXT_STEP = {"Instrument": "čekám na Twelve Data (5 min)…", "Data 5min ověřena": "čekám na Twelve Data (15 min)…",
+             "Data 15min ověřena": "čekám na Twelve Data (1 h)…", "Data 1h ověřena": "načítám kalendář zpráv…"}
 
 
 def data_dir() -> Path:
@@ -45,7 +54,7 @@ def data_dir() -> Path:
 
 
 class Task(QThread):
-    """Runs fn(progress) off the UI thread; any exception becomes `failed` (the UI then shows WAIT)."""
+    """Runs fn(progress) off the UI thread; any exception becomes `failed` (the UI then shows ERROR)."""
     progress = Signal(int, int, str)
     done = Signal(object)
     failed = Signal(str)
@@ -61,67 +70,14 @@ class Task(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
-class Gauge(QWidget):
-    clicked = Signal()
-
-    def __init__(self):
-        super().__init__()
-        self.setFixedSize(210, 210)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Spustit analýzu")
-        self.pct, self.title, self.sub, self.color = 0, "START", "spustit analýzu", QColor("#3b82f6")
-
-    def show_state(self, pct: int, title: str, sub: str, color: str = "#3b82f6"):
-        self.pct, self.title, self.sub, self.color = pct, title, sub, QColor(color)
-        self.update()
-
-    def mouseReleaseEvent(self, e):
-        if self.isEnabled() and e.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = self.rect().adjusted(14, 14, -14, -14)
-        p.setPen(QPen(QColor("#232a3a"), 14, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.drawEllipse(r)
-        if self.pct:
-            p.setPen(QPen(self.color, 14, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            p.drawArc(r, 90 * 16, -int(self.pct * 360 / 100 * 16))
-        p.setPen(self.color if self.title in VERDICT_COLORS else QColor("#e5e7eb"))
-        p.setFont(QFont("Segoe UI", 30, QFont.Weight.Bold))
-        p.drawText(r.adjusted(0, -20, 0, -20), Qt.AlignmentFlag.AlignCenter, self.title)
-        p.setPen(QColor("#94a3b8"))
-        p.setFont(QFont("Segoe UI", 10))
-        p.drawText(r.adjusted(0, 50, 0, 0), Qt.AlignmentFlag.AlignCenter, self.sub)
-
-
-class Tile(QFrame):
-    def __init__(self, key: str):
-        super().__init__(objectName="tile")
-        self.title, self.value = QLabel(TITLES[key]), QLabel("–")
-        self.title.setStyleSheet("font-weight: 600; background: transparent;")
-        self.value.setStyleSheet("color: #94a3b8; background: transparent; font-size: 11px;")
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 6, 10, 6)
-        lay.setSpacing(1)
-        lay.addWidget(self.title)
-        lay.addWidget(self.value)
-        self.set("na", "–", "")
-
-    def set(self, state: str, value: str, note: str):
-        self.value.setText(value)
-        self.setToolTip(note)
-        self.setStyleSheet(f"QFrame#tile {{ border-left: 4px solid {COLORS[state]}; }}")
-
-
 class SettingsDialog(QDialog):
     def __init__(self, s: QSettings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Nastavení")
         self.s = s
         self.key = QLineEdit(s.value("api_key", ""), echoMode=QLineEdit.EchoMode.Password)
-        self.cutoff = QTimeEdit(QTime.fromString(s.value("cutoff", "21:00"), "HH:mm"))
+        self.cutoffs = {k: QTimeEdit(QTime.fromString(s.value(f"cutoff/{k}", f"{p.cutoff:%H:%M}"), "HH:mm"))
+                        for k, p in PROFILES.items()}
         self.left = QSpinBox(minimum=0, maximum=600, value=int(s.value("min_left", 60)))
         self.demo = QCheckBox("Offline demo (syntetická data, ne trh)")
         self.demo.setChecked(s.value("demo", False, type=bool))
@@ -131,7 +87,8 @@ class SettingsDialog(QDialog):
                                        value=float(s.value("watch_interval", 2.5)))
         form = QFormLayout(self)
         form.addRow("Twelve Data API klíč", self.key)
-        form.addRow("Večerní limit (místní čas)", self.cutoff)
+        for k, edit in self.cutoffs.items():
+            form.addRow(f"Večerní limit – {PROFILES[k].name}", edit)
         form.addRow("Min. minut do limitu", self.left)
         form.addRow(self.demo)
         form.addRow(self.watch)
@@ -146,7 +103,8 @@ class SettingsDialog(QDialog):
 
     def save(self):
         self.s.setValue("api_key", self.key.text().strip())
-        self.s.setValue("cutoff", self.cutoff.time().toString("HH:mm"))
+        for k, edit in self.cutoffs.items():
+            self.s.setValue(f"cutoff/{k}", edit.time().toString("HH:mm"))
         self.s.setValue("min_left", self.left.value())
         self.s.setValue("demo", self.demo.isChecked())
         self.s.setValue("watch", self.watch.isChecked())
@@ -172,8 +130,12 @@ class MainWindow(QWidget):
         super().__init__()
         self.s = QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope, "CFDSignalCalculator", "app")
         self.task: Task | None = None
+        self._retired: list[QThread] = []           # cancelled / timed-out workers, kept until they finish
+        self._gen = 0                                # analysis generation: late results of old runs are ignored
+        self._cancel = threading.Event()
         self.analysed: Instrument | None = None     # instrument of the running / last analysis
         self.shown: Instrument | None = None        # instrument of the result on screen (None = no result)
+        self.started = datetime.now(timezone.utc)
         self.setWindowTitle(APP)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
 
@@ -184,31 +146,16 @@ class MainWindow(QWidget):
         gear.clicked.connect(self.settings)
         self.bar.buttons.addWidget(gear)
 
-        self.banner = QLabel("DEMO – syntetická data, nejde o tržní signál")
-        self.banner.setStyleSheet("background: #7c2d12; color: #fed7aa; border-radius: 6px; padding: 4px;")
-        self.banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.gauge = Gauge()
         self.gauge.clicked.connect(self.start)
         self.step = QLabel("Připraveno", objectName="muted", alignment=Qt.AlignmentFlag.AlignCenter)
-
+        self.step.setFixedHeight(16)
         grid = QGridLayout()
         grid.setSpacing(6)
-        self.tiles = {k: Tile(k) for k in MODULES}
+        self.tiles = {k: Tile(TITLES[k]) for k in MODULES}
         for n, k in enumerate(MODULES):
             grid.addWidget(self.tiles[k], n // 2, n % 2)
-
-        res = QFrame(objectName="result")
-        res.setFixedWidth(332)
-        rl = QVBoxLayout(res)
-        self.verdict = QLabel("–", alignment=Qt.AlignmentFlag.AlignCenter)
-        self.verdict.setStyleSheet("font-size: 26px; font-weight: 800; background: transparent;")
-        self.levels = QLabel("", alignment=Qt.AlignmentFlag.AlignCenter)
-        self.levels.setStyleSheet("background: transparent; font-family: Consolas, monospace;")
-        self.explain = QLabel("Stiskněte START.", wordWrap=True)
-        self.explain.setStyleSheet("background: transparent;")
-        self.stamp = QLabel("", objectName="muted", wordWrap=True)
-        for w in (self.verdict, self.levels, self.explain, self.stamp):
-            rl.addWidget(w)
+        self.result = ResultPanel(WIDTH - 28, 228)
 
         self.spread = QLineEdit()
         self.spread.setToolTip("Aktuální spread z Trading 212 (rozdíl BUY − SELL) v cenových jednotkách")
@@ -219,29 +166,34 @@ class MainWindow(QWidget):
         bt, jr = QPushButton("Backtest"), QPushButton("Demo deník")
         bt.clicked.connect(self.backtest)
         jr.clicked.connect(self.journal)
-        bottom = QHBoxLayout()
-        bottom.addWidget(bt)
-        bottom.addWidget(jr)
+        sp.addWidget(bt)
+        sp.addWidget(jr)
+        self.footer = QLabel("", objectName="muted", alignment=Qt.AlignmentFlag.AlignCenter)
 
         lay = QVBoxLayout(self)
-        lay.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)  # calculator-like: window follows content
-        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setContentsMargins(14, 8, 14, 6)
+        lay.setSpacing(5)
         lay.addWidget(self.bar)
-        lay.addWidget(self.banner)
         lay.addWidget(self.gauge, alignment=Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(self.step)
         lay.addLayout(grid)
-        lay.addWidget(res)
+        lay.addWidget(self.result)
         lay.addLayout(sp)
-        lay.addLayout(bottom)
-        lay.addWidget(QLabel(f"v{__version__} · pouze analýza, žádné zadávání obchodů", objectName="muted",
-                             alignment=Qt.AlignmentFlag.AlignCenter))
+        lay.addWidget(self.footer)
         self.refresh_header()
+        self.setFixedWidth(WIDTH)
+        self.adjustSize()
+        self.setFixedSize(self.size())                 # never resizes afterwards: no visible jumping
+        if self.bar.mode() == AUTO:
+            QTimer.singleShot(300, self.bar.warmup)    # OCR model loads after the window is visible
 
     # ---- settings helpers ----
     def cfg(self) -> Settings:
-        hh, mm = map(int, self.s.value("cutoff", "21:00").split(":"))
-        return Settings(cutoff=time(hh, mm), min_minutes_left=int(self.s.value("min_left", 60)))
+        cutoffs = []
+        for k, prof in PROFILES.items():
+            hh, mm = map(int, str(self.s.value(f"cutoff/{k}", f"{prof.cutoff:%H:%M}")).split(":"))
+            cutoffs.append((k, time(hh, mm)))
+        return Settings(min_minutes_left=int(self.s.value("min_left", 60)), cutoffs=tuple(cutoffs))
 
     def demo(self) -> bool:
         return self.s.value("demo", False, type=bool)
@@ -279,102 +231,147 @@ class MainWindow(QWidget):
             self.refresh_header()
 
     def refresh_header(self):
-        self.spread.setText(f"{self.spread_of(self.inst):g}" if self.inst else "")
-        self.banner.setVisible(self.demo())
+        text = f"{self.spread_of(self.inst):g}" if self.inst else ""
+        if self.spread.text() != text:
+            self.spread.setText(text)
+        demo = " · <span style='color:#fb923c'>DEMO – syntetická data</span>" if self.demo() else ""
+        self.footer.setText(f"v{__version__} · jen analýza, žádné obchody{demo}")
+
+    # ---- instrument changes ----
+    def running(self) -> bool:
+        return bool(self.task and self.task.isRunning())
 
     def on_instrument_changed(self, inst: Instrument | None):
         self.refresh_header()
         if self.shown and inst != self.shown:
             self.mark_historical()
-        if not (self.task and self.task.isRunning()):
-            self.gauge.show_state(0, "START", "spustit analýzu" if inst else "vyberte instrument")
+        if not self.running():
+            self.gauge.show_state(0, "START", "spustit analýzu" if inst else "vyberte instrument", ACCENT)
 
     def mark_historical(self):
         """The instrument changed: the result on screen no longer applies to what Trading 212 shows."""
-        grey = "font-size: 18px; font-weight: 800; background: transparent; color: #64748b;"
-        self.verdict.setText(f"HISTORICKÝ · {self.verdict.text().removeprefix('HISTORICKÝ · ')}")
-        self.verdict.setStyleSheet(grey)
-        self.levels.setStyleSheet("background: transparent; font-family: Consolas, monospace; color: #64748b;")
-        for t in self.tiles.values():  # the indicator colours belonged to the old instrument
-            t.setStyleSheet(f"QFrame#tile {{ border-left: 4px solid {COLORS['na']}; }}")
-        note = f"Instrument se změnil – signál platí jen pro {self.shown.name} ({self.shown.symbol}) a je historický."
-        if not self.explain.text().startswith("Instrument se změnil"):
-            self.explain.setText(note + "\n" + self.explain.text())
+        old = self.shown
+        self.result.mark_historical(f"Instrument se změnil – signál platil jen pro {old.name} ({old.symbol}) "
+                                    f"a je historický.")
+        for t in self.tiles.values():
+            t.set("na", t.value.text(), t.toolTip(), "historické")
 
     # ---- analysis ----
     def start(self):
-        if self.task and self.task.isRunning():
+        if self.running():
+            self.cancel("Analýza zrušena.")
             return
         self.save_spread()
+        if self.bar.mode() == AUTO:
+            self.step.setText("Čtu instrument z Trading 212…")
         self.bar.confirm_for_start(self.begin)
 
     def begin(self, inst: Instrument):
-        if self.task and self.task.isRunning() or inst != self.inst:
+        if self.running() or inst != self.inst:
             return
         try:
             provider = self.provider()
         except DataError as e:
+            self.step.setText("")
             QMessageBox.warning(self, APP, str(e))
             return
         self.refresh_header()
         spread, cfg = self.spread_of(inst), self.cfg()
         calendar = _NoNews() if self.demo() else Calendar(data_dir() / "calendar.json")
-        for t in self.tiles.values():
-            t.set("na", "…", "")
         self.analysed, self.shown = inst, None
         self.bar.remember(inst)
-        if not inst.td_verified:
-            self.started = datetime.now(timezone.utc)
-            self.on_result(Result(reasons=[UNMAPPED.format(name=inst.name, symbol=inst.symbol)], aborted=True))
-            return
-        self.verdict.setText("…")
-        self.levels.setText("")
-        self.explain.setText("")
-        self.gauge.setEnabled(False)
-        self.gauge.show_state(0, "0 %", "analýza")
+        self.result.clear()
+        self._gen += 1
+        gen, self._cancel = self._gen, threading.Event()
+        cancel = self._cancel
+        self.gauge.show_state(0, "0 %", NEXT_STEP["Instrument"], ACCENT, busy=True)
+        self.gauge.setToolTip("Kliknutím analýzu zrušíte")
         now = datetime.now(timezone.utc)
         self.started = now
-        self.task = Task(lambda p: run_analysis(inst, provider, calendar, spread, now, cfg, p))
-        self.task.progress.connect(self.on_progress)
-        self.task.done.connect(self.on_result)
-        self.task.failed.connect(lambda msg: self.on_result(Result(reasons=[f"chyba analýzy: {msg}"], aborted=True)))
+        self.task = Task(lambda p: run_analysis(inst, provider, calendar, spread, now, cfg, p, cancel.is_set))
+        self.task.progress.connect(lambda d, t, label, g=gen: self.on_progress(d, t, label, g))
+        self.task.done.connect(lambda r, g=gen: self.on_result(r, g))
+        self.task.failed.connect(lambda msg, g=gen: self.on_result(
+            Result(verdict=ERROR, reasons=[f"technická chyba analýzy: {msg}"], summary=f"technická chyba: {msg}",
+                   aborted=True), g))
         self.task.start()
+        QTimer.singleShot(ANALYSIS_TIMEOUT_MS, lambda g=gen: self._timeout(g))
 
-    def on_progress(self, done: int, total: int, label: str):
-        pct = round(100 * done / total)
-        self.gauge.show_state(pct, f"{pct} %", "analýza")
+    def _timeout(self, gen: int):
+        if gen == self._gen and self.running():
+            self.cancel("Analýza překročila časový limit (pomalá síť nebo Twelve Data neodpovídá).")
+
+    def cancel(self, why: str):
+        """Abandon the running analysis at once; the worker stops after its current request and is ignored."""
+        self._cancel.set()
+        self._gen += 1
+        if self.task:
+            self._retired.append(self.task)
+            self.task.finished.connect(lambda t=self.task: self._retired.remove(t) if t in self._retired else None)
+        self.task = None
+        self.analysed = None
+        self.gauge.show_state(0, "START", "zrušeno – klikněte znovu", ACCENT)
+        self.result.clear("ZRUŠENO")
+        self.result.reason.setText(why)
+        self.step.setText(why)
+
+    def on_progress(self, done: int, total: int, label: str, gen: int):
+        if gen != self._gen:
+            return
+        pct = 100 * done / total
+        key = next((k for k in NEXT_STEP if label.startswith(k)), None)
+        waiting = NEXT_STEP.get(key) if key else None
+        self.gauge.show_state(pct, f"{round(pct)} %", waiting or "vyhodnocuji…", ACCENT, busy=bool(waiting))
         self.step.setText(f"{done}/{total} · {label}")
 
-    def on_result(self, r: Result):
+    def on_result(self, r: Result, gen: int = -1):
+        if gen not in (-1, self._gen):
+            return  # result of a cancelled or superseded run
         inst = self.analysed
+        if inst is None:
+            return
         self.shown = inst
-        self.gauge.setEnabled(True)
-        pct = round(100 * r.completed / r.total) if r.total else 0
-        self.gauge.show_state(pct, r.verdict, "přerušeno – klikněte znovu" if r.aborted else "hotovo · znovu",
-                              VERDICT_COLORS[r.verdict])
-        self.verdict.setText(("DEMO " if self.demo() else "") + r.verdict)
-        self.verdict.setStyleSheet(f"font-size: 26px; font-weight: 800; background: transparent; "
-                                   f"color: {VERDICT_COLORS[r.verdict]};")
-        self.levels.setStyleSheet("background: transparent; font-family: Consolas, monospace;")
+        self.gauge.setToolTip("Spustit analýzu")
+        pct = 100 * r.completed / r.total if r.total else 0
+        color = VERDICT_COLORS.get(r.verdict, ACCENT)
+        sub = {NO_DATA: "nedostatek dat · znovu", ERROR: "technická chyba · znovu"}.get(
+            r.verdict, "ukončeno · znovu" if r.aborted else "hotovo · znovu")
+        self.gauge.show_state(pct, r.verdict, sub, color)
+        self.step.setText(f"{r.completed}/{r.total} kroků" if r.total else "")
         for k, t in self.tiles.items():
             m = r.modules.get(k)
-            t.set(m.state, m.value, m.note) if m else t.set("na", "–", "nevyhodnoceno")
-        why = "; ".join(r.reasons)
-        self.explain.setText(("Trend 1h: " + r.trend + ". " if r.modules else "") + why[:1].upper() + why[1:] + ".")
-        data = (f"data do {r.data_time:%H:%M} UTC ({r.data_time.astimezone():%H:%M} místního)" if r.data_time
-                else "data nejsou")
-        self.stamp.setText(f"Analýza {self.started.astimezone():%H:%M:%S} · {inst.symbol} · {data}")
-        if r.verdict in (BUY, SELL):
+            t.set(m.state, m.value, m.note, m.stance) if m else t.set("na", "–", "nevyhodnoceno", "")
+        levels = ""
+        if r.is_signal:
             e = float(r.entry)
             dist = lambda x: f"{abs(float(x) - e):g} / {abs(float(x) - e) / e:.2%}"  # noqa: E731
-            self.levels.setText(f"Vstup {r.entry}\nSL {r.sl}  (−{dist(r.sl)})\nTP {r.tp}  (+{dist(r.tp)})")
-            self.explain.setText(self.explain.text() + "\nCeny CFD v T212 se mohou lišit od Twelve Data – "
-                                                       "přeneste vzdálenosti SL/TP. Obchod zadáváte sami.")
+            levels = f"Vstup {r.entry}\nSL {r.sl}  (−{dist(r.sl)})\nTP {r.tp}  (+{dist(r.tp)})"
+        data = (f"data do {r.data_time:%H:%M} UTC ({r.data_time.astimezone():%H:%M} místního)" if r.data_time
+                else "bez dat")
+        stamp = (f"{inst.name} ({inst.symbol}) · {r.profile or PROFILES[inst.kind].name} · {data} · "
+                 f"analýza {self.started.astimezone():%H:%M:%S}")
+        title = ("DEMO " if self.demo() and r.verdict in (BUY, SELL) else "") + r.verdict
+        self.result.levels.setStyleSheet("background: transparent; font-family: Consolas, monospace;")
+        self.result.show_result(r, title, levels, stamp, detail_html(r, inst))
         if inst != self.inst:  # the instrument changed while the analysis was running
             self.mark_historical()
             return
-        if r.verdict in (BUY, SELL) and not self.demo():
+        if r.is_signal and not self.demo():
             journal_add(data_dir() / "journal.csv", inst.symbol, r.verdict, r.data_time, r.entry, r.sl, r.tp)
+
+    # ---- shutdown ----
+    def closeEvent(self, e):
+        """Stop timers, cancel work and let worker threads end (bounded) before the window goes away."""
+        self.hide()
+        self.bar.shutdown()
+        if self.running():
+            self.cancel("Ukončování…")
+        deadline = datetime.now(timezone.utc).timestamp() + 20
+        for t in list(self._retired):
+            while t.isRunning() and datetime.now(timezone.utc).timestamp() < deadline:
+                t.wait(50)
+                QApplication.processEvents()
+        e.accept()
 
     # ---- backtest + demo journal ----
     def backtest(self):
@@ -389,25 +386,30 @@ class MainWindow(QWidget):
         if not inst.td_verified:
             QMessageBox.information(self, APP, UNMAPPED.format(name=inst.name, symbol=inst.symbol))
             return
-        dlg = TextDialog(f"Backtest – {inst.name}", "Spustit", self)
-        dlg.text.setPlainText("Stejná pravidla jako živá analýza na posledních až 5000 svíčkách 5m (3 API dotazy).\n"
-                              "Bez historického filtru zpráv; vstup za close + spread; SL a TP v jedné svíčce = SL.\n"
-                              "Krátká historie není statistický důkaz ziskovosti.")
+        dlg = TextDialog(f"Backtest – {inst.name}: pravidla v2.0 vs. v2.1", "Spustit porovnání", self)
+        dlg.text.setPlainText(
+            "Porovná původní pravidla v2.0 a nová v2.1 na stejných datech (až 5000 svíček 5m, 3 API dotazy).\n"
+            "Období se dělí 60 % vývoj / 40 % následný test; signál vidí jen uzavřené svíčky.\n"
+            "Bez historického filtru zpráv; spread 1× za obchod, modelované náklady navíc 0,5× spread;\n"
+            "SL a TP v jedné svíčce = SL. Krátká historie není statistický důkaz ziskovosti.")
 
         def run():
             dlg.btn.setEnabled(False)
-            dlg._task = Task(lambda p: run_backtest(inst, provider, spread, cfg, lambda a, b: p(a, b)))
+
+            def job(p):
+                bars = [provider.bars(inst.symbol, i, HISTORY) for i in ("5min", "15min", "1h")]
+                return compare(inst, *bars, spread, 0.5, 0.6, cfg, lambda a, b: p(a, b))
+            dlg._task = Task(job)
             dlg._task.progress.connect(lambda a, b, _: (dlg.bar.setMaximum(max(b, 1)), dlg.bar.setValue(a)))
-            dlg._task.done.connect(lambda rep: dlg.text.setPlainText(
-                rep.summary() + "\n\n" + "\n".join(
-                    f"{t.time:%d.%m. %H:%M}  {t.direction:4}  {t.how:14} {'' if t.r is None else f'{t.r:+.2f} R'}"
-                    for t in rep.trades[-200:])))
+            dlg._task.done.connect(lambda res: dlg.text.setPlainText(comparison_text(res)))
             dlg._task.failed.connect(lambda m: dlg.text.setPlainText(f"Backtest selhal: {m}"))
             dlg._task.finished.connect(lambda: dlg.btn.setEnabled(True))
             dlg._task.start()
 
         dlg.btn.clicked.connect(run)
         dlg.exec()
+        if getattr(dlg, "_task", None):
+            dlg._task.wait(30000)
 
     def journal(self):
         path = data_dir() / "journal.csv"
@@ -448,10 +450,32 @@ class _NoNews:
         return []
 
 
+def detail_html(r: Result, inst: Instrument) -> str:
+    """"Detail analýzy": every reason, every indicator with its role and every safety filter (wrapped lines)."""
+    esc = html.escape
+    icons = {"ok": "✓", "fail": "✗", "na": "–"}
+    c = r.counts
+    counts = (f"pro {c['pro']} · proti {c['proti']} · neutrální {c['neutrální']} · nedostupné {c['nedostupné']}"
+              f" · nepoužito {c['nepoužito']}" if c else "–")
+    parts = [f"<p><b>{esc(r.verdict)}</b> – {esc(inst.name)} ({esc(inst.symbol)}), profil "
+             f"{esc(r.profile or PROFILES[inst.kind].name)}, trend 1h: {esc(r.trend)}</p><p><b>Důvody</b><br>"
+             + "<br>".join(f"• {esc(x)}" for x in r.reasons) + "</p>",
+             f"<p><b>Indikátory</b> ({esc(counts)})<br>"
+             + "<br>".join(f"<b>{esc(TITLES[k])}</b> – {esc(m.stance or m.state)} · {esc(m.value)}<br>"
+                           f"&nbsp;&nbsp;{esc(m.note)}" for k, m in r.modules.items()) + "</p>",
+             "<p><b>Bezpečnostní filtry</b><br>"
+             + ("<br>".join(f"{icons.get(st, '?')} <b>{esc(name)}</b>: {esc(detail)}" for name, st, detail in r.filters)
+                or "nehodnoceno") + "</p>"]
+    return "".join(parts)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setStyleSheet(STYLE)
     w = MainWindow()
-    w.show()
-    sys.exit(app.exec())
+    w.show()                       # the window appears at once; OCR model and data load in the background
+    code = app.exec()
+    if any(t.isRunning() for t in w.findChildren(QThread)) or w._retired:
+        os._exit(code)             # a worker still blocked in a network call must not crash interpreter shutdown
+    sys.exit(code)
