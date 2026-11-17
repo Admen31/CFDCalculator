@@ -90,8 +90,9 @@ rámec váží víc:
 
 ### Rychlost
 
-* START → výsledek (napodobené API 300 ms na dotaz, 3 rámce paralelně, Windows CI): **cache miss medián ~322 ms
-  (p95 ~326 ms)**, **cache hit medián ~23 ms (p95 ~52 ms)** (`tests/test_latency.py`, krok v CI).
+* START → výsledek (napodobené API 300 ms na dotaz, 3 rámce paralelně, Windows CI): **cache miss medián 324 ms
+  (p95 327 ms)**, **cache hit medián 29 ms (p95 42 ms)** (`tests/test_latency.py`, krok v CI). Skutečná síť a tarif
+  Twelve Data dobu prodlouží; v režimu AUTO se přičte čtení Trading 212 (OCR, desítky ms).
 * Předchozí výsledek instrumentu se po START zobrazí okamžitě, šedě označený „PŘEDCHOZÍ VÝSLEDEK z HH:MM –
   aktualizuji data…“. Za aktuální se nikdy nevydává.
 * **Průběžné obnovování** výsledku každou minutu (vypnutelné v Nastavení). Díky cache svíček stojí jen jednotky
@@ -105,17 +106,17 @@ Podrobně v `docs/v26-laborator.md` (kapitola 6) a v artefaktu `strategy-lab` ka
 | | BUY | SELL | NEUTRAL | WAIT | NO DATA |
 |---|---|---|---|---|---|
 | **před** (v2.1, hlavní výsledek) | 0,7 % | 1,3 % | – | 91,7 % | 6,3 % |
-| **po** – MARKET DIRECTION | ~37 % | ~45 % | ~17 % | – | 0,3 % |
+| **po** – MARKET DIRECTION | 32,4 % | 39,7 % | 27,6 % | – | 0,3 % |
 | **po** – TRADE CONFIRMATION | 0,7 % | 1,3 % | – | 91,7 % | 6,3 % |
 
-* **Směr nemá prokázanou prediktivní výhodu.** Na nedotčeném testu odpovídal směru ceny za 1 h zhruba v 51 %
-  případů. 95% interval (převzorkováno po dnech) zahrnuje 50 %. Na 5m a 15m horizontu je to kolem 50 %
-  a po odečtení spreadu je průměrný pohyb záporný. MARKET DIRECTION proto **popisuje aktuální stav trhu,
-  nepředpovídá ho**.
+* **Směr nemá prokázanou prediktivní výhodu.** Na nedotčeném testu (práh 0,25) odpovídal směru ceny:
+  5 min 49,7 %, 15 min 50,1 %, 1 h 51,4 % (95% interval po dnech 49,6–53,1 %, tedy včetně 50 %).
+  Průměrný pohyb za 1 h ve směru signálu je +0,066 ATR hrubě, ale −0,052 ATR po jednom spreadu (−0,17 po dvou).
+  MARKET DIRECTION proto **popisuje aktuální stav trhu, nepředpovídá ho**.
 * Předem stanovené pravidlo pro výběr prahu (nejlepší vývojový výsledek) nenašlo práh nad 50 %. Aplikace proto
   drží předem zvolený popisný práh 0,25.
-* Potvrzené vstupy (TRADE CONFIRMATION, plné náklady) se vyhodnocují zvlášť, viz řádek v2.1 v kapitole 2 laboratoře.
-  Výhoda ani tam není prokázaná.
+* Potvrzené vstupy (TRADE CONFIRMATION, včetně nového pravidla „ne proti směru“, plné náklady) mají na
+  nedotčeném testu 103 obchodů, PF 1,03, ⌀ +0,017 R. Interval je −0,23 až +0,29 R, takže výhoda není prokázaná.
 * Varianta pravidla „≤ 1 indikátor proti“ (místo nuly) měla v testu +0,12 R, ale interval −0,12 až +0,35 R a záporné
   výsledky na validaci. Neprošla, pravidlo „0 proti“ zůstává.
 
