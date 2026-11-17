@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.5.0 – široké pokrytí trhů a oprava NO DATA (větev `v2.5-multi-provider-market-coverage`)
+
+* **Audit pokrytí** (`scripts/coverage_audit.py`, samostatný job v CI) ověřuje přes veřejné endpointy Twelve Data
+  (`symbol_search?show_plan=true`) a Coinbase symbol, burzu, měnu, typ a potřebný tarif **každého** zdroje katalogu.
+* **Katalog 37 → 167 instrumentů**: 43 forexových párů, 67 amerických akcií, 14 evropských akcií, 18 ETF,
+  12 kryptoměn, 7 komodit, 6 indexů. Na tarifu Basic: 141 plná analýza, 9 jen směr, 17 vyžaduje vyšší tarif.
+* **Zdroje dat u instrumentu** (`instruments.Source`): přesné, nebo referenční s popisem. Pořadí lze měnit
+  v katalogu. Všechny rámce vždy z jednoho zdroje.
+* **Coinbase Exchange** jako nový poskytovatel (krypto, bez klíče), Twelve Data jako záloha.
+* **Tarif Twelve Data** v Nastavení: symboly mimo tarif se nestahují a hned se ukáže důvod.
+* **Referenční data** dávají jen směr: žádný vstup, SL, TP, Risk ani zápis do deníku. Ve výsledku je jasný štítek.
+* **Limity API**: Retry-After, místní denní limit 800, kredity z hlaviček odpovědí, cache rozlišuje burzy.
+* **NO DATA**: víkend = zavřený trh (WAIT), nové kategorie (zastaralá data, málo svíček, nenamapováno).
+  Týdenní kalendář zpráv platí až 24 h. Bias a WATCH se spočítají i bez kalendáře.
+* **Stránka Dostupnost tržních dat** a **přidání instrumentu z adresáře symbolů** s kontrolou identity a obchodních
+  hodin burzy.
+* **Výzkum**: předem stanovený test pravidla „0 indikátorů proti“ (varianta ≤ 1 proti) se stejnými náklady,
+  walk-forward a holdoutem, Bonferroni ×4.
+
+
 ## 2.4.0 – Risk management: velikost CFD pozice podle rizika účtu (větev `v2.4-risk-position-sizing`)
 
 * **Můj účet** (Risk ▸ → Účet…): hodnota účtu, měna (CZK, EUR, USD, GBP, PLN, CHF), riziko na obchod (výchozí 2 %,

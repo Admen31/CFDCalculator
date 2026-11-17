@@ -52,6 +52,71 @@ Požadavky: Windows 10/11, Python ≥ 3.12. OCR (RapidOCR) běží offline, nic 
   místo aby čekal ve frontě. Čtení, které visí déle než 8 s, START neblokuje.
 * Při zavření okna se pracovní vlákna bezpečně ukončí.
 
+## Verze 2.5: široké pokrytí trhů a oprava NO DATA
+
+Podrobné porovnání poskytovatelů a cen je v [docs/poskytovatele-dat.md](docs/poskytovatele-dat.md).
+
+### Proč bylo tolik NO DATA (audit)
+
+| Příčina | Dopad ve v2.4 | Řešení ve v2.5 |
+|---|---|---|
+| Stříbro, ropa WTI/Brent jsou u Twelve Data až v tarifu **Grow** (ověřeno `show_plan`) | na bezplatném tarifu HTTP 404 → NO DATA | ⚙ **Tarif Twelve Data**: symboly vyššího tarifu se nestahují (žádný zbytečný dotaz). Stříbro, ropa a plyn se analyzují z **referenčních ETF** (SLV, USO, UNG), jen směr. |
+| Indexy (SPX, NDX, DJI, DAX, FTSE) Twelve Data pod těmito symboly nemá | vždy NO DATA | referenční ETF: SPY, QQQ, DIA, IWM, Global X DAX, EWU; jen směr |
+| Malý katalog (37 instrumentů) | ostatní instrumenty z Trading 212 neznámé | **167 instrumentů** s ověřenou identitou a **adresář symbolů** (Trhy → Přidat instrument) |
+| Neoficiální kalendář zpráv omezuje dotazy; po 6 h bez stažení NO DATA u **všech** instrumentů | časté NO DATA bez souvislosti s trhem | týdenní kalendář platí až 24 h, pokud pokrývá dnešek. Bez kalendáře se i tak spočítá bias a WATCH. |
+| Víkend u forexu a komodit | „zastaralá data“ = NO DATA | WAIT „trh je o víkendu zavřený“, bez dotazu |
+| Limit 8 dotazů/min a 800/den | NO DATA „překročen limit“ | krypto z Coinbase (bez kreditů TD), cache, Retry-After, denní počítadlo, zbývající kredity na stránce Trhy |
+
+### Zdroje dat
+
+* Každý instrument má seznam **zdrojů**. Nejdřív se zkouší přesné (stejný podkladový instrument), pak referenční.
+  Všechny tři časové rámce pocházejí vždy z **jednoho** zdroje, řady se nikdy nekombinují.
+* **Twelve Data** zůstává hlavním zdrojem. Burza je u akcií a ETF pevně daná a každá odpověď se kontroluje
+  (symbol, burza, měna).
+* **Coinbase Exchange** (veřejné API, bez klíče, burzovní objem) je hlavní zdroj pro 12 kryptoměn; Twelve Data slouží
+  jako záloha.
+* **Referenční data** jsou označená textem „REFERENČNÍ TRŽNÍ DATA – NEMUSÍ ODPOVÍDAT CENĚ TRADING 212 CFD.“
+  Dávají jen směr: žádný vstup, SL, TP, zápis do deníku ani předvyplnění Risk Managementu. Spread T212 se s cenou ETF
+  nesrovnává.
+
+### Pokrytí (bezplatný tarif Twelve Data Basic)
+
+| Trh | Instrumentů | Plná analýza | Jen směr (referenční) | Vyžaduje vyšší tarif |
+|---|---|---|---|---|
+| Forex | 43 | 43 | – | – |
+| Americké akcie a ADR | 67 | 67 | – | – |
+| Evropské akcie (XETR, Euronext, LSE, SIX) | 14 | – | – | 14 (Grow, SIX Pro) |
+| ETF | 18 | 18 | – | – |
+| Kryptoměny | 12 | 12 | – | – |
+| Komodity | 7 | 1 (zlato) | 3 (stříbro, WTI, plyn) | 3 (Brent, platina, palladium) |
+| Indexy | 6 | – | 6 | – |
+| **Celkem** | **167** | **141** | **9** | **17** |
+
+Ve verzi 2.4 bylo 37 instrumentů a na tarifu Basic šlo analyzovat 28. Devět (24 %) vracelo NO DATA vždy.
+S tarifem **Grow** přibude plná analýza stříbra, ropy, platiny, palladia a evropských akcií z XETR, Euronextu a LSE.
+
+### Stránka DOSTUPNOST TRŽNÍCH DAT (tlačítko Trhy)
+
+Pro každý instrument ukazuje: název, typ trhu, poskytovatele, časové rámce, zpoždění, stav API, poslední ověření,
+přesný/referenční zdroj a zda je možná plná analýza. Umožňuje vyhledávání a filtrování podle kategorie a ukazuje
+spotřebu limitu Twelve Data. Bez nových dotazů na API.
+
+**Přidat instrument…** vyhledá v adresáři symbolů Twelve Data (1 dotaz) a přidá vybraný výpis. Přidat lze jen akcie,
+ADR a ETF z burz se známými obchodními hodinami (US, XETR, Euronext, LSE, SIX, Milán, Madrid, Brusel). Identita
+(symbol, burza, MIC, měna, typ, tarif) se uloží a kontroluje se u každé odpovědi. Spread a specifikace pro Risk se
+nikdy nedoplňují automaticky.
+
+### Přesné příčiny NO DATA
+
+Instrument nerozpoznán · symbol není namapován · poskytovatel symbol nezná · instrument není v tarifu · překročen
+limit (včetně Retry-After a denního limitu) · chybí časový rámec · data jsou zastaralá · trh je zavřený (WAIT) ·
+výpadek serveru · chyba připojení · nedostatek historických svíček. Každá zpráva obsahuje doporučený další krok.
+
+### Risk Management a referenční data
+
+Risk Management převezme vstup a SL jen z potvrzeného signálu na přesných datech. U britských akcií (cena v pencích,
+GBp) se kurz zadává za 1 GBp. Specifikace kontraktu se ani při změně zdroje nikdy nedoplňují.
+
 ## Verze 2.4: Risk management – velikost pozice podle rizika účtu
 
 ![Stránka RISK MANAGEMENT: vypočtená pozice a stav NEDOSTATEK DAT (syntetická testovací data)](docs/v24-risk.png)

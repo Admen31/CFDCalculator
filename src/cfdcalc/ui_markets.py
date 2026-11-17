@@ -14,7 +14,7 @@ from .instruments import (BY_SYMBOL, CATALOG, COINBASE, TWELVE, Instrument, from
                           sources)
 
 PROVIDER_NAMES = {TWELVE: "Twelve Data", COINBASE: "Coinbase Exchange"}
-DELAY = {TWELVE: "dle tarifu – stáří kontroluje každá analýza", COINBASE: "reálný čas (veřejné API)"}
+DELAY = {TWELVE: "dle tarifu (kontrola stáří)", COINBASE: "reálný čas"}
 COLUMNS = ("Název", "Typ trhu", "Poskytovatel", "Časové rámce", "Zpoždění", "Stav API", "Poslední ověření",
            "Přesný / referenční", "Plná analýza")
 CUSTOM_KEY = "custom/instruments"
@@ -187,6 +187,7 @@ class MarketsDialog(QDialog):
                 item.setToolTip(value)
                 self.table.setItem(r, c, item)
         self.table.setSortingEnabled(True)
+        self.table.sortItems(0, Qt.SortOrder.AscendingOrder)
         self.summary.setText(f"{len(items)} instrumentů · plná analýza {full} · jen směr z referenčních dat {ref} · "
                              f"bez dat v tarifu {len(items) - full - ref}. Stav API vychází z posledních analýz "
                              "a ručních ověření (bez nových dotazů).")
