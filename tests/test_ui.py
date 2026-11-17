@@ -34,12 +34,15 @@ def finish(app, w):
 def test_start_runs_real_steps_to_a_verdict(app, window, tmp_path):
     window.start()
     finish(app, window)
-    assert window.gauge.target == 100 and window.gauge.title in ("BUY", "SELL", "WAIT")
-    verdict = window.result.verdict.text()
-    assert verdict in ("DEMO BUY", "DEMO SELL", "WAIT"), verdict
+    # v2.6: the big answer is the MARKET DIRECTION; after the result the ring shows its strength (0-100)
+    title = window.gauge.title
+    assert title in ("BUY", "SELL", "NEUTRAL") and window.result.verdict.text() == title
+    shown = window.last_results["XAU/USD"][0]
+    assert window.gauge.target == int(shown["strength"].split()[1].split("/")[0])
+    assert "OBCHODNÍ VSTUP" in window.result.entry.text() and window.latencies
     stamp = window.result.stamp.text()
     head = window.result.instrument.text()
-    assert "analýza" in stamp and "data do" in stamp and "XAU/USD" in head and "Komodity" in head
+    assert "analýza" in stamp and "data do" in stamp and "DEMO" in stamp and "XAU/USD" in head and "Komodity" in head
     assert all(t.value.text() not in ("…", "") for t in window.tiles.values())
     assert not (tmp_path / "journal.csv").exists()  # synthetic demo signals never enter the journal
 

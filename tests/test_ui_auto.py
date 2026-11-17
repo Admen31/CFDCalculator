@@ -94,7 +94,7 @@ def test_start_analyses_the_confirmed_instrument_then_change_makes_it_historical
     w = make(reader)
     w.start()
     settle(app, w)
-    assert w.analysed.symbol == "EUR/USD" and w.gauge.target == 100
+    assert w.analysed.symbol == "EUR/USD" and w.gauge.title in ("BUY", "SELL", "NEUTRAL", "NO DATA")
     assert "EUR/USD" in w.result.instrument.text() and "analýza" in w.result.stamp.text()
     assert not w.result.verdict.text().startswith("HISTORICKÝ")
     reader.set("Gold")

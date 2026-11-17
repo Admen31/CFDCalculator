@@ -9,6 +9,7 @@ import html
 import os
 import sys
 import threading
+import time as clock
 from datetime import datetime, time, timezone
 from pathlib import Path
 
@@ -33,10 +34,12 @@ from .instruments import BY_SYMBOL, Instrument
 from . import risk
 from .ui_instrument import AUTO, InstrumentBar
 from .ui_risk import RiskPage, manual_fx
-from .widgets import ACCENT, BIAS_COLORS, GREEN, RED, SLATE, VERDICT_COLORS, YELLOW, Gauge, ResultPanel, Tile
+from .widgets import (ACCENT, BIAS_COLORS, DIRECTION_COLORS, GREEN, RED, SLATE, YELLOW, Gauge, ResultPanel,
+                      Tile)
 
 APP = "CFD Signal Calculator"
 WIDTH = 380
+REFRESH_MS = 60_000             # periodic refresh of the shown result (the candle cache keeps it cheap)
 ANALYSIS_TIMEOUT_MS = 75_000    # 3 requests x 15 s + calendar 15 s + margin; then the analysis is abandoned
 STYLE = """
 QWidget { background: #11151d; color: #e5e7eb; font-family: 'Segoe UI', sans-serif; font-size: 12px; }
@@ -99,6 +102,8 @@ class SettingsDialog(QDialog):
         self.watch.setChecked(s.value("watch", True, type=bool))
         self.interval = QDoubleSpinBox(minimum=2.0, maximum=3.0, singleStep=0.5, suffix=" s",
                                        value=float(s.value("watch_interval", 2.5)))
+        self.refresh = QCheckBox("Průběžně obnovovat výsledek (každou minutu, z cache svíček)")
+        self.refresh.setChecked(s.value("auto_refresh", True, type=bool))
         self.motion = QCheckBox("Omezit animace (výchozí podle nastavení Windows)")
         self.motion.setChecked(s.value("reduced_motion", widgets.system_reduced_motion(), type=bool))
         self.rate = QSpinBox(minimum=1, maximum=600, value=int(s.value("td_per_minute", 8)), suffix=" dotazů/min")
@@ -111,6 +116,7 @@ class SettingsDialog(QDialog):
         form.addRow(self.demo)
         form.addRow(self.watch)
         form.addRow("Interval sledování", self.interval)
+        form.addRow(self.refresh)
         form.addRow(self.motion)
         form.addRow("Limit Twelve Data", self.rate)
         self.plan = QComboBox()
@@ -141,6 +147,7 @@ class SettingsDialog(QDialog):
         self.s.setValue("watch", self.watch.isChecked())
         self.s.setValue("watch_interval", self.interval.value())
         self.s.setValue("reduced_motion", self.motion.isChecked())
+        self.s.setValue("auto_refresh", self.refresh.isChecked())
         self.s.setValue("td_per_minute", self.rate.value())
         self.s.setValue("td_plan", self.plan.currentText())
         self.accept()
@@ -185,14 +192,24 @@ class MainWindow(QWidget):
 
         self.gauge = Gauge()
         self.gauge.clicked.connect(self.start)
-        self.step = QLabel("Připraveno", objectName="muted", alignment=Qt.AlignmentFlag.AlignCenter)
+        self.step = QLabel("Připraveno", objectName="muted", alignment=Qt.AlignmentFlag.AlignLeft |
+                           Qt.AlignmentFlag.AlignVCenter)
+        self.go = QPushButton("▶ START")
+        self.go.setToolTip("Spustit / obnovit analýzu (totéž jako klik do kruhu)")
+        self.go.setStyleSheet("padding: 2px 10px; font-weight: 700;")
+        self.go.clicked.connect(self.start)
+        self.latencies: list[float] = []         # START click -> result shown, seconds (this session)
+        self._t_click: float | None = None
+        self.last_results: dict[str, tuple] = {}  # symbol -> (view, shown at, data time): instant previous result
+        self._refresh = QTimer(self, singleShot=True)
+        self._refresh.timeout.connect(self._auto_refresh)
         self.step.setFixedHeight(16)
         grid = QGridLayout()
         grid.setSpacing(6)
         self.tiles = {k: Tile(TITLES[k]) for k in MODULES}
         for n, k in enumerate(MODULES):
             grid.addWidget(self.tiles[k], n // 2, n % 2)
-        self.result = ResultPanel(WIDTH - 28, 290)
+        self.result = ResultPanel(WIDTH - 28, 302)
         self.fx_cache: dict[tuple[str, str], risk.Fx] = {}      # rates fetched from Twelve Data this session
         self._fx_failed: dict[tuple[str, str], datetime] = {}
         self._levels = ""
@@ -222,7 +239,10 @@ class MainWindow(QWidget):
         lay.setSpacing(4)
         lay.addWidget(self.bar)
         lay.addWidget(self.gauge, alignment=Qt.AlignmentFlag.AlignHCenter)
-        lay.addWidget(self.step)
+        steprow = QHBoxLayout()
+        steprow.addWidget(self.step, 1)
+        steprow.addWidget(self.go)
+        lay.addLayout(steprow)
         lay.addLayout(grid)
         lay.addWidget(self.result)
         lay.addLayout(sp)
@@ -338,6 +358,7 @@ class MainWindow(QWidget):
     def mark_historical(self):
         """The instrument changed: the result on screen no longer applies to what Trading 212 shows."""
         old = self.shown
+        self._refresh.stop()
         self.risk_page.load(self.inst, None)     # an old signal is never sized for the new instrument
         self.result.mark_historical(f"Instrument se změnil – signál platil jen pro {old.name} ({old.symbol}) "
                                     f"a je historický.")
@@ -349,6 +370,9 @@ class MainWindow(QWidget):
         if self.running():
             self.cancel("Analýza zrušena.")
             return
+        self._refresh.stop()
+        self._t_click = clock.perf_counter()
+        self.go.setText("■ ZRUŠIT")
         self.save_spread()
         if self.bar.mode() == AUTO:
             self.step.setText("Čtu instrument z Trading 212…")
@@ -369,7 +393,14 @@ class MainWindow(QWidget):
         self.analysed, self.shown = inst, None
         self.bar.remember(inst)
         self._levels = ""
-        self.result.clear()
+        cached = self.last_results.get(inst.symbol)
+        if cached:          # instant answer: the previous result, clearly marked, while fresh data load
+            v, when, data_time = cached
+            self.result.display(v)
+            age = f"data do {data_time.astimezone():%H:%M}" if data_time else "bez dat"
+            self.result.mark_stale(f"PŘEDCHOZÍ VÝSLEDEK z {when.astimezone():%H:%M:%S} ({age}) – aktualizuji data…")
+        else:
+            self.result.clear()
         self._gen += 1
         gen, self._cancel = self._gen, threading.Event()
         cancel = self._cancel
@@ -386,6 +417,11 @@ class MainWindow(QWidget):
         self.task.start()
         QTimer.singleShot(ANALYSIS_TIMEOUT_MS, lambda g=gen: self._timeout(g))
 
+    def _auto_refresh(self):
+        """Periodic refresh of the shown instrument (cache keeps API use low); never while busy or after a change."""
+        if not self.running() and self.shown and self.shown == self.inst and self.isVisible():
+            self.start()
+
     def _timeout(self, gen: int):
         if gen == self._gen and self.running():
             self.cancel("Analýza překročila časový limit (pomalá síť nebo Twelve Data neodpovídá).")
@@ -400,6 +436,8 @@ class MainWindow(QWidget):
         self.task = None
         self.analysed = None
         self.gauge.show_state(0, "START", "zrušeno – klikněte znovu", ACCENT)
+        self.go.setText("▶ START")
+        self._t_click = None
         self.result.clear("ZRUŠENO")
         self.result.reason.setText(why)
         self.step.setText(why)
@@ -421,14 +459,22 @@ class MainWindow(QWidget):
             return
         self.shown = inst
         self.gauge.setToolTip("Spustit analýzu")
+        side = main_side(r)
         pct = 100 * r.completed / r.total if r.total else 0
-        color = VERDICT_COLORS.get(r.verdict, ACCENT)
-        sub = {NO_DATA: "nedostatek dat · znovu", ERROR: "technická chyba · znovu"}.get(
-            r.verdict, "ukončeno · znovu" if r.aborted else "hotovo · znovu")
-        self.gauge.show_state(pct, r.verdict, sub, color)
+        if r.market and side in (BUY, SELL, NEUTRAL):
+            pct, sub = r.market.strength, f"převaha {r.market.strength}/100"
+        else:
+            sub = {NO_DATA: "nedostatek dat", ERROR: "technická chyba"}.get(side, "hotovo")
+        self.gauge.show_state(pct, side, sub, DIRECTION_COLORS.get(side, ACCENT))
+        self.go.setText("⟳ REFRESH")
+        latency = (clock.perf_counter() - self._t_click) if self._t_click else None
+        if latency is not None:
+            self.latencies.append(latency)
+            self._t_click = None
         took = sum(r.timings.values())
         self.step.setText((f"{r.completed}/{r.total} kroků" if r.total else "")
-                          + (f" · {took / 1000:.1f} s" if took else ""))
+                          + (f" · výsledek za {latency:.2f} s" if latency is not None else
+                             f" · {took / 1000:.1f} s" if took else ""))
         for k, t in self.tiles.items():
             m = r.modules.get(k)
             t.set(m.state, m.value, m.note, m.stance) if m else t.set("na", "–", "nevyhodnoceno", "")
@@ -439,14 +485,16 @@ class MainWindow(QWidget):
             rr = abs(float(r.tp) - e) / abs(e - float(r.sl)) if float(r.sl) != e else 0
             levels = (f"Vstup {r.entry}   R:R 1:{rr:.1f}\nSL {r.sl}  (−{dist(r.sl)})\n"
                       f"TP {r.tp}  (+{dist(r.tp)})")
-        data = (f"data do {r.data_time:%H:%M} UTC ({r.data_time.astimezone():%H:%M} místního)" if r.data_time
-                else "bez dat")
-        stamp = f"{data} · analýza {self.started.astimezone():%H:%M:%S}"
-        title = ("DEMO " if self.demo() and r.verdict in (BUY, SELL) else "") + r.verdict
-        v = view(r)
-        self.result.show_result(r, title, levels, stamp, detail_html(r, inst, self.bar.last_ocr_ms),
-                                instrument=f"{inst.name} ({inst.symbol}) · {r.profile or PROFILES[inst.kind].name}",
-                                **v)
+        src = next((s_[0] for s_ in r.sources if s_[3] == "OK"), "")
+        data = (f"AKTUÁLNÍ data do {r.data_time:%H:%M} UTC ({r.data_time.astimezone():%H:%M} místního)"
+                if r.data_time else "bez platných dat")
+        demo = " · DEMO (syntetická data)" if self.demo() else ""
+        stamp = f"{data}{' · ' + src if src else ''}{demo} · analýza {self.started.astimezone():%H:%M:%S}"
+        v = view(r, inst, levels=levels, stamp=stamp, detail=detail_html(r, inst, self.bar.last_ocr_ms))
+        self.result.display(v)
+        self.last_results[inst.symbol] = (v, datetime.now(timezone.utc), r.data_time)
+        if self.s.value("auto_refresh", True, type=bool) and side != ERROR and inst == self.inst:
+            self._refresh.start(REFRESH_MS)
         self._levels = levels
         if inst != self.inst:  # the instrument changed while the analysis was running
             self.mark_historical()
@@ -667,25 +715,42 @@ def detail_html(r: Result, inst: Instrument, ocr_ms: float | None = None) -> str
 
 
 OPP_TEXT = {"watch": "◆ WATCH", "trigger": "◆ SETUP SPLNĚN", "invalid": "✕ ZANIKLO"}
+NEUTRAL = "NEUTRAL"
 
 
-def view(r: Result) -> dict:
-    """What the summary card says besides the verdict: strategy line, "čeká se na", bias and opportunity pills."""
-    out = {"strategy": "", "waiting": "", "bias": None, "opportunity": None}
-    if r.bias:
-        out["bias"] = (r.bias.direction, "Směr trhu (není pokyn k obchodu): "
-                       + (f"{r.bias.strength}, " if r.bias.strength else "") + "; ".join(r.bias.parts)
-                       + f"\n{st.BIAS_NOTE}")
-    o = r.opportunity
-    if r.verdict in (BUY, SELL):
-        validated = r.strategy != st.NAMES["v21"]
-        out["strategy"] = (f"Strategie: {r.strategy} · {r.verdict}"
-                           + (" · ověřená strategie" if validated else " · pravidla v2.1"))
-    elif o:
-        side = {"BUY": "BUY", "SELL": "SELL"}.get(o.direction or "", "?")
-        out["strategy"] = f"Strategie: {o.name} · potenciálně {side}" + ("" if o.validated else " · výzkum")
+def main_side(r: Result) -> str:
+    """The big answer: MARKET DIRECTION (BUY / SELL / NEUTRAL), or NO DATA / ERROR when it cannot be determined."""
+    if r.verdict == ERROR and not r.market:
+        return ERROR
+    if r.market and r.market.side in (BUY, SELL, NEUTRAL, NO_DATA, ERROR):
+        return r.market.side
+    return r.verdict if r.verdict in (BUY, SELL, NO_DATA, ERROR) else NEUTRAL
+
+
+def view(r: Result, inst: Instrument | None = None, *, levels: str = "", stamp: str = "", detail: str = "") -> dict:
+    """Everything the summary card shows, derived from the result only (no invented numbers)."""
+    m, o, side = r.market, r.opportunity, main_side(r)
+    out = {"side": side, "title": side, "levels": levels, "stamp": stamp, "detail": detail, "opportunity": None,
+           "instrument": f"{inst.name} ({inst.symbol}) · {r.profile or PROFILES[inst.kind].name}" if inst else "",
+           "buy_share": m.buy_share if m and side in (BUY, SELL, NEUTRAL) else None}
+    directional = side in (BUY, SELL, NEUTRAL)
+    out["strength"] = f"převaha {m.strength}/100" if m and directional else ""
+    out["trend"] = (f"TREND: {m.trend} · kvalita dat {m.quality:.0%}" + (" · REFERENČNÍ DATA" if r.reference else "")
+                    if m and directional else "")
+    if r.is_signal:
+        out["entry"] = (f"✓ OBCHODNÍ VSTUP: POTVRZEN {r.verdict}", GREEN if r.verdict == BUY else RED,
+                        f"pravidla {r.strategy or st.NAMES['v21']}, všechny bezpečnostní filtry prošly")
+    elif r.reference:
+        out["entry"] = ("OBCHODNÍ VSTUP: NELZE (referenční data)", SLATE, r.reference)
+    elif r.verdict == ERROR:
+        out["entry"] = ("⚠ OBCHODNÍ VSTUP: ERROR", RED, r.summary)
+    elif r.verdict == NO_DATA:
+        out["entry"] = ("○ OBCHODNÍ VSTUP: NO DATA", SLATE, r.summary)
     else:
-        out["strategy"] = "Strategie: žádné aktivní nastavení"
+        out["entry"] = ("■ OBCHODNÍ VSTUP: ČEKÁ NA POTVRZENÍ", YELLOW, r.summary)
+    why = (m.reason if m and directional else r.summary) or ""
+    out["reason"] = f"<b>Důvod:</b> {html.escape(why[:1].upper() + why[1:], quote=False)}"
+    out["reason_tip"] = "\n".join(([m.reason] if m else []) + r.reasons)
     if o:
         rr = f", R:R 1:{o.rr:.1f}" if o.rr else ""
         tip = (f"{o.name}: {o.detail}" + (f" ({o.risk_note})" if o.risk_note else "")
@@ -698,22 +763,31 @@ def view(r: Result) -> dict:
             out["opportunity"] = (OPP_TEXT["trigger"] + (" · BLOK" if o.blocked else " · VÝZKUM"), YELLOW, tip + rr)
         else:
             out["opportunity"] = (OPP_TEXT["invalid"], SLATE, tip)
-    if r.verdict in (BUY, SELL):
-        out["waiting"] = ""
-    elif r.verdict in (NO_DATA, ERROR):
-        out["waiting"] = "Čeká se na: platná a aktuální data" if r.verdict == NO_DATA else \
-            "Technická chyba – analýzu spusťte znovu, detail uvádí příčinu."
+    # why the TRADE CONFIRMATION is not given (never hides the direction)
+    if r.is_signal:
+        waiting = ""
+    elif r.reference:
+        waiting = "Vstup se z referenčních dat nepotvrzuje (cena jiného produktu než CFD)."
+    elif r.verdict == ERROR:
+        waiting = "Technická chyba – analýzu spusťte znovu, detail uvádí příčinu."
+    elif r.verdict == NO_DATA:
+        waiting = "Vstup nelze potvrdit: " + (r.summary if directional else "chybí platná a aktuální data")
     elif o and o.state == "watch":
-        out["waiting"] = "Čeká se na: " + "; ".join(o.missing)
+        waiting = f"Vstup nepotvrzen ({r.summary}). {o.name} (výzkum) čeká na: " + "; ".join(o.missing)
     elif o and o.state == "trigger":
-        out["waiting"] = ("Nastavení splněno, ale " + o.risk_note) if o.blocked else (
-            "Nastavení splněno – výzkumná strategie, NENÍ potvrzený signál (v testu po nákladech ztrátová).")
-    elif o and o.state == "invalid":
-        out["waiting"] = f"Nastavení zaniklo: {o.detail}"
+        waiting = ("Nastavení splněno, ale " + o.risk_note) if o.blocked else (
+            f"{o.name}: nastavení splněno – výzkumná strategie, NENÍ potvrzený signál (v testu po nákladech "
+            f"ztrátová). Vstup nepotvrzen: {r.summary}")
     else:
-        failed = [name for name, status, _ in r.filters if status == "fail"]
-        out["waiting"] = ("Čeká se na: " + ("jasný trend 1h" if "Trend 1h" in failed else
-                                            ", ".join(failed[:3]).lower() if failed else "vhodné nastavení trhu"))
+        waiting = f"Vstup nepotvrzen: {r.summary}"
+    out["waiting"] = waiting
+    out["waiting_tone"] = {ERROR: "#fca5a5", NO_DATA: "#cbd5e1"}.get(r.verdict, "#fde68a")
+    if m and directional:
+        out["reasons"] = "<b>Hlavní důvody:</b><br>" + "<br>".join(f"• {html.escape(f.text)}" for f in m.top)
+    elif m and m.missing:
+        out["reasons"] = "<b>Chybí:</b> " + html.escape("; ".join(m.missing[:3]))
+    else:
+        out["reasons"] = ""
     return out
 
 

@@ -4,7 +4,8 @@ on:
   push:
     branches: [main, "v2.0-auto-recognition", "v2.1-signal-and-smooth-ui", "v2.2-research-backtest",
                "v2.2.1-xagusd-data-fix", "v2.3-smart-signals-color-ui",
-               "v2.4-risk-position-sizing", "v2.5-multi-provider-market-coverage"]
+               "v2.4-risk-position-sizing", "v2.5-multi-provider-market-coverage",
+               "v2.6-instant-market-direction"]
   pull_request:
   workflow_dispatch:
 

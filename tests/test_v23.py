@@ -226,14 +226,12 @@ def test_view_texts():
     pytest.importorskip("PySide6.QtCore")
     from cfdcalc.ui import view
     r = Result(verdict=WAIT, summary="1h graf je bez jasného trendu")
-    r.bias = st.Bias(st.BEARISH, -3, "střední", ["a", "b", "c"])
     r.opportunity = st.Setup("pullback", "SELL", "watch", "x", ["dotek zóny 1.08"])
     v = view(r)
-    assert v["bias"][0] == "BEARISH" and "není pokyn" in v["bias"][1]
-    assert v["opportunity"][0] == "◆ WATCH" and v["waiting"] == "Čeká se na: dotek zóny 1.08"
-    assert "TREND PULLBACK" in v["strategy"] and "výzkum" in v["strategy"]
+    assert v["opportunity"][0] == "◆ WATCH" and "dotek zóny 1.08" in v["waiting"] and "TREND PULLBACK" in v["waiting"]
+    assert "ČEKÁ NA POTVRZENÍ" in v["entry"][0] and v["side"] == "NEUTRAL"
     r.opportunity = _trigger()
     v = view(r)
     assert "VÝZKUM" in v["opportunity"][0] and "NENÍ potvrzený signál" in v["waiting"]
     assert view(Result(verdict=ERROR))["waiting"].startswith("Technická chyba")
-    assert view(Result(verdict=NO_DATA))["waiting"] == "Čeká se na: platná a aktuální data"
+    assert view(Result(verdict=NO_DATA))["waiting"] == "Vstup nelze potvrdit: chybí platná a aktuální data"

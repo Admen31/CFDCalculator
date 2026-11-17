@@ -4,15 +4,14 @@ Animations (QPropertyAnimation / QVariantAnimation) only interpolate what is dra
 """
 from __future__ import annotations
 
-import html
 import sys
 
 from PySide6.QtCore import (Property, QEasingCurve, QPropertyAnimation, QRectF, Qt, QVariantAnimation, Signal)
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QStackedWidget, QTextBrowser,
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QStackedWidget, QTextBrowser,
                                QVBoxLayout, QWidget)
 
-from .analysis import BUY, ERROR, NO_DATA, SELL, WAIT, Result
+from .analysis import BUY, ERROR, NO_DATA, SELL, WAIT
 
 GREEN, RED, YELLOW, SLATE = "#22c55e", "#ef4444", "#facc15", "#64748b"
 ACCENT = "#60a5fa"
@@ -223,17 +222,55 @@ class Tile(QWidget):
         p.fillRect(0, 0, 4, self.height(), self._accent)
 
 
-def _pill(text: str, color: str) -> str:
-    return (f"<span style='color:{color}; font-weight:700'>{text}</span>")
+NEUTRAL = "NEUTRAL"
+DIRECTION_COLORS = {BUY: GREEN, SELL: RED, NEUTRAL: YELLOW, NO_DATA: SLATE, ERROR: RED}
+ICONS[NEUTRAL] = "◆"
+
+
+class RatioBar(QWidget):
+    """BUY vs SELL weight of the arguments, green | red, with the shares written on it (readable without colour)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(18)
+        self.buy: float | None = None
+
+    def set_share(self, buy: float | None):
+        if buy != self.buy:
+            self.buy = buy
+            self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 8, 8)
+        p.setClipPath(path)
+        if self.buy is None:
+            p.fillRect(r, QColor("#232a3a"))
+            text_l, text_r = "BUY –", "– SELL"
+        else:
+            split = r.left() + r.width() * self.buy
+            green, red = QColor(GREEN), QColor(RED)
+            green.setAlpha(190)
+            red.setAlpha(190)
+            p.fillRect(QRectF(r.left(), r.top(), split - r.left(), r.height()), green)
+            p.fillRect(QRectF(split, r.top(), r.right() - split, r.height()), red)
+            text_l, text_r = f"BUY {self.buy:.0%}", f"{1 - self.buy:.0%} SELL"
+        p.setClipping(False)
+        p.setPen(QColor("#f8fafc"))
+        p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        p.drawText(r.adjusted(8, 0, -8, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text_l)
+        p.drawText(r.adjusted(8, 0, -8, 0), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, text_r)
 
 
 class ResultPanel(QFrame):
-    """Fixed-size result card with two pages: summary and "Detail analýzy" (scrollable).
+    """Fixed-size result card: summary, "Detail analýzy" and extra pages (Risk).
 
-    Summary: instrument · MARKET BIAS · opportunity (WATCH) · CONFIRMED SIGNAL (big) · strategy · reason ·
-    what the app waits for (or SL/TP of a valid signal) · safety filters · data time. The card background is
-    tinted softly with the signal colour (green BUY, red SELL, yellow WAIT/WATCH); a technical ERROR gets a dashed
-    border and the word ERROR, so it is never mistaken for a SELL."""
+    Summary (v2.6): instrument · BUY/SELL ratio · MARKET DIRECTION (big) with its strength · trend and data quality ·
+    TRADE CONFIRMATION chip (+ WATCH) · why the entry is (not) confirmed, or SL/TP of a confirmed entry · the three
+    strongest reasons · data state and time. A technical ERROR gets a dashed border and the word ERROR."""
 
     def __init__(self, width: int, height: int):
         super().__init__(objectName="result")
@@ -247,72 +284,60 @@ class ResultPanel(QFrame):
         self.pages.addWidget(detail)
 
         self.instrument = QLabel("", objectName="muted")
-        self.bias = QLabel("", objectName="pill")
-        self.opportunity = QLabel("", objectName="pill")
-        for lab in (self.bias, self.opportunity):
-            lab.setFixedHeight(22)
-        caption = QLabel("POTVRZENÝ SIGNÁL", objectName="caption")
+        self.instrument.setFixedHeight(15)
+        self.ratio = RatioBar()
         self.icon = QLabel("", alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.verdict = QLabel("–", alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.verdict.setFixedHeight(30)
-        self.icon.setFixedHeight(30)
-        self.strategy = QLabel("", objectName="muted")
-        self.strategy.setFixedHeight(15)
+        self.strength = QLabel("", alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        for w in (self.icon, self.verdict, self.strength):
+            w.setFixedHeight(30)
+        self.strength.setStyleSheet("font-size: 13px; font-weight: 700; color: #e5e7eb; background: transparent;")
+        self.trend = QLabel("", objectName="muted")
+        self.trend.setFixedHeight(15)
+        self.entry = QLabel("", objectName="pill")
+        self.entry.setFixedHeight(22)
+        self.opportunity = QLabel("", objectName="pill")
+        self.opportunity.setFixedHeight(22)
         self.reason = QLabel("Stiskněte START.", wordWrap=True, objectName="reason")
-        self.reason.setFixedHeight(30)
+        self.reason.setFixedHeight(29)
         self.reason.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.waiting = QLabel("", wordWrap=True, objectName="waiting")
-        self.waiting.setFixedHeight(30)
         self.waiting.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self.counts = QLabel("", objectName="muted")
-        self.counts.setFixedHeight(14)
-        self.filters = QGridLayout()
-        self.filters.setHorizontalSpacing(6)
-        self.filters.setVerticalSpacing(0)
-        self._filter_labels = []
-        for n in range(12):
-            lab = QLabel("", objectName="muted")
-            lab.setFixedHeight(14)
-            self._filter_labels.append(lab)
-            self.filters.addWidget(lab, n // 3, n % 3)
         self.levels = QLabel("", alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.levels.setFixedHeight(44)
         self._levels_style(False)
+        self.reasons = QLabel("", wordWrap=True, objectName="muted")
+        self.reasons.setFixedHeight(58)
+        self.reasons.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.stamp = QLabel("", objectName="muted", wordWrap=True)
-        self.stamp.setFixedHeight(26)
+        self.stamp.setFixedHeight(28)
         self.detail_btn = QPushButton("Detail ▸")
         self.detail_btn.setStyleSheet("padding: 2px 8px; font-size: 11px;")
         self.detail_btn.clicked.connect(lambda: self.pages.setCurrentIndex(1))
 
         sl = QVBoxLayout(summary)
         sl.setContentsMargins(12, 8, 12, 6)
-        sl.setSpacing(2)
+        sl.setSpacing(3)
         sl.addWidget(self.instrument)
-        pills = QHBoxLayout()
-        pills.setSpacing(6)
-        pills.addWidget(self.bias, 1)
-        pills.addWidget(self.opportunity, 1)
-        sl.addLayout(pills)
-        sl.addWidget(caption)
+        sl.addWidget(self.ratio)
         big = QHBoxLayout()
         big.setSpacing(6)
         big.addWidget(self.icon)
         big.addWidget(self.verdict, 1)
+        big.addWidget(self.strength)
         sl.addLayout(big)
-        sl.addWidget(self.strategy)
+        sl.addWidget(self.trend)
+        chips = QHBoxLayout()
+        chips.setSpacing(6)
+        chips.addWidget(self.entry, 1)
+        chips.addWidget(self.opportunity)
+        sl.addLayout(chips)
         sl.addWidget(self.reason)
-        self.lower = QStackedWidget(objectName="pages")      # "Čeká se na" text, or SL/TP of a valid signal
-        self.lower.setFixedHeight(44)
-        wait_page = QWidget(objectName="page")
-        wl = QVBoxLayout(wait_page)
-        wl.setContentsMargins(0, 0, 0, 0)
-        wl.setSpacing(0)
-        wl.addWidget(self.waiting)
-        wl.addWidget(self.counts)
-        self.lower.addWidget(wait_page)
+        self.lower = QStackedWidget(objectName="pages")      # why not confirmed, or SL/TP of a confirmed entry
+        self.lower.setFixedHeight(42)
+        self.lower.addWidget(self.waiting)
         self.lower.addWidget(self.levels)
         sl.addWidget(self.lower)
-        sl.addLayout(self.filters)
+        sl.addWidget(self.reasons)
         self.bottom = QHBoxLayout()
         self.bottom.addWidget(self.stamp, 1)
         self.bottom.addWidget(self.detail_btn, 0, Qt.AlignmentFlag.AlignBottom)
@@ -332,7 +357,8 @@ class ResultPanel(QFrame):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.pages)
         self._paint_verdict()
-        self.set_pills(None, None)
+        self._chip(self.entry, "OBCHODNÍ VSTUP –", SLATE)
+        self.opportunity.hide()
 
     def add_page(self, page: QWidget, button: str, back: QPushButton) -> QPushButton:
         """Extra page reachable from the summary (v2.4: RISK MANAGEMENT)."""
@@ -357,7 +383,7 @@ class ResultPanel(QFrame):
 
     def _paint_verdict(self):
         color = self._color.name()
-        size = 24 if len(self.verdict.text()) <= 8 else 16
+        size = 26 if len(self.verdict.text()) <= 8 else 16
         self.verdict.setStyleSheet(f"font-size: {size}px; font-weight: 800; background: transparent; color: {color};")
         self.icon.setStyleSheet(f"font-size: 20px; font-weight: 800; background: transparent; color: {color};")
 
@@ -383,90 +409,70 @@ class ResultPanel(QFrame):
         self.levels.setStyleSheet("background: transparent; font-family: Consolas, monospace; font-size: 12px;"
                                   + (" color: #64748b;" if muted else ""))
 
+    @staticmethod
+    def _chip(label: QLabel, text: str, color: str, tip: str = ""):
+        label.setText(text)
+        label.setToolTip(tip)
+        label.setStyleSheet(f"background: {tint(color, 34)}; color: {color}; border: 1px solid {tint(color, 90)};"
+                            " border-radius: 11px; padding: 0 8px; font-weight: 700; font-size: 11px;")
+
     # ---- content ----
-    def set_pills(self, bias: tuple[str, str] | None, opportunity: tuple[str, str, str] | None):
-        """bias = (BULLISH|BEARISH|NEUTRAL, tooltip); opportunity = (text, colour, tooltip)."""
-        if bias:
-            word, tip = bias
-            color = BIAS_COLORS[word]
-            text = f"BIAS  {ICONS[word]} {word}"
-        else:
-            color, text, tip = SLATE, "BIAS  –", "směr trhu nelze určit bez platných dat"
-        self.bias.setText(text)
-        self.bias.setToolTip(tip)
-        self.bias.setStyleSheet(f"background: {tint(color, 34)}; color: {color}; border: 1px solid {tint(color, 90)};"
-                                " border-radius: 11px; padding: 0 8px; font-weight: 700; font-size: 11px;")
-        otext, ocolor, otip = opportunity or ("PŘÍLEŽITOST  –", SLATE, "žádné sledované nastavení")
-        self.opportunity.setText(otext)
-        self.opportunity.setToolTip(otip)
-        self.opportunity.setStyleSheet(f"background: {tint(ocolor, 34)}; color: {ocolor}; border: 1px solid "
-                                       f"{tint(ocolor, 90)}; border-radius: 11px; padding: 0 8px; font-weight: 700;"
-                                       " font-size: 11px;")
-
-    def show_filters(self, filters: list[tuple[str, str, str]]):
-        for n, lab in enumerate(self._filter_labels):
-            if n < len(filters):
-                name, status, detail = filters[n]
-                icon, color = FILTER_ICONS.get(status, FILTER_ICONS["na"])
-                lab.setText(f"<span style='color:{color}'>{icon}</span> {SHORT.get(name, name)}")
-                lab.setToolTip(detail)
-            else:
-                lab.setText("")
-                lab.setToolTip("")
-
-    def show_result(self, r: Result, title: str, levels: str, stamp: str, detail_html: str, *, instrument: str = "",
-                    strategy: str = "", waiting: str = "", bias=None, opportunity=None):
-        self.instrument.setText(instrument)
-        self.verdict.setText(title)
-        self.icon.setText(ICONS.get(r.verdict, ""))
-        self.fade_to(VERDICT_COLORS.get(r.verdict, ACCENT), dashed=r.verdict == ERROR)
-        why = r.summary or (r.reasons[0] if r.reasons else "")
-        self.reason.setText(f"<b>Důvod:</b> {html.escape(why[:1].upper() + why[1:], quote=False)}")
-        self.reason.setToolTip("\n".join(r.reasons))
-        self.strategy.setText(strategy)
-        self.waiting.setText(waiting)
-        tone = {ERROR: "#fca5a5", NO_DATA: "#cbd5e1"}.get(r.verdict, "#fde68a")   # yellow = waiting / watch
-        self.waiting.setStyleSheet(f"color: {tone}; font-size: 11px; background: transparent;")
-        c = r.counts
-        if c:
-            names = (("pro", "proti") if r.direction else ("býčí", "medvědí"))
-            self.counts.setText(f"Indikátory: {names[0]} {c['pro']} · {names[1]} {c['proti']} · neutrální "
-                                f"{c['neutrální']} · nedostupné {c['nedostupné']} · nepoužito {c['nepoužito']}")
-        else:
-            self.counts.setText("")
-        self.set_pills(bias, opportunity)
-        self.show_filters(r.filters)
-        self.levels.setText(levels)
+    def display(self, v: dict):
+        """v: the view built by ui.view() - every text shown here comes from the analysis result."""
+        self.instrument.setText(v["instrument"])
+        self.ratio.set_share(v["buy_share"])
+        self.verdict.setText(v["title"])
+        self.icon.setText(ICONS.get(v["side"], ""))
+        self.strength.setText(v["strength"])
+        self.fade_to(DIRECTION_COLORS.get(v["side"], ACCENT), dashed=v["side"] == ERROR)
+        self.trend.setText(v["trend"])
+        text, color, tip = v["entry"]
+        if v["opportunity"]:                     # room for the WATCH pill: shorter entry text
+            text = text.replace("OBCHODNÍ VSTUP", "VSTUP")
+            self._chip(self.opportunity, *v["opportunity"])
+        self.opportunity.setVisible(bool(v["opportunity"]))
+        self._chip(self.entry, text, color, tip)
+        self.reason.setText(v["reason"])
+        self.reason.setToolTip(v["reason_tip"])
+        self.waiting.setText(v["waiting"])
+        self.waiting.setStyleSheet(f"color: {v['waiting_tone']}; font-size: 11px; background: transparent;")
+        self.levels.setText(v["levels"])
         self._levels_style(False)
-        self.lower.setCurrentIndex(1 if levels else 0)
-        self.stamp.setText(stamp)
-        self.detail.setHtml(detail_html)
-
-    def reason_text(self) -> str:
-        return self.reason.text()
+        self.lower.setCurrentIndex(1 if v["levels"] else 0)
+        self.reasons.setText(v["reasons"])
+        self.stamp.setText(v["stamp"])
+        self.detail.setHtml(v["detail"])
 
     def clear(self, text: str = "…"):
         self.verdict.setText(text)
         self.icon.setText("")
+        self.strength.setText("")
+        self.ratio.set_share(None)
         self.fade_to(ACCENT)
         self._paint_verdict()
+        self.trend.setText("")
         self.reason.setText("")
-        self.strategy.setText("")
         self.waiting.setText("")
-        self.counts.setText("")
-        self.set_pills(None, None)
-        self.show_filters([])
+        self.reasons.setText("")
+        self._chip(self.entry, "OBCHODNÍ VSTUP –", SLATE)
+        self.opportunity.hide()
         self.levels.setText("")
         self.lower.setCurrentIndex(0)
         self.detail.setHtml("")
         self.pages.setCurrentIndex(0)
 
+    def mark_stale(self, note: str):
+        """A previous result shown while new data load: never presented as current."""
+        self.fade_to("#475569")
+        self.stamp.setText(note)
+
     def mark_historical(self, note: str):
         if not self.verdict.text().startswith("HISTORICKÝ"):
             self.verdict.setText(f"HISTORICKÝ · {self.verdict.text()}")
         self.icon.setText("")
+        self.strength.setText("")
         self.fade_to("#475569")
         self._levels_style(True)
         self.reason.setText(note)
-        self.waiting.setText("Signál už neplatí – pro nový instrument spusťte analýzu.")
+        self.waiting.setText("Výsledek už neplatí – pro nový instrument spusťte analýzu.")
         self.lower.setCurrentIndex(0)
