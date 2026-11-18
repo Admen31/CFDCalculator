@@ -54,7 +54,17 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
           CFD_E2E_OUT: e2e-out
-        run: python -m pytest -q -p no:cacheprovider
+        run: python -m pytest -q -p no:cacheprovider --junitxml=junit.xml
+      - name: Failed tests as annotations (readable while the job still runs)
+        if: failure()
+        shell: python
+        run: |
+          import xml.etree.ElementTree as ET
+          for case in ET.parse("junit.xml").iter("testcase"):
+              for bad in list(case.findall("failure")) + list(case.findall("error")):
+                  text = (bad.get("message") or "") + "\n" + (bad.text or "")[-1500:]
+                  text = text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+                  print(f"::error title={case.get('classname')}.{case.get('name')}::{text}")
       - name: v2.8 M15 historical validation on real 15m prices (Yahoo, network, informational)
         continue-on-error: true
         timeout-minutes: 20

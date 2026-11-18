@@ -297,6 +297,7 @@ def test_spec_typed_in_the_portfolio_tab_makes_the_position_available(app, live)
     w.to_portfolio.click()
     app.processEvents()
     f = w.portfolio.spec
+    f.show_instrument(w.inst)                                  # what opening the tab does (showEvent)
     assert f.inst.symbol == "XAU/USD" and f.isEnabled()
     f.edits["contract"].setText("1")
     assert "1 000 × 1" in f.check.text()                       # how to verify the unit against Trading 212
