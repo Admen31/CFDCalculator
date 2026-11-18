@@ -1,0 +1,89 @@
+name: Release Windows ZIP
+
+# Publishes the already tested Windows build (folder build from PyInstaller) as a GitHub Release asset,
+# so the app can be downloaded as one ZIP without logging in. Nothing is rebuilt here.
+on:
+  push:
+    branches: ["release/v2.6.1"]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Successful 'CFD Signal Calculator' run whose Windows artifact is published"
+        default: "44255101547"
+      version:
+        description: "Version (tag v<version>)"
+        default: "2.6.1"
+
+permissions:
+  contents: write   # create the tag and the release
+  actions: read     # download the artifact of the build run
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ inputs.run_id || '44255101547' }}
+      VERSION: ${{ inputs.version || '2.6.1' }}
+    steps:
+      - name: Check the build run
+        run: |
+          set -euo pipefail
+          read -r conclusion sha branch < <(gh api "repos/$REPO/actions/runs/$RUN_ID" \
+            --jq '"\(.conclusion) \(.head_sha) \(.head_branch)"')
+          echo "run $RUN_ID: $conclusion, $branch @ $sha"
+          [ "$conclusion" = "success" ] || { echo "::error::run $RUN_ID is not successful"; exit 1; }
+          echo "SHA=$sha" >> "$GITHUB_ENV"
+
+      - name: Download the Windows artifact
+        run: |
+          set -euo pipefail
+          mkdir -p "pkg/CFD Signal Calculator"
+          gh run download "$RUN_ID" -R "$REPO" -n cfd-signal-calculator-windows -D "pkg/CFD Signal Calculator"
+
+      - name: Verify the Windows EXE
+        run: |
+          set -euo pipefail
+          exe="pkg/CFD Signal Calculator/CFD Signal Calculator.exe"
+          [ -f "$exe" ] || { echo "::error::EXE missing"; ls -la "pkg/CFD Signal Calculator"; exit 1; }
+          file "$exe"
+          file "$exe" | grep -q 'PE32+ executable (GUI) x86-64' || { echo "::error::not a 64-bit Windows GUI EXE"; exit 1; }
+          [ -d "pkg/CFD Signal Calculator/_internal" ] || { echo "::error::_internal folder missing"; exit 1; }
+          echo "files: $(find pkg -type f | wc -l), size: $(du -sh pkg | cut -f1)"
+
+      - name: Create the ZIP
+        run: |
+          set -euo pipefail
+          zip_name="CFD-Signal-Calculator-v${VERSION}-windows.zip"
+          (cd pkg && zip -r -9 -q "../$zip_name" "CFD Signal Calculator")
+          sha256sum "$zip_name" | tee "$zip_name.sha256"
+          unzip -l "$zip_name" | tail -1
+          echo "ZIP=$zip_name" >> "$GITHUB_ENV"
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          cat > notes.md <<EOF
+          Windows aplikace CFD Signal Calculator ${VERSION}, sestavená a otestovaná v běhu
+          https://github.com/${REPO}/actions/runs/${RUN_ID} (commit ${SHA}).
+
+          **Instalace:** stáhněte \`${ZIP}\`, rozbalte (pravé tlačítko → Extrahovat vše) a spusťte
+          \`CFD Signal Calculator\\CFD Signal Calculator.exe\`. Nic dalšího se neinstaluje.
+          Složku \`_internal\` nechte vedle EXE.
+
+          Pokud Windows zobrazí „Systém Windows ochránil váš počítač“, klikněte na **Další informace → Přesto spustit**
+          (aplikace není digitálně podepsaná).
+
+          SHA-256: \`$(cut -d' ' -f1 "$ZIP.sha256")\`
+          EOF
+          if gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
+            gh release upload "$tag" "$ZIP" "$ZIP.sha256" -R "$REPO" --clobber
+            gh release edit "$tag" -R "$REPO" --title "CFD Signal Calculator v${VERSION}" --notes-file notes.md --latest
+          else
+            gh release create "$tag" "$ZIP" "$ZIP.sha256" -R "$REPO" --target "$SHA" \
+              --title "CFD Signal Calculator v${VERSION}" --notes-file notes.md --latest
+          fi
+          echo "Download: https://github.com/${REPO}/releases/download/${tag}/${ZIP}" | tee -a "$GITHUB_STEP_SUMMARY"
