@@ -13,53 +13,51 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-pytest.importorskip("PySide6.QtGui")
 pytest.importorskip("rapidocr_onnxruntime")
-from PySide6.QtCore import QRectF, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QFont, QImage, QPainter  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+PIL = pytest.importorskip("PIL")
+from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
 from cfdcalc.recognize import locate, match, ocr_boxes, ocr_lines  # noqa: E402
 
 OUT = Path(os.environ.get("CFD_E2E_OUT", "e2e-out")) / "ocr-panels"
 WATCHLIST = [("Gold", "4,083.45"), ("NVIDIA", "182.40"), ("Germany 40", "23,950.1"), ("GBP/USD", "1.31842")]
+FONTS = {False: ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"), True: ("segoeuib.ttf", "arialbd.ttf",
+                                                                        "DejaVuSans-Bold.ttf")}
+
+
+def font(size: int, bold: bool):
+    """A real TrueType font (Windows: Segoe UI / Arial). The offscreen Qt platform has no fonts at all, so the
+    screenshots are drawn with Pillow."""
+    for name in FONTS[bold]:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    pytest.skip("no TrueType font available")
 
 
 @pytest.fixture(scope="module")
 def app():
     OUT.mkdir(parents=True, exist_ok=True)
-    return QApplication.instance() or QApplication([])
 
 
 def render(header, subtitle, sell, buy, scale=1.0, watch=WATCHLIST, second_header=None, name="panel"):
     """RGB numpy screenshot (physical pixels at `scale`) of a dark trading screen."""
     w, h = int(980 * scale), int(560 * scale)
-    img = QImage(w, h, QImage.Format.Format_RGB888)
-    img.fill(QColor("#14181f"))
-    p = QPainter(img)
-    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    img = Image.new("RGB", (w, h), "#14181f")
+    d = ImageDraw.Draw(img)
 
-    def text(x, y, s, size, color="#e6e6e6", bold=False, ww=420):
-        f = QFont("Segoe UI")
-        f.setPixelSize(int(size * scale))
-        f.setBold(bold)
-        p.setFont(f)
-        p.setPen(QColor(color))
-        p.drawText(QRectF(x * scale, y * scale, ww * scale, size * 1.6 * scale),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, s)
+    def text(x, y, s, size, color="#e6e6e6", bold=False):
+        d.text((x * scale, y * scale), s, fill=color, font=font(int(size * scale), bold))
 
-    # watchlist (left, small)
     text(16, 20, "Watchlist", 12, "#9aa3b2")
     for i, (n, px) in enumerate(watch):
         text(16, 52 + 34 * i, n, 13)
         text(140, 52 + 34 * i, px, 13, "#9aa3b2")
-    # instrument header (centre, large) + sub-title
     text(260, 24, header, 28, bold=True)
     text(260, 72, subtitle, 13, "#9aa3b2")
     if second_header:
-        text(620, 24, second_header, 28, bold=True, ww=340)
-    # trade panel
+        text(620, 24, second_header, 28, bold=True)
     text(260, 150, "SELL", 14, "#f87171", True)
     text(260, 176, sell, 20, "#f87171", True)
     text(470, 150, "BUY", 14, "#4ade80", True)
@@ -69,12 +67,9 @@ def render(header, subtitle, sell, buy, scale=1.0, watch=WATCHLIST, second_heade
     text(260, 272, "Margin", 13, "#9aa3b2")
     text(470, 272, "€38.41", 13)
     text(260, 304, "Leverage 1:30", 13, "#9aa3b2")
-    text(260, 336, "Take profit   Stop loss   Market order", 13, "#9aa3b2", ww=600)
-    p.end()
-    img.save(str(OUT / f"{name}_{int(scale * 100)}.png"))
-    ptr = img.constBits()
-    arr = np.frombuffer(ptr, np.uint8, img.sizeInBytes()).reshape(h, img.bytesPerLine())[:, :w * 3]
-    return arr.reshape(h, w, 3).copy()
+    text(260, 336, "Take profit   Stop loss   Market order", 13, "#9aa3b2")
+    img.save(OUT / f"{name}_{int(scale * 100)}.png")
+    return np.asarray(img).copy()
 
 
 CASES = [
