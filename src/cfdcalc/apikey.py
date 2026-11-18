@@ -28,19 +28,25 @@ def available() -> bool:
     return sys.platform == "win32"
 
 
-def _blob(data: bytes) -> _Blob:
-    buf = ctypes.create_string_buffer(data, len(data))
-    return _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-
-
 def _call(fn, data: bytes) -> bytes:
-    out, entropy = _Blob(), _blob(_ENTROPY)
-    if not fn(ctypes.byref(_blob(data)), None, ctypes.byref(entropy), None, None, 0x1, ctypes.byref(out)):
-        raise OSError("DPAPI selhalo")
+    """CryptProtectData / CryptUnprotectData. The input buffers are kept referenced for the whole call (a struct
+    pointing to a garbage-collected buffer would hand freed memory to Windows)."""
+    from ctypes import wintypes
+    inbuf = ctypes.create_string_buffer(data, len(data))
+    entbuf = ctypes.create_string_buffer(_ENTROPY, len(_ENTROPY))
+    blob_in = _Blob(len(data), ctypes.cast(inbuf, ctypes.POINTER(ctypes.c_char)))
+    blob_ent = _Blob(len(_ENTROPY), ctypes.cast(entbuf, ctypes.POINTER(ctypes.c_char)))
+    out = _Blob()
+    fn.restype = wintypes.BOOL
+    if not fn(ctypes.byref(blob_in), None, ctypes.byref(blob_ent), None, None, 0x1, ctypes.byref(out)):
+        raise OSError(f"DPAPI selhalo (kód {ctypes.GetLastError()})")
     try:
         return ctypes.string_at(out.pbData, out.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(out.pbData)
+        free = ctypes.windll.kernel32.LocalFree
+        free.argtypes = [ctypes.c_void_p]
+        free.restype = ctypes.c_void_p
+        free(ctypes.cast(out.pbData, ctypes.c_void_p))
 
 
 def protect(text: str) -> str:

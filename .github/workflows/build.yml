@@ -54,12 +54,18 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
           CFD_E2E_OUT: e2e-out
-        run: python -m pytest -q -p no:cacheprovider --junitxml=junit.xml
+        run: python -m pytest -q -p no:cacheprovider --junitxml=junit.xml 2>&1 | Tee-Object -FilePath pytest.log
       - name: Failed tests as annotations (readable while the job still runs)
         if: failure()
         shell: python
         run: |
+          import os
           import xml.etree.ElementTree as ET
+          if not os.path.exists("junit.xml"):
+              tail = open("pytest.log", encoding="utf-8", errors="replace").read()[-3000:] \
+                  if os.path.exists("pytest.log") else "no output"
+              print("::error title=pytest crashed (no junit.xml)::" + tail.replace("%", "%25").replace("\n", "%0A"))
+              raise SystemExit(0)
           for case in ET.parse("junit.xml").iter("testcase"):
               for bad in list(case.findall("failure")) + list(case.findall("error")):
                   text = (bad.get("message") or "") + "\n" + (bad.text or "")[-1500:]
