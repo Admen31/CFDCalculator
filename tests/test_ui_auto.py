@@ -1,6 +1,7 @@
 """v2 UI flows with a simulated Trading 212 reader (offscreen Qt, any OS)."""
 import os
 import threading
+import time
 from decimal import Decimal
 
 import pytest
@@ -72,8 +73,11 @@ def ticks(app, w, n=2):
     for _ in range(n):
         w.bar.tick()
         w.bar.wait_idle()
-        for _ in range(30):
+        end = time.monotonic() + 0.05      # drain queued cross-thread signals even on a busy CI runner
+        while True:
             app.processEvents()
+            if time.monotonic() >= end:
+                break
 
 
 def test_auto_recognises_without_marking_the_screen_again(app, make):
