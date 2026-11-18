@@ -17,6 +17,22 @@ Hotovou aplikaci stáhnete v prohlížeči na stránce **Releases** (ZIP). Rozba
 digitálně podepsaná, takže Windows může zobrazit „Systém Windows ochránil váš počítač“. Pak klikněte na
 **Další informace → Přesto spustit**.
 
+## Verze 2.9: stabilita, OCR více záložek a obchodní plán
+
+* **OCR podle hierarchie**: 1) název v obchodním panelu, 2) identita grafu / nadpis, 3) vizuálně aktivní záložka,
+  4) ostatní záložky jen pomocně. Když je instrument jednoznačný, žádný potvrzovací dialog. Otevřené záložky
+  Silver / NVIDIA / Gold už nezpůsobují nejednoznačnost.
+* **A. SMĚR TRHU je oddělen od B. PLÁNU**. Plán má stav POTVRZENÝ / PODMÍNĚNÝ / NEPLATNÝ. Podmíněný plán se zobrazuje
+  jako „VSTUP: … (podmíněný – stop|limit)“ a není to pokyn. Neplatný plán ukáže pomlčky s důvodem v Podrobnostech.
+* **POZICE v jednotkách množství Trading 212** (2 % riziko, `risk.py`). Ve „Portfolio a riziko“ je formulář
+  specifikace aktuálního instrumentu (1 ks = kolik jednotek podkladu, min., krok, max., marže). Žádné „loty“.
+* **API klíč** je uložen šifrovaně přes Windows DPAPI a přežije aktualizaci (starý nešifrovaný klíč se převede).
+  V Nastavení je tlačítko „Otestovat připojení k Twelve Data“. Klíč se nezapisuje do logů.
+* **Rychlost**: výsledek z mezipaměti ~1 ms; nový požadavek ≈ doba odezvy API.
+* **Historické ověření**: [docs/v29-m15-validace.md](docs/v29-m15-validace.md) – prokázaná výhoda strategie **není**.
+* Testy scénářů A–J běží v CI nad zabaleným EXE (`--selftest`) se simulovanou obrazovkou a daty;
+  proti živému Trading 212 a živému API **neověřeno**.
+
 ## Verze 2.8: M15 trading ready
 
 * **Jen 15minutový graf.** BUY / SELL / NEUTRAL / NO DATA, VSTUP, TP i SL vznikají jen z 15m svíček (EMA 20/50/200,

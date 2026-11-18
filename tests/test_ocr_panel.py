@@ -212,3 +212,37 @@ def test_tabs_without_any_visible_mark_are_not_guessed(app):
     rec = locate(ocr_boxes(render_t212("EUR/USD", mark="none", name="tabs_unmarked")))
     assert not rec.confident and rec.best is None
     assert {i.symbol for i in rec.competing} >= {"EUR/USD", "XAU/USD"}       # offered for the manual choice
+
+
+def test_loose_and_shifted_ocr_boxes_never_pick_a_wrong_instrument(app, monkeypatch):
+    """Robustness without the OCR engine: the exact text boxes of the rendered screen are randomly enlarged and
+    shifted (as RapidOCR boxes are) before measuring them. A wrong instrument is never chosen; the marked tab or
+    the chart header is always found; an unmarked row of tabs stays undecided."""
+    import random
+
+    from cfdcalc.recognize import make_box
+    drawn = []
+    orig = ImageDraw.ImageDraw.text
+
+    def spy(self, xy, t, fill=None, font=None, **kw):
+        drawn.append((t, self.textbbox(xy, t, font=font)))
+        return orig(self, xy, t, fill=fill, font=font, **kw)
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
+    cases = (("EUR/USD", "background", None, "EUR/USD"), ("EUR/USD", "text", None, "EUR/USD"),
+             ("Gold", "background", None, "XAU/USD"), ("EUR/USD", "none", "EUR/USD", "EUR/USD"),
+             ("EUR/USD", "none", None, None))
+    for seed in range(12):
+        rnd = random.Random(seed)
+        for scale in (1.0, 1.25, 1.5, 2.0):
+            for active, mark, header, want in cases:
+                drawn.clear()
+                rgb = render_t212(active, scale=scale, mark=mark, header=header, name="stress")
+                lum = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
+                boxes = []
+                for t, (x0, y0, x1, y1) in drawn:
+                    px, py = rnd.randint(1, int(8 * scale)), rnd.randint(1, int(7 * scale))
+                    ox, oy = rnd.randint(-2, 2), rnd.randint(-2, 2)
+                    boxes.append(make_box(lum, t, x0 - px + ox, y0 - py + oy, x1 + px + ox, y1 + py + oy))
+                rec = locate(boxes)
+                got = rec.best.symbol if rec.best else None
+                assert got == want, (seed, scale, active, mark, header, got, rec.via)

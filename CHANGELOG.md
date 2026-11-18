@@ -1,5 +1,39 @@
 # Changelog
 
+## 2.9.0 – stabilita a obchodní plán (větev `v2.9-stability-and-trade-plan`)
+
+**Příčiny závad v2.8 (v kódu) a opravy**
+1. *EUR/USD nerozpoznán, i když je vidět* a 2. *nejednoznačnost kvůli záložkám*: `recognize.match()` bralo každý
+   nalezený název jako rovnocenného kandidáta. `locate()` vybíralo jen podle velikosti písma, a otevřené záložky
+   Silver / NVIDIA / Gold / EUR/USD mají písmo stejné. Při START (`ui_instrument._start_after`) se pak vždy
+   otevřel dialog. **Oprava** je hierarchie aktivního instrumentu: 1) název u tlačítek SELL/BUY, 2) samostatný
+   název grafu, výrazně větší než záložky, 3) vizuálně odlišená aktivní záložka (jiné pozadí nebo jas textu),
+   4) ostatní záložky a watchlist jen jako nabídka pro ruční výběr. Výška písma, poloha a vzhled se měří na
+   inkoustu textu, ne na volném OCR boxu. Totéž platí uvnitř vybrané oblasti ▭.
+3. *SELL a čtyři pomlčky*: `m15._confirm()` ukázalo ceny jen při splnění všech 10 podmínek. Nedostupný
+   ekonomický kalendář (`events=None`) podmínku vždy shodil. **Oprava**: dvě vrstvy, A. SMĚR TRHU a
+   B. OBCHODNÍ PLÁN se stavem **POTVRZENÝ** (vstup nyní), **PODMÍNĚNÝ** (stop pokyn po průrazu M15 rozsahu,
+   limit při návratu k EMA 20, až po zprávě, bez zadaného spreadu) nebo **NEPLATNÝ** (s důvodem). Nedostupný
+   kalendář plán neskryje, jen se vypíše varování.
+4. *Pozice prakticky nedostupná*: POZICE se počítala jen u plně potvrzeného vstupu a specifikace byla schovaná
+   v dialogu. **Oprava**: POZICE i pro podmíněný plán. Specifikace CFD aktuálního instrumentu se zadává přímo
+   v záložce Portfolio a riziko, včetně návodu, jak jednotku množství Trading 212 ověřit. Množství se zobrazuje
+   jako „(množství T212)“, nikdy jako loty bez ověření.
+5. *API klíč*: nastavení je od v1 v `%APPDATA%\CFDSignalCalculator\app.ini` (nezávisí na složce s EXE). Kód,
+   který by klíč mazal, nalezen nebyl. Klíč ale byl uložen nešifrovaně a aplikace neukazovala, kde ho hledá.
+   **Oprava**: šifrování Windows DPAPI (jen pro daného uživatele), automatická migrace starého klíče, v Nastavení
+   je vidět, kde klíč je, a je tam tlačítko „Otestovat připojení“ (jeden dotaz `api_usage`).
+6. *Instrumenty bez dat*: omezení tarifu Twelve Data a indexy jen s referenčními ETF. Zdarma to opravit nejde,
+   viz `docs/v28-audit-dat.md`.
+
+**Obchodní plán (M15)**: SL za posledním M15 swingem + 0,2× ATR + spread, v rozmezí 1–3× ATR14. TP = 2R.
+Ceny zaokrouhlené na tick (SL od ceny, TP k ceně) a pořadí kontrolované testy. Referenční data plán nikdy nemají.
+
+**Ověření zabalené aplikace**: `CFD Signal Calculator.exe --selftest <složka>` spustí v CI na skutečné ploše
+Windows GUI s přibaleným OCR proti nakreslenému oknu „Trading 212“ se záložkami a projde scénáře A–H a J.
+`--selftest-verify` v novém procesu ověří, že se nastavení a klíč zachovaly (scénář I). Report a screenshoty jsou
+přiložené k vydání.
+
 ## 2.8.0 – M15 trading ready (větev `v2.8-m15-trading-ready`)
 
 **OCR rozpoznání Trading 212 (regrese a opravy)**
