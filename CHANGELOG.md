@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.6.1 – opakovaný START a minimalistická hlavní obrazovka (větev `v2.6.1-repeatable-start-minimal-ui`)
+
+* **Příčina „druhý START nefunguje“**: druhé a další kliknutí analýzu spustilo, ale mezipaměť svíček vrátila stejná
+  data (do konce 5min periody žádný nový dotaz), výsledek se přepočítal za ~30 ms beze změny a VSTUP byla cena
+  poslední *uzavřené* svíčky. Uživatel tedy neviděl žádnou změnu ani průběh.
+* **Oprava**: každá analýza si vynutí nová 5m data (1 dotaz; 15m/1h z mezipaměti jen podle pravidel aktuálnosti).
+  VSTUP je poslední dostupná cena (aktuální 5m svíčka) a TP/SL se pokaždé přepočítají. Tlačítko během výpočtu
+  ukazuje „ANALYZUJI…“. Kliknutí během běžící analýzy se ignoruje (žádný duplicitní výpočet). Po chybě, NO DATA
+  i timeoutu jde analýzu jedním kliknutím zopakovat.
+* **Hlavní obrazovka**: jen velké tlačítko START → BUY (zelené) / SELL (červené) / NEUTRAL / NO DATA / ERROR
+  a pod ním VSTUP, TP, SL. Výběr instrumentu zůstává nahoře. Vše ostatní (kruh průběhu, indikátory, vysvětlení,
+  Risk, Detail, spread, Backtest, Deník, Trhy) je beze změny na stránce **Podrobnosti ▸**.
+* **VSTUP / TP / SL** (`analysis.trade_levels`): SL = vstup ∓ 1,5 × ATR(15m), TP = 2R. Zaokrouhlení na tick
+  (SL od ceny, TP k ceně), kontrola minimální vzdálenosti (≥ 3 ticky), spreadu (≤ 15 % vzdálenosti SL), platnosti
+  a stran. Co nejde spočítat bezpečně, ukáže „–“. U referenčních dat se ceny nezobrazují.
+* Průběžné obnovování je nově ve výchozím stavu vypnuté (šetří limit Twelve Data); lze ho zapnout v Nastavení.
+* Testy: START → BUY → SELL → BUY, chyba API → opakování, změna instrumentu bez starých cen, opakované kliknutí
+  během výpočtu, timeout → opakování, obsah hlavní obrazovky.
+
+
 ## 2.6.0 – okamžitý směr trhu (větev `v2.6-instant-market-direction`)
 
 * **MARKET DIRECTION** (`direction.py`): transparentní vážené hlasování (EMA, sklon, cena vs EMA na 5m/15m/1h, RSI,

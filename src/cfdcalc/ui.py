@@ -16,7 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QTime, QTimer, Signal
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QPushButton, QSpinBox, QTimeEdit, QVBoxLayout, QWidget)
+                               QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTimeEdit, QVBoxLayout, QWidget)
 
 from . import __version__, widgets
 from . import strategies as st
@@ -35,7 +35,7 @@ from . import risk
 from .ui_instrument import AUTO, InstrumentBar
 from .ui_risk import RiskPage, manual_fx
 from .widgets import (ACCENT, BIAS_COLORS, DIRECTION_COLORS, GREEN, RED, SLATE, YELLOW, Gauge, ResultPanel,
-                      Tile)
+                      Tile, tint)
 
 APP = "CFD Signal Calculator"
 WIDTH = 380
@@ -54,6 +54,10 @@ QWidget#page, QStackedWidget#pages { background: transparent; }
 QLabel#muted { color: #94a3b8; font-size: 11px; background: transparent; }
 QLabel#caption { color: #64748b; font-size: 9px; font-weight: 700; letter-spacing: 1px; background: transparent; }
 QLabel#reason { color: #e5e7eb; font-size: 11px; background: transparent; }
+QPushButton#big { font-size: 46px; font-weight: 800; border-radius: 22px; }
+QLabel#level { font-size: 22px; font-weight: 700; font-family: Consolas, 'Segoe UI', monospace; background: transparent;
+  color: #e5e7eb; padding-left: 8px; }
+QPushButton#nav { padding: 2px 10px; font-size: 11px; }
 QLabel#value { color: #e5e7eb; font-size: 10px; font-weight: 600; background: transparent; }
 QLabel#waiting { color: #fde68a; font-size: 11px; background: transparent; }
 QProgressBar { background: #1a2030; border-radius: 6px; text-align: center; }
@@ -103,7 +107,7 @@ class SettingsDialog(QDialog):
         self.interval = QDoubleSpinBox(minimum=2.0, maximum=3.0, singleStep=0.5, suffix=" s",
                                        value=float(s.value("watch_interval", 2.5)))
         self.refresh = QCheckBox("Průběžně obnovovat výsledek (každou minutu, z cache svíček)")
-        self.refresh.setChecked(s.value("auto_refresh", True, type=bool))
+        self.refresh.setChecked(s.value("auto_refresh", False, type=bool))
         self.motion = QCheckBox("Omezit animace (výchozí podle nastavení Windows)")
         self.motion.setChecked(s.value("reduced_motion", widgets.system_reduced_motion(), type=bool))
         self.rate = QSpinBox(minimum=1, maximum=600, value=int(s.value("td_per_minute", 8)), suffix=" dotazů/min")
@@ -201,6 +205,7 @@ class MainWindow(QWidget):
         self.latencies: list[float] = []         # START click -> result shown, seconds (this session)
         self._t_click: float | None = None
         self.last_results: dict[str, tuple] = {}  # symbol -> (view, shown at, data time): instant previous result
+        self.last_levels: dict = {}               # symbol -> analysis.Levels of the last result
         self._refresh = QTimer(self, singleShot=True)
         self._refresh.timeout.connect(self._auto_refresh)
         self.step.setFixedHeight(16)
@@ -234,19 +239,53 @@ class MainWindow(QWidget):
         sp.addWidget(mk)
         self.footer = QLabel("", objectName="muted", alignment=Qt.AlignmentFlag.AlignCenter)
 
+        # ---- main screen (v2.6.1): one big START / BUY / SELL button and VSTUP, TP, SL - nothing else ----
+        self.big = QPushButton("START", objectName="big")
+        self.big.setFixedHeight(170)
+        self.big.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.big.clicked.connect(self.analyze)
+        self.entry_lbl, self.tp_lbl, self.sl_lbl = (QLabel("", objectName="level") for _ in range(3))
+        self.to_details = QPushButton("Podrobnosti ▸", objectName="nav")
+        self.to_details.setToolTip("Indikátory, vysvětlení, Risk management, backtest, deník, trhy, spread")
+        main = QWidget(objectName="page")
+        ml = QVBoxLayout(main)
+        ml.setContentsMargins(6, 16, 6, 6)
+        ml.setSpacing(8)
+        ml.addStretch(1)
+        ml.addWidget(self.big)
+        ml.addSpacing(14)
+        for lab in (self.entry_lbl, self.tp_lbl, self.sl_lbl):
+            ml.addWidget(lab)
+        ml.addStretch(2)
+        ml.addWidget(self.to_details, 0, Qt.AlignmentFlag.AlignRight)
+        # ---- details page: everything that was on the main screen before ----
+        details = QWidget(objectName="page")
+        dl = QVBoxLayout(details)
+        dl.setContentsMargins(0, 0, 0, 0)
+        dl.setSpacing(4)
+        back = QPushButton("◂ Zpět", objectName="nav")
+        dl.addWidget(self.gauge, alignment=Qt.AlignmentFlag.AlignHCenter)
+        steprow = QHBoxLayout()
+        steprow.addWidget(back)
+        steprow.addWidget(self.step, 1)
+        steprow.addWidget(self.go)
+        dl.addLayout(steprow)
+        dl.addLayout(grid)
+        dl.addWidget(self.result)
+        dl.addLayout(sp)
+        dl.addWidget(self.footer)
+        self.pages = QStackedWidget(objectName="pages")
+        self.pages.addWidget(main)
+        self.pages.addWidget(details)
+        self.to_details.clicked.connect(lambda: self.pages.setCurrentIndex(1))
+        back.clicked.connect(lambda: self.pages.setCurrentIndex(0))
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 8, 14, 6)
         lay.setSpacing(4)
         lay.addWidget(self.bar)
-        lay.addWidget(self.gauge, alignment=Qt.AlignmentFlag.AlignHCenter)
-        steprow = QHBoxLayout()
-        steprow.addWidget(self.step, 1)
-        steprow.addWidget(self.go)
-        lay.addLayout(steprow)
-        lay.addLayout(grid)
-        lay.addWidget(self.result)
-        lay.addLayout(sp)
-        lay.addWidget(self.footer)
+        lay.addWidget(self.pages, 1)
+        self.show_main(START, None)
         self.refresh_header()
         self.risk_page.load(self.inst, None)
         self.setFixedWidth(WIDTH)
@@ -350,6 +389,8 @@ class MainWindow(QWidget):
             self.risk_page.load(inst, None)
         if not self.running():
             self.gauge.show_state(0, "START", "spustit analýzu" if inst else "vyberte instrument", ACCENT)
+            if inst != self.shown:
+                self.show_main(START, None)
             if inst and not self.demo():   # local record only - no network request on recognition
                 state, text = self.availability().summary(TwelveData.name, inst.symbol)
                 self.step.setText(text if state != "neověřeno" else "Data Twelve Data: zatím neověřena")
@@ -359,11 +400,45 @@ class MainWindow(QWidget):
         """The instrument changed: the result on screen no longer applies to what Trading 212 shows."""
         old = self.shown
         self._refresh.stop()
+        self.show_main(START, None)              # never the prices of another instrument
         self.risk_page.load(self.inst, None)     # an old signal is never sized for the new instrument
         self.result.mark_historical(f"Instrument se změnil – signál platil jen pro {old.name} ({old.symbol}) "
                                     f"a je historický.")
         for t in self.tiles.values():
             t.set("na", t.value.text(), t.toolTip(), "historické")
+
+    # ---- main screen ----
+    def analyze(self):
+        """The big button: START, or a repeat of the analysis from a shown BUY / SELL / NEUTRAL / NO DATA / ERROR.
+        A click while an analysis runs is ignored (no duplicate, no cancel); the timeout ends a hung run."""
+        if self.running():
+            return
+        self.start()
+
+    def show_main(self, state: str, levels, dim: bool = False):
+        """state: START | ANALYZUJI… | BUY | SELL | NEUTRAL | NO DATA | ERROR; levels: analysis.Levels or None."""
+        color = {BUY: GREEN, SELL: RED, NEUTRAL: YELLOW, NO_DATA: SLATE, ERROR: RED}.get(state, ACCENT)
+        dashed = "dashed" if state == ERROR else "solid"
+        self.big.setText(state)
+        size = 46 if len(state) <= 7 else 34
+        self.big.setStyleSheet(f"QPushButton#big {{ font-size: {size}px; background: {tint(color, 46)}; "
+                               f"color: {color}; "
+                               f"border: 2px {dashed} {color}; }} QPushButton#big:hover {{ background: "
+                               f"{tint(color, 70)}; }}")
+        values = [getattr(levels, k, None) if levels else None for k in ("entry", "tp", "sl")]
+        for lab, name, v in zip((self.entry_lbl, self.tp_lbl, self.sl_lbl), ("VSTUP", "TP", "SL"), values,
+                                strict=True):
+            lab.setText(f"{name}: {v if v is not None else '–'}")
+            lab.setStyleSheet("color: #64748b;" if dim else "")
+        tip = ""
+        if levels and levels.entry is not None:
+            when = levels.price_time.astimezone() if levels.price_time else None
+            tip = (f"Aktuální cena získaná {when:%H:%M:%S}" if levels.live and when else
+                   f"Cena poslední uzavřené 5m svíčky ({when:%H:%M})" if when else "") + f". {levels.note}"
+        elif levels:
+            tip = levels.note
+        self.entry_lbl.setToolTip(tip)
+        self.big.setToolTip("Kliknutím spustíte novou analýzu" if state != "ANALYZUJI…" else "Probíhá analýza…")
 
     # ---- analysis ----
     def start(self):
@@ -393,6 +468,8 @@ class MainWindow(QWidget):
         self.analysed, self.shown = inst, None
         self.bar.remember(inst)
         self._levels = ""
+        prev = self.last_levels.get(inst.symbol)
+        self.show_main("ANALYZUJI…", prev, dim=True)      # previous values of THIS instrument only, greyed out
         cached = self.last_results.get(inst.symbol)
         if cached:          # instant answer: the previous result, clearly marked, while fresh data load
             v, when, data_time = cached
@@ -438,6 +515,7 @@ class MainWindow(QWidget):
         self.gauge.show_state(0, "START", "zrušeno – klikněte znovu", ACCENT)
         self.go.setText("▶ START")
         self._t_click = None
+        self.show_main(START, None)
         self.result.clear("ZRUŠENO")
         self.result.reason.setText(why)
         self.step.setText(why)
@@ -493,7 +571,9 @@ class MainWindow(QWidget):
         v = view(r, inst, levels=levels, stamp=stamp, detail=detail_html(r, inst, self.bar.last_ocr_ms))
         self.result.display(v)
         self.last_results[inst.symbol] = (v, datetime.now(timezone.utc), r.data_time)
-        if self.s.value("auto_refresh", True, type=bool) and side != ERROR and inst == self.inst:
+        self.last_levels[inst.symbol] = r.levels
+        self.show_main(side, r.levels)
+        if self.s.value("auto_refresh", False, type=bool) and side != ERROR and inst == self.inst:
             self._refresh.start(REFRESH_MS)
         self._levels = levels
         if inst != self.inst:  # the instrument changed while the analysis was running
@@ -716,6 +796,7 @@ def detail_html(r: Result, inst: Instrument, ocr_ms: float | None = None) -> str
 
 OPP_TEXT = {"watch": "◆ WATCH", "trigger": "◆ SETUP SPLNĚN", "invalid": "✕ ZANIKLO"}
 NEUTRAL = "NEUTRAL"
+START = "START"
 
 
 def main_side(r: Result) -> str:

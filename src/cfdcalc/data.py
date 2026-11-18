@@ -461,6 +461,13 @@ class CachedProvider:
         self._store: dict[tuple[str, str, str], tuple[list[Bar], datetime]] = {}
         self._lock = threading.Lock()
         self.hits = self.partial = self.full = 0
+        self.last: dict[tuple[str, str, str], tuple[datetime, bool]] = {}   # key -> (fetched at, from network)
+
+    supports_force = True    # bars(force=True): always ask the provider for the newest bars (a user click)
+
+    def fetched(self, symbol: str, interval: str, exchange: str = "") -> tuple[datetime, bool] | None:
+        """When the series returned last time was fetched, and whether that call went to the network."""
+        return self.last.get((symbol, interval, exchange or ""))
 
     def clear(self):
         with self._lock:
@@ -470,7 +477,7 @@ class CachedProvider:
     def pins_exchange(self) -> bool:
         return getattr(self.provider, "pins_exchange", False)
 
-    def bars(self, symbol: str, interval: str, n: int, **kw) -> list[Bar]:
+    def bars(self, symbol: str, interval: str, n: int, force: bool = False, **kw) -> list[Bar]:
         step = timedelta(minutes=INTERVALS[interval])
         now = self._clock()
         key = (symbol, interval, kw.get("exchange") or "")
@@ -479,9 +486,10 @@ class CachedProvider:
             cached = self._store.get(key)
         if cached and len(cached[0]) >= n:
             bars, fetched = cached
-            if fetched >= period + self.SETTLE:
+            if fetched >= period + self.SETTLE and not force:
                 with self._lock:
                     self.hits += 1
+                    self.last[key] = (fetched, False)
                 return list(bars[-n:])
             missing = int((now - bars[-1].t) / step) + 2
             if missing < n // 2:
@@ -493,11 +501,13 @@ class CachedProvider:
                     with self._lock:
                         self._store[key] = (out, now)
                         self.partial += 1
+                        self.last[key] = (now, True)
                     return out[-n:]
         fresh = self.provider.bars(symbol, interval, n, **kw)
         with self._lock:
             self._store[key] = (list(fresh), now)
             self.full += 1
+            self.last[key] = (now, True)
         return list(fresh)
 
 

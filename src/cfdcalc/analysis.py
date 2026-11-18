@@ -144,6 +144,7 @@ class Result:
     timings: dict[str, float] = field(default_factory=dict)   # measured durations in ms
     reference: str = ""                  # non-empty: analysed on REFERENCE data (label) - direction only, no levels
     market: dr.Direction | None = None   # v2.6 MARKET DIRECTION (main answer); `verdict` = TRADE CONFIRMATION
+    levels: Levels | None = None         # v2.6.1 VSTUP / TP / SL of the main screen (for the market direction)
 
     @property
     def is_signal(self) -> bool:
@@ -562,6 +563,63 @@ def _opportunities(r: Result, inst: Instrument, m5, m15, h1, events, spread, now
 EVALUATE_STEPS = 12
 
 
+@dataclass
+class Levels:
+    """VSTUP / TP / SL for the prevailing direction. entry = the newest available price (the still forming 5m bar
+    when it was just fetched, else the close of the last closed 5m bar); SL = entry -/+ 1.5 x ATR(15m), TP = 2R.
+    A value that cannot be computed safely is None (shown as "–"). Not a confirmed trade by itself."""
+    entry: Decimal | None = None
+    tp: Decimal | None = None
+    sl: Decimal | None = None
+    price_time: datetime | None = None   # when the entry price was obtained (fetch time, or close of the bar)
+    live: bool = False                   # entry from the forming bar fetched by this analysis
+    note: str = ""
+
+
+def trade_levels(inst: Instrument, side: str, m5: list[Bar], latest: Bar | None, fetched: datetime | None,
+                 m15: list[Bar] | None, spread: float, now: datetime) -> Levels:
+    if side not in (BUY, SELL):
+        return Levels(note="bez převažujícího směru – vstup, TP a SL se neurčují")
+    if not m5:
+        return Levels(note="chybí cena")
+    lv = Levels()
+    step = timedelta(minutes=5)
+    if latest is not None and fetched is not None and latest.t >= m5[-1].t and latest.t + step > fetched \
+            and now - fetched <= step:
+        price, lv.price_time, lv.live = latest.c, fetched, True
+    else:
+        price, lv.price_time = m5[-1].c, m5[-1].t + step
+    if not (math.isfinite(price) and price > 0):
+        lv.note = "neplatná cena"
+        return lv
+    d = inst.decimals
+    lv.entry = _q(price, d, ROUND_HALF_EVEN)
+    a15 = ind.atr([b.h for b in m15], [b.l for b in m15], [b.c for b in m15])[-1] if m15 and len(m15) > 20 else None
+    tick = 10 ** -d
+    if not a15 or not math.isfinite(a15):
+        lv.note = "ATR (15m) nelze spočítat – TP a SL nelze určit"
+        return lv
+    dist = SL_ATR * a15
+    if dist < 3 * tick:
+        lv.note = "volatilita je pod velikostí ticku – TP a SL nelze určit"
+        return lv
+    if spread > 0 and spread > MAX_SPREAD_OF_SL * dist:
+        lv.note = f"spread {spread:g} je vůči stop-lossu ({dist:.{d}f}) příliš velký – TP a SL se nezobrazí"
+        return lv
+    e = float(lv.entry)
+    if side == BUY:          # SL away from the price, TP towards the entry (rounded to the tick)
+        sl, tp = _q(e - dist, d, ROUND_FLOOR), _q(e + TP_R * dist, d, ROUND_FLOOR)
+    else:
+        sl, tp = _q(e + dist, d, ROUND_CEILING), _q(e - TP_R * dist, d, ROUND_CEILING)
+    sign = 1 if side == BUY else -1
+    if sl <= 0 or tp <= 0 or sign * (lv.entry - sl) <= 0 or sign * (tp - lv.entry) <= 0:
+        lv.note = "TP/SL by byly neplatné"
+        return lv
+    lv.sl, lv.tp = sl, tp
+    lv.note = f"SL {SL_ATR:g}× ATR(15m), TP {TP_R:g}R"
+    return lv
+
+
 def providers_for(provider, name: str):
     """One provider object serves every source (tests, demo), or a mapping {provider name: provider}."""
     return provider if hasattr(provider, "bars") else provider.get(name)
@@ -608,6 +666,8 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
             t0 = clock.perf_counter()
             try:
                 pin = {"exchange": src.exchange} if src.exchange and getattr(prov, "pins_exchange", False) else {}
+                if interval == "5min" and getattr(prov, "supports_force", False):
+                    pin["force"] = True          # every analysis asks for the newest price
                 return prov.bars(src.symbol, interval, FETCH, **pin), None
             except Exception as e:  # noqa: BLE001 - classified below
                 return None, e
@@ -645,6 +705,8 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
             sources.append((name, src.symbol, interval, "OK", f"{len(raw)} svíček, poslední uzavřená "
                                                               f"{bars[-1].t:%d.%m. %H:%M} UTC"))
             got[interval] = bars
+            if interval == "5min":
+                newest[src] = raw[-1]
             step(f"Data {interval} ověřena")
         if failure:
             partial[src] = got        # what this ONE source delivered (never mixed with another source)
@@ -655,6 +717,17 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
         return stop(NO_DATA, "analýza zrušena")
     frames, failure, used = None, None, None
     partial: dict = {}
+    newest: dict = {}                       # source -> newest raw 5m bar (may still be forming)
+
+    def attach_levels(res: Result, src, got: dict) -> Levels:
+        if res.reference:
+            return Levels(note="referenční data – ceny jiného produktu se jako VSTUP, TP a SL nepoužívají")
+        prov = providers_for(provider, src.provider)
+        info = prov.fetched(src.symbol, "5min", src.exchange) if hasattr(prov, "fetched") else (now, True)
+        fetched = info[0] if info and info[1] else None          # a price from the cache is not "fresh"
+        side = res.market.side if res.market else None
+        return trade_levels(inst, side, got.get("5min"), newest.get(src), fetched, got.get("15min"), spread, now)
+
     skipped = [s for s in candidates if not plan_ok(s, cfg.td_plan)]
     for src in skipped:
         sources.append(("Twelve Data", src.symbol, "–", "plan",
@@ -698,6 +771,7 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
             out.data_time = got["5min"][-1].t + timedelta(minutes=5)
             if not src.exact:
                 out.reference = src.label or src.symbol
+            out.levels = attach_levels(out, src, got)
         return out
     if cancelled():
         return stop(NO_DATA, "analýza zrušena")
@@ -720,4 +794,5 @@ def run_analysis(inst: Instrument, provider: Provider, calendar: Calendar | None
     r.completed, r.total = done, total
     r.sources = sources
     r.timings = dict(timings)
+    r.levels = attach_levels(r, used, frames)
     return r

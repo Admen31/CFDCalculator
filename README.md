@@ -53,6 +53,22 @@ Požadavky: Windows 10/11, Python ≥ 3.12. OCR (RapidOCR) běží offline, nic 
   místo aby čekal ve frontě. Čtení, které visí déle než 8 s, START neblokuje.
 * Při zavření okna se pracovní vlákna bezpečně ukončí.
 
+## Verze 2.6.1: jedno tlačítko START / BUY / SELL
+
+![Hlavní obrazovka v2.6.1: START, ANALYZUJI…, BUY, SELL (syntetická testovací data)](docs/v261-main.png)
+
+* Hlavní obrazovka obsahuje jen velké tlačítko a pod ním **VSTUP**, **TP** a **SL**. Nahoře zůstává výběr instrumentu,
+  vpravo dole odkaz **Podrobnosti ▸**: indikátory, vysvětlení, Risk management, Detail, spread, Backtest, Deník,
+  Trhy a kruh průběhu.
+* Tlačítko ukazuje START, během výpočtu ANALYZUJI… a pak **BUY** (zeleně), **SELL** (červeně), NEUTRAL, NO DATA nebo
+  ERROR. Kliknutí na výsledek spustí novou analýzu stejného instrumentu. Kliknutí během výpočtu se ignoruje.
+* BUY/SELL je **převažující směr trhu**, ne doporučení k otevření pozice.
+* **VSTUP** = poslední dostupná cena (aktuální 5m svíčka stažená touto analýzou; jinak cena poslední uzavřené svíčky,
+  čas je v nápovědě). **SL** = VSTUP ∓ 1,5 × ATR(15m), **TP** = 2 × vzdálenost SL. Hodnoty jsou zaokrouhlené na tick
+  instrumentu a kontrolují se minimální vzdálenost, spread a strany. Co nelze bezpečně spočítat, ukáže „–“.
+* Každá analýza stahuje nová 5m data (1 dotaz). Starší rámce se berou z mezipaměti jen tehdy, když nemohla vzniknout
+  novější uzavřená svíčka. Ceny jiného instrumentu se po přepnutí nikdy nezobrazí.
+
 ## Verze 2.6: okamžitý směr trhu (MARKET DIRECTION)
 
 ![Hlavní obrazovka v2.6: BUY, SELL s nepotvrzeným vstupem, NEUTRAL, NO DATA (syntetická testovací data)](docs/v26-ui.png)
