@@ -39,7 +39,7 @@ def test_start_runs_real_steps_to_a_verdict(app, window, tmp_path):
     assert title in ("BUY", "SELL", "NEUTRAL") and window.result.verdict.text() == title
     shown = window.last_results["XAU/USD"][0]
     assert window.gauge.target == int(shown["strength"].split()[1].split("/")[0])
-    assert "OBCHODNÍ VSTUP" in window.result.entry.text() and window.latencies
+    assert "VSTUP" in window.result.entry.text() and window.latencies      # shortened when a WATCH pill shows
     stamp = window.result.stamp.text()
     head = window.result.instrument.text()
     assert "analýza" in stamp and "data do" in stamp and "DEMO" in stamp and "XAU/USD" in head and "Komodity" in head
