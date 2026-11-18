@@ -1,5 +1,51 @@
 # Changelog
 
+## 2.8.0 – M15 trading ready (větev `v2.8-m15-trading-ready`)
+
+**OCR rozpoznání Trading 212 (regrese a opravy)**
+* **Příčina falešné nejednoznačnosti**: `recognize.score()` skládalo slova víceslovného názvu z *libovolných* řádků
+  oblasti. Pravidlo bylo v kódu od první verze, ale s katalogem 167 instrumentů (v2.5) a širší oblastí začalo
+  škodit: „Euro / **US** Dollar“ + „Leverage 1:**30**“ daly index „US 30“, takže EUR/USD skončilo jako
+  „nejednoznačné“ a START se ptal na ruční výběr. Teď se smí spojit jen **dva sousední** řádky.
+* Ceny, množství, marže, procenta a slova obchodního panelu (BUY, SELL, Quantity, Margin, Leverage, …, i česky)
+  se před porovnáním odstraní. Nikdy se tak nepřečtou jako instrument.
+* Typické záměny OCR v měnových párech se opraví jen na existující pár z katalogu: „EURIUSD“, „EUR|USD“,
+  „XAU/USO“ → EUR/USD, XAU/USD.
+* **Záložní čtení celého okna**: když oblast ▭ chybí, nebo neukazuje rozpoznatelný instrument (Trading 212 po
+  změně šířky okna posune rozložení, v oblasti je cena), přečte se celé okno a vezme se instrument napsaný
+  **největším písmem** (nadpis). Dva různé instrumenty stejně velkým písmem → „Instrument nerozpoznán“, nic se
+  nehádá. Při průběžném sledování nejvýš jednou za 10 s, START a ⟳ vždy.
+* Stav „Instrument nerozpoznán“ s nabídkou ručního výběru. Ruční výběr má vždy přednost.
+
+**Data a „nedostatečné API“** (podrobně `docs/v28-audit-dat.md`)
+* Hlavní signál potřebuje **jediný požadavek** na 15min svíčky místo tří (5m + 15m + 1h). Opakované kliknutí do
+  60 s nedělá žádný požadavek. Na pozadí se stahuje jen po uzavření nové 15m svíčky (nejvýš 4× za hodinu).
+* Další požadavky stahují jen nejnovější svíčky a slučují je s cache. Dva souběžné požadavky na stejnou řadu se
+  nikdy nespustí, druhý použije výsledek prvního.
+* Chybějící klíč, tarif, limit, mapování, počet svíček, stáří cache a poslední chyba poskytovatele jsou vidět
+  v **Podrobnosti → Signál M15 → Diagnostika dat**.
+
+**Signál jen z M15** (`m15.py`)
+* Směr BUY / SELL / NEUTRAL / NO DATA jen z **uzavřených 15m svíček**: EMA 20/50/200, sklon EMA 50, MACD, RSI 14,
+  struktura swingů. Žádná data 5m ani 1h, žádné čekání na H1.
+* VSTUP / TP / SL jen pro **potvrzený vstup**: trend (EMA 200, EMA 20/50), RSI není extrémní, cena do 1× ATR od
+  EMA 20, prostor ≥ 1R k nejbližšímu swingu, spread ≤ 15 % SL, ATR ≥ 3 ticky, čas do večerního limitu,
+  ekonomický kalendář, přesná (ne referenční) data. SL = 1,5× ATR14(M15), TP = 2R.
+* Jinak BUY/SELL jen jako **převažující směr** bez cen („jen směr – vstup nepotvrzen“), nebo NEUTRAL / NO DATA.
+* Pod hodnotami je skutečný čas dat: uzavřená M15 svíčka a čas ceny.
+
+**Portfolio a riziko**
+* Záložka **Portfolio a riziko**: hodnota portfolia, měna (CZK, EUR, USD, …), riziko na obchod (2 %), riziko už
+  otevřených pozic, max. celkové otevřené riziko, rezerva na skluz, volná marže, specifikace CFD. Ukládá se
+  lokálně.
+* **POZICE** na hlavní obrazovce z výpočtu v2.4 (`risk.size`, žádný druhý výpočet). Ten je rozšířený o celkové
+  otevřené riziko, rezervu na skluz a kontrolu ztráty po zaokrouhlení dolů na krok. Chybí-li údaj: „NELZE
+  SPOČÍTAT“, minimální množství nad limitem: „PŘÍLIŠ RIZIKOVÉ“.
+
+**Rozhraní**: hlavní obrazovka obsahuje jen START → BUY/SELL, VSTUP, TP, SL, POZICE a jeden řádek s časem dat.
+Podrobnosti mají záložky **Signál M15** a **Historický režim 5m/15m/1h**. Historický režim hlavní obrazovku ani
+výpočet pozice neovlivňuje.
+
 ## 2.6.1 – opakovaný START a minimalistická hlavní obrazovka (větev `v2.6.1-repeatable-start-minimal-ui`)
 
 * **Příčina „druhý START nefunguje“**: druhé a další kliknutí analýzu spustilo, ale mezipaměť svíček vrátila stejná

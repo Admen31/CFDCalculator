@@ -10,6 +10,47 @@ BUY / SELL / NEUTRAL** s mírou převahy; obchodní vstup se potvrzuje samostatn
 **Aplikace nikdy nezadává obchody.** Neobsahuje žádné napojení na broker, obchod zadáváte ručně.
 Výsledky nejsou investiční doporučení a ziskovost strategie není ověřena.
 
+## Stažení (bez instalace)
+
+Hotovou aplikaci stáhnete v prohlížeči na stránce **Releases** (ZIP). Rozbalte ho a spusťte
+`CFD Signal Calculator\CFD Signal Calculator.exe`. Python ani GitHub CLI nepotřebujete. Aplikace není
+digitálně podepsaná, takže Windows může zobrazit „Systém Windows ochránil váš počítač“. Pak klikněte na
+**Další informace → Přesto spustit**.
+
+## Verze 2.8: M15 trading ready
+
+* **Jen 15minutový graf.** BUY / SELL / NEUTRAL / NO DATA, VSTUP, TP i SL vznikají jen z 15m svíček (EMA 20/50/200,
+  RSI 14, MACD, ATR 14, struktura swingů, support/rezistence). Žádná 5m ani 1h data, žádné čekání na H1.
+  Podrobnosti v [CHANGELOG](CHANGELOG.md).
+* **Hlavní obrazovka**: START → **BUY / SELL**, pod tím **VSTUP, TP, SL, POZICE** a jeden řádek se skutečným časem
+  dat (uzavřená M15 svíčka, čas ceny). BUY/SELL bez potvrzeného vstupu znamená jen převažující směr. Ceny ani
+  pozice se pak nezobrazí, nejde o obchodní pokyn.
+* **Jeden požadavek na klik**, opakované kliknutí do 60 s je okamžité z cache (stejný výsledek, žádný požadavek).
+  Nová 15m svíčka vzniká jen jednou za 15 minut. Na pozadí se data stáhnou po uzavření nové svíčky.
+* **Portfolio a riziko** (záložka): hodnota portfolia, měna, riziko na obchod (výchozí 2 %), riziko otevřených
+  pozic, max. celkové riziko, rezerva na skluz, specifikace CFD. POZICE se počítá výpočtem v2.4.
+* **OCR**: oprava falešné nejednoznačnosti (slova z různých řádků), filtr cen a BUY/SELL, opravy záměn v párech.
+  Když oblast ▭ selže, čte se celé okno a vezme se název napsaný největším písmem. Jinak „Instrument nerozpoznán“
+  a ruční výběr.
+* Audit dat: [docs/v28-audit-dat.md](docs/v28-audit-dat.md). Historické ověření:
+  [docs/v28-m15-validace.md](docs/v28-m15-validace.md). Směr nemá prokázanou předpovědní hodnotu a ziskovost
+  není prokázaná.
+
+### Ukázka: velikost pozice EUR/USD, portfolio 100 000 Kč, riziko 2 %
+
+Rizikový rozpočet = 100 000 × 2 % = **2 000 Kč**. Příklad: BUY, VSTUP 1,15000, SL 1,14850 (15 pipů), spread
+0,00008, kurz 1 USD = 21,00 Kč (ilustrační, aplikace bere aktuální kurz z Twelve Data nebo váš ruční).
+
+| Specifikace CFD (opište z Trading 212) | POZICE | ztráta při SL | nominální hodnota | marže 3,33 % |
+|---|---|---|---|---|
+| kontrakt 1 EUR, krok 1 | 60 277 ks | 1 999,99 Kč | 1 455 690 Kč | 48 474 Kč |
+| kontrakt 100 000 EUR (1 lot), krok 0,01 | 0,6 ks | 1 990,80 Kč | 1 449 000 Kč | 48 252 Kč |
+| totéž s rezervou na skluz 10 % (výchozí v aplikaci), kontrakt 1 EUR | 55 050 ks | 1 999,97 Kč | 1 329 458 Kč | 44 271 Kč |
+
+Riziko na jednotku = (|VSTUP − SL| + spread [+ rezerva]) × kontrakt × kurz; množství se zaokrouhlí **dolů** na
+krok a ztráta se po zaokrouhlení znovu ověří. Množství CFD, nominální hodnota, marže a riziko při SL jsou různé
+veličiny. **Při skluzu nebo cenovém gapu může být skutečná ztráta vyšší než 2 %.**
+
 ## Instalace a spuštění (vývojově)
 
 ```bat
