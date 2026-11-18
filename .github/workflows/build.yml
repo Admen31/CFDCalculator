@@ -57,6 +57,8 @@ jobs:
         run: python -m pytest -q -p no:cacheprovider --junitxml=junit.xml 2>&1 | Tee-Object -FilePath pytest.log
       - name: Failed tests as annotations (readable while the job still runs)
         if: failure()
+        env:
+          PYTHONIOENCODING: utf-8
         shell: python
         run: |
           import os

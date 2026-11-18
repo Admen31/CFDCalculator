@@ -1017,10 +1017,11 @@ def m15_detail_html(sig: m15.Signal, inst: Instrument, report: list[str], latenc
         rows.append(f"<p style='color:#fb923c'><b>REFERENČNÍ TRŽNÍ DATA</b> – "
                     f"{e(sig.reference)}. Cena jiného produktu není cena CFD v Trading 212.</p>")
     if sig.levels_ok:
+        rr = sig.rr or float(abs(sig.tp - sig.entry) / abs(sig.entry - sig.sl))
         kind = {m15.MARKET: "vstup nyní (tržní cena)", m15.LIMIT_ENTRY: "limitní pokyn (návrat ceny)",
                 m15.STOP_ENTRY: "stop pokyn (průraz)"}.get(sig.entry_kind, "")
         rows.append(f"<p><b>Plán {e(sig.plan)}</b> – {kind}. VSTUP {sig.entry} · SL {sig.sl} · TP {sig.tp} "
-                    f"(R:R 1:{sig.rr:.2f}). SL za posledním M15 swingem + 0,2× ATR + spread, v rozmezí "
+                    f"(R:R 1:{rr:.2f}). SL za posledním M15 swingem + 0,2× ATR + spread, v rozmezí "
                     f"{m15.SL_MIN_ATR:g}–{m15.SL_MAX_ATR:g}× ATR14; TP = {m15.TP_R:g}R.</p>")
         if sig.trigger:
             rows.append(f"<p style='color:#facc15'><b>Podmínka vstupu:</b> {e(sig.trigger)}</p>")

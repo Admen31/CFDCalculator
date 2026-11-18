@@ -231,28 +231,38 @@ class Box:
         return self.y + self.height / 2
 
 
-def _style(lum, x0: int, y0: int, x1: int, y1: int) -> tuple[float | None, float | None]:
-    """Background (median of a ring around the box) and text luminance (the extreme inside, away from the
-    background) of one box. lum = 2-D luminance array."""
-    h, w = lum.shape
-    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
-    if x1 - x0 < 2 or y1 - y0 < 2:
-        return None, None
-    pad = max(2, (y1 - y0) // 3)
-    ox0, oy0, ox1, oy1 = max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
-    ring = [lum[oy0:y0, ox0:ox1].ravel(), lum[y1:oy1, ox0:ox1].ravel(),
-            lum[y0:y1, ox0:x0].ravel(), lum[y0:y1, x1:ox1].ravel()]
+def make_box(lum, text: str, x0: int, y0: int, x1: int, y1: int) -> Box:
+    """One OCR box measured on the image: OCR boxes are loose, so the INK of the text is found first (pixels that
+    differ from the box border). Font size and position come from the ink (exact whatever the OCR padding), the
+    background from a thin ring around the ink, the text luminance from the ink itself."""
     import numpy as np
-    ring = np.concatenate([r for r in ring if r.size]) if any(r.size for r in ring) else None
-    inside = lum[y0:y1, x0:x1].ravel()
-    bg = float(np.median(ring)) if ring is not None else float(np.median(inside))
-    lo, hi = float(np.percentile(inside, 3)), float(np.percentile(inside, 97))
-    fg = hi if abs(hi - bg) >= abs(lo - bg) else lo
-    return bg, fg
+    h, w = lum.shape
+    x0, y0, x1, y1 = max(0, int(x0)), max(0, int(y0)), min(w, int(x1)), min(h, int(y1))
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return Box(text, float(max(1, y1 - y0)), float(x0), float(y0), float(max(1, x1 - x0)))
+    box = lum[y0:y1, x0:x1]
+    border = np.concatenate([box[0], box[-1], box[:, 0], box[:, -1]])
+    bg0 = float(np.median(border))
+    ink = np.abs(box - bg0) > 40
+    if not ink.any():
+        return Box(text, float(y1 - y0), float(x0), float(y0), float(x1 - x0), bg0, bg0)
+    ys, xs = np.nonzero(ink)
+    iy0, iy1, ix0, ix1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+    ih = max(2, iy1 - iy0)
+    pad = max(2, int(ih * 0.35))
+    ry0, ry1 = max(0, y0 + iy0 - pad), min(h, y0 + iy1 + pad)
+    rx0, rx1 = max(0, x0 + ix0 - pad), min(w, x0 + ix1 + pad)
+    ring = lum[ry0:ry1, rx0:rx1].astype(np.float32).copy()
+    ring[(y0 + iy0 - ry0):(y0 + iy1 - ry0), (x0 + ix0 - rx0):(x0 + ix1 - rx0)] = np.nan
+    vals = ring[~np.isnan(ring)]
+    bg = float(np.median(vals)) if vals.size else bg0
+    t = box[ink]
+    fg = float(np.percentile(t, 90)) if np.median(t) > bg else float(np.percentile(t, 10))
+    return Box(text, float(ih), float(x0 + ix0), float(y0 + iy0), float(ix1 - ix0), bg, fg)
 
 
 def ocr_boxes(rgb) -> list[Box]:
-    """Text boxes with geometry and look (RapidOCR, offline)."""
+    """Text boxes measured on the image (RapidOCR, offline)."""
     import numpy as np
     result, _ = warm_up()(rgb)
     lum = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
@@ -260,9 +270,7 @@ def ocr_boxes(rgb) -> list[Box]:
     for item in result or []:
         pts, text = item[0], item[1]
         ys, xs = [p[1] for p in pts], [p[0] for p in pts]
-        x0, y0, x1, y1 = int(min(xs)), int(min(ys)), int(max(xs)) + 1, int(max(ys)) + 1
-        bg, fg = _style(lum, x0, y0, x1, y1)
-        out.append(Box(text, float(y1 - y0), float(x0), float(y0), float(x1 - x0), bg, fg))
+        out.append(make_box(lum, text, int(min(xs)), int(min(ys)), int(max(xs)) + 1, int(max(ys)) + 1))
     return out
 
 
@@ -301,11 +309,11 @@ def _collections(hits: list[_Hit]) -> list[list[_Hit]]:
                 if j == i or j in used:
                     continue
                 hmax = max(a.box.height, b.box.height)
-                alike = min(a.box.height, b.box.height) >= 0.7 * hmax
+                alike = min(a.box.height, b.box.height) >= 0.6 * hmax      # OCR box heights vary
                 if kind == "row":
-                    near = abs(a.box.cy - b.box.cy) <= 0.6 * hmax
+                    near = abs(a.box.cy - b.box.cy) <= 0.5 * hmax
                 else:
-                    near = abs(a.box.x - b.box.x) <= 1.0 * hmax and abs(a.box.cy - b.box.cy) <= 12 * hmax
+                    near = abs(a.box.x - b.box.x) <= 1.2 * hmax and abs(a.box.cy - b.box.cy) <= 12 * hmax
                 if alike and near:
                     g.append(b)
             if len({h.inst for h in g}) >= 2:
@@ -346,9 +354,10 @@ def _active(group: list[_Hit], screen_bg: float | None = None) -> _Hit | None:
 
 
 def _near_trade(h: _Hit, anchors: list[Box]) -> bool:
+    """The instrument name of a trade panel sits right at its SELL / BUY buttons (a few lines above / beside)."""
     for a in anchors:
-        hmax = max(h.box.height, a.height)
-        if abs(h.box.cy - a.cy) <= 8 * hmax and abs(h.box.cx - a.cx) <= 16 * hmax:
+        ha = a.height
+        if abs(h.box.cy - a.cy) <= 4 * ha and abs(h.box.cx - a.cx) <= 8 * ha:
             return True
     return False
 

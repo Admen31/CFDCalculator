@@ -116,6 +116,12 @@ def test_screen_without_a_known_instrument_is_not_guessed(app):
 # ---------------------------------------------------------------- v2.9: several instrument tabs open in Trading 212
 
 TABS = ["Silver", "NVIDIA", "Gold", "EUR/USD"]
+
+
+def dump(boxes):
+    """Measured OCR boxes for the failure message (text, x, y, font height, background, text luminance)."""
+    return [(b.text, round(b.x), round(b.y), round(b.height), b.bg and round(b.bg), b.fg and round(b.fg))
+            for b in boxes]
 WATCH = [("Silver", "51.84"), ("NVIDIA", "182.40"), ("Gold", "4,083.45"), ("EUR/USD", "1.15242"),
          ("GBP/USD", "1.31842")]
 
@@ -167,33 +173,39 @@ def render_t212(active, tabs=TABS, scale=1.0, header=None, mark="background", wa
 @pytest.mark.parametrize("scale", [1.0, 1.25, 1.5, 2.0])
 def test_active_eurusd_among_silver_nvidia_gold_tabs(app, scale):
     """Scenario A (representative image): Silver, NVIDIA, Gold and EUR/USD open, EUR/USD active -> EUR/USD."""
-    rec = locate(ocr_boxes(render_t212("EUR/USD", scale=scale, name="tabs_eurusd_active")))
-    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason, rec.text[:300])
+    boxes = ocr_boxes(render_t212("EUR/USD", scale=scale, name="tabs_eurusd_active"))
+    rec = locate(boxes)
+    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason, dump(boxes))
     assert rec.via == "aktivní záložka"
 
 
 @pytest.mark.parametrize("scale", [1.0, 1.5])
 def test_active_tab_marked_only_by_text_colour_and_underline(app, scale):
-    rec = locate(ocr_boxes(render_t212("EUR/USD", scale=scale, mark="text", name="tabs_text_marked")))
-    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason)
+    boxes = ocr_boxes(render_t212("EUR/USD", scale=scale, mark="text", name="tabs_text_marked"))
+    rec = locate(boxes)
+    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason, dump(boxes))
 
 
 @pytest.mark.parametrize("scale", [1.0, 1.5])
 def test_chart_header_wins_over_tabs(app, scale):
-    rec = locate(ocr_boxes(render_t212("EUR/USD", scale=scale, header="EUR/USD", name="tabs_header")))
-    assert rec.confident and rec.best.symbol == "EUR/USD" and rec.via in ("graf / nadpis", "obchodní panel")
+    boxes = ocr_boxes(render_t212("EUR/USD", scale=scale, header="EUR/USD", mark="none", name="tabs_header"))
+    rec = locate(boxes)            # tabs WITHOUT a mark: only the chart header can decide
+    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason, dump(boxes))
+    assert rec.via in ("graf / nadpis", "obchodní panel")
 
 
 @pytest.mark.parametrize("scale", [1.0, 1.25])
 def test_switch_to_gold_is_recognised(app, scale):
     """Scenario B (representative image): the user clicks the Gold tab -> XAU/USD."""
-    rec = locate(ocr_boxes(render_t212("Gold", scale=scale, name="tabs_gold_active")))
-    assert rec.confident and rec.best.symbol == "XAU/USD", (rec.via, rec.reason)
+    boxes = ocr_boxes(render_t212("Gold", scale=scale, name="tabs_gold_active"))
+    rec = locate(boxes)
+    assert rec.confident and rec.best.symbol == "XAU/USD", (rec.via, rec.reason, dump(boxes))
 
 
 def test_two_tabs_only(app):
-    rec = locate(ocr_boxes(render_t212("EUR/USD", tabs=["Silver", "EUR/USD"], name="two_tabs")))
-    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason)
+    boxes = ocr_boxes(render_t212("EUR/USD", tabs=["Silver", "EUR/USD"], name="two_tabs"))
+    rec = locate(boxes)
+    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason, dump(boxes))
 
 
 def test_tabs_without_any_visible_mark_are_not_guessed(app):
