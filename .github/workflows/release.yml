@@ -49,7 +49,9 @@ jobs:
           exe="pkg/CFD Signal Calculator/CFD Signal Calculator.exe"
           [ -f "$exe" ] || { echo "::error::EXE missing"; ls -la "pkg/CFD Signal Calculator"; exit 1; }
           file "$exe"
-          file "$exe" | grep -q 'PE32+ executable (GUI) x86-64' || { echo "::error::not a 64-bit Windows GUI EXE"; exit 1; }
+          info=$(file -b "$exe")
+          echo "$info" | grep -q 'PE32+' && echo "$info" | grep -q 'GUI' && echo "$info" | grep -qi 'x86-64' \
+            || { echo "::error::not a 64-bit Windows GUI EXE: $info"; exit 1; }
           [ -d "pkg/CFD Signal Calculator/_internal" ] || { echo "::error::_internal folder missing"; exit 1; }
           echo "files: $(find pkg -type f | wc -l), size: $(du -sh pkg | cut -f1)"
 
