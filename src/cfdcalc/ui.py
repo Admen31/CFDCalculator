@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
                                QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTabWidget, QTextBrowser,
                                QTimeEdit, QVBoxLayout, QWidget)
 
-from . import __version__, m15, widgets
+from . import __version__, apikey, m15, widgets
 from . import strategies as st
 from .analysis import BUY, ERROR, MODULES, NO_DATA, PROFILES, SELL, TITLES, Result, Settings, run_analysis
 from .backtest import HISTORY, journal_add, journal_read, journal_verify
@@ -100,7 +100,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Nastavení")
         self.s = s
-        self.key = QLineEdit(s.value("api_key", ""), echoMode=QLineEdit.EchoMode.Password)
+        self.key = QLineEdit(apikey.load(s), echoMode=QLineEdit.EchoMode.Password)
         self.cutoffs = {k: QTimeEdit(QTime.fromString(s.value(f"cutoff/{k}", f"{p.cutoff:%H:%M}"), "HH:mm"))
                         for k, p in PROFILES.items()}
         self.left = QSpinBox(minimum=0, maximum=600, value=int(s.value("min_left", 60)))
@@ -133,9 +133,15 @@ class SettingsDialog(QDialog):
         self.plan.setToolTip("Váš tarif Twelve Data. Instrumenty vyšších tarifů se nestahují (žádné zbytečné dotazy "
                              "a chyby) a použije se ověřený referenční zdroj, pokud existuje.")
         form.addRow("Tarif Twelve Data", self.plan)
-        note = QLabel(f"Klíč se ukládá nešifrovaně do {s.fileName()}.\n"
-                      "Alternativa: proměnná prostředí TWELVEDATA_API_KEY.", objectName="muted")
+        note = QLabel(f"Klíč: {apikey.where(s)}.\nNastavení zůstává při nové verzi (nezávisí na složce s EXE).\n"
+                      "Alternativa: proměnná prostředí TWELVEDATA_API_KEY.", objectName="muted", wordWrap=True)
         form.addRow(note)
+        self.test_btn = QPushButton("Otestovat připojení k Twelve Data")
+        self.test_btn.setToolTip("Jeden dotaz na stav účtu (api_usage): ověří klíč a ukáže tarif a čerpání")
+        self.test_result = QLabel("", objectName="muted", wordWrap=True)
+        self.test_btn.clicked.connect(self.test_connection)
+        form.addRow(self.test_btn)
+        form.addRow(self.test_result)
         if probe:
             check = QPushButton(f"Ověřit dostupnost dat – {probe_label}")
             check.setToolTip("Katalog symbolů a 2 svíčky pro 5min/15min/1h u Twelve Data (4–5 dotazů)")
@@ -146,8 +152,25 @@ class SettingsDialog(QDialog):
         bb.rejected.connect(self.reject)
         form.addRow(bb)
 
+    def test_connection(self):
+        """Check the TYPED key with one api_usage request (in a worker; never shows the key)."""
+        key = self.key.text().strip()
+        if not key:
+            self.test_result.setText("Zadejte klíč.")
+            return
+        self.test_btn.setEnabled(False)
+        self.test_result.setText("Ověřuji…")
+        self._probe = Task(lambda _: TwelveData(key, per_minute=60).account())
+        self._probe.done.connect(lambda r: self._tested(f"OK – připojení funguje. {r}"))
+        self._probe.failed.connect(lambda m: self._tested(f"CHYBA: {m.split(': ', 1)[-1]}"))
+        self._probe.start()
+
+    def _tested(self, text: str):
+        self.test_result.setText(text)
+        self.test_btn.setEnabled(True)
+
     def save(self):
-        self.s.setValue("api_key", self.key.text().strip())
+        apikey.save(self.s, self.key.text())
         for k, edit in self.cutoffs.items():
             self.s.setValue(f"cutoff/{k}", edit.time().toString("HH:mm"))
         self.s.setValue("min_left", self.left.value())
@@ -360,7 +383,7 @@ class MainWindow(QWidget):
         minute limit and the cache survive between analyses; a new key or limit starts a fresh client)."""
         if self.demo():
             return SyntheticData()
-        key = os.environ.get("TWELVEDATA_API_KEY") or self.s.value("api_key", "")
+        key = apikey.load(self.s)
         ident = (key, int(self.s.value("td_per_minute", 8)))
         if not self._cache or self._cache[0] != ident:
             self._cache = (ident, CachedProvider(TwelveData(key, per_minute=ident[1])))
@@ -437,6 +460,7 @@ class MainWindow(QWidget):
             self.show_main(START, None)
             self.info.setText("" if inst else "Instrument nerozpoznán – vyberte ho ručně (hledání nahoře)")
             self.m15_text.setHtml("<p>Klikněte START na hlavní obrazovce.</p>")
+            self.portfolio.spec.show_instrument(inst)
             QTimer.singleShot(0, self.background)    # first data of the new instrument in the background
         if self.shown and inst != self.shown:
             self.mark_historical()
@@ -542,7 +566,7 @@ class MainWindow(QWidget):
             journal_add(data_dir() / "journal.csv", inst.symbol, sig.side, sig.data_time, sig.entry, sig.sl, sig.tp)
 
     def has_key(self) -> bool:
-        return bool(os.environ.get("TWELVEDATA_API_KEY") or self.s.value("api_key", ""))
+        return bool(apikey.load(self.s))
 
     def usage(self) -> str:
         try:
@@ -587,10 +611,14 @@ class MainWindow(QWidget):
         if sig is None or not sig.levels_ok or out is None or self.risk_page.inst != self.shown_m15:
             return "–"
         if out.qty is not None:
-            return f"{risk.fmt_qty(out.qty)} ks" + ("" if out.state == risk.OK else " (orientačně)")
+            return f"{risk.fmt_qty(out.qty)} (množství T212)" + ("" if out.state == risk.OK else " orientačně")
         if out.state == risk.LIMIT:
             return out.headline
-        return "NELZE SPOČÍTAT"
+        text = " ".join(out.messages).lower()
+        why = ("chybí portfolio" if "hodnota účtu" in text else
+               "chybí specifikace" if "specifikace" in text else
+               "chybí kurz" if "kurz" in text else "")
+        return "NELZE SPOČÍTAT" + (f" ({why})" if why else "")
 
     def show_main(self, state: str, levels, dim: bool = False):
         """state: START | ANALYZUJI… | BUY | SELL | NEUTRAL | NO DATA | ERROR; levels: object with entry/tp/sl or
@@ -608,6 +636,9 @@ class MainWindow(QWidget):
                                 strict=True):
             lab.setText(f"{name}: {v if v is not None else '–'}")
             lab.setStyleSheet("color: #64748b;" if dim else "")
+        if levels is not None and getattr(levels, "plan", "") == m15.CONDITIONAL and values[0] is not None:
+            kind = {m15.STOP_ENTRY: "stop", m15.LIMIT_ENTRY: "limit"}.get(levels.entry_kind, "čekat")
+            self.entry_lbl.setText(f"VSTUP: {values[0]} (podmíněný – {kind})")   # the entry has not happened yet
         self.pos_lbl.setText(f"POZICE: {self.position_text() if levels is not None and not dim else '–'}")
         self.pos_lbl.setStyleSheet("color: #64748b;" if dim else "")
         tip = ""
@@ -958,8 +989,10 @@ def m15_info(sig: m15.Signal, state: str, latency: float | None) -> str:
         parts.append(f"M15 svíčka {sig.data_time.astimezone():%H:%M}")
     if sig.price_time and sig.live:
         parts.append(f"cena {sig.price_time.astimezone():%H:%M:%S}")
-    if sig.side in (BUY, SELL) and not sig.levels_ok:
-        parts.append("jen směr – vstup nepotvrzen")
+    if sig.side in (BUY, SELL) and sig.plan == m15.INVALID:
+        parts.append("plán neplatný – důvod v Podrobnostech")
+    elif sig.side in (BUY, SELL) and sig.plan == m15.CONDITIONAL:
+        parts.append("PODMÍNĚNÝ plán – vstup zatím nenastal")
     elif sig.side in (NO_DATA, NEUTRAL) and sig.note:
         parts.append(sig.note[:60])
     if sig.reference:
@@ -973,20 +1006,28 @@ def m15_detail_html(sig: m15.Signal, inst: Instrument, report: list[str], latenc
                     ocr_ms: float | None, latencies: list[float], kinds: list[str]) -> str:
     """Detail page of the M15 signal: decision, votes, entry checks, data diagnostics, timings."""
     e = html.escape
-    rows = [f"<h3>{e(inst.name)} ({e(inst.symbol)}) – {e(sig.side)}"
-            f"{' · POTVRZENÝ VSTUP' if sig.levels_ok else ''}</h3>",
+    rows = [f"<h3>{e(inst.name)} ({e(inst.symbol)}) – A. SMĚR TRHU: {e(sig.side)}"
+            f"{' · B. PLÁN: ' + e(sig.plan) if sig.plan else ''}</h3>",
             f"<p><b>{e(sig.summary)}</b></p>"]
-    if sig.side in (BUY, SELL) and not sig.levels_ok:
-        rows.append("<p>BUY/SELL zde označuje <b>převažující směr trhu na M15</b>. Vstup nesplňuje podmínky, proto "
-                    "aplikace nezobrazuje VSTUP, TP, SL ani pozici – <b>nejde o obchodní pokyn</b>.</p>")
+    if sig.side in (BUY, SELL):
+        rows.append("<p>A. <b>Směr trhu</b> (BUY/SELL/NEUTRAL) popisuje převažující stav na M15 – sám o sobě není "
+                    "obchodní pokyn. B. <b>Obchodní plán</b>: POTVRZENÝ = podmínky vstupu splněny nyní; PODMÍNĚNÝ = "
+                    "vstup teprve při splnění podmínky níže (zatím nenastal); NEPLATNÝ = plán nelze odvodit.</p>")
     if sig.reference:
         rows.append(f"<p style='color:#fb923c'><b>REFERENČNÍ TRŽNÍ DATA</b> – "
                     f"{e(sig.reference)}. Cena jiného produktu není cena CFD v Trading 212.</p>")
     if sig.levels_ok:
-        rr = abs(sig.tp - sig.entry) / abs(sig.entry - sig.sl)
-        rows.append(f"<p>VSTUP {sig.entry} · SL {sig.sl} ({m15.SL_ATR:g}× ATR14 M15) · TP {sig.tp} "
-                    f"(R:R 1:{rr:.1f}). Podkladová cena se může lišit od ceny CFD v Trading 212 – zkontrolujte "
-                    "vstup v platformě.</p>")
+        kind = {m15.MARKET: "vstup nyní (tržní cena)", m15.LIMIT_ENTRY: "limitní pokyn (návrat ceny)",
+                m15.STOP_ENTRY: "stop pokyn (průraz)"}.get(sig.entry_kind, "")
+        rows.append(f"<p><b>Plán {e(sig.plan)}</b> – {kind}. VSTUP {sig.entry} · SL {sig.sl} · TP {sig.tp} "
+                    f"(R:R 1:{sig.rr:.2f}). SL za posledním M15 swingem + 0,2× ATR + spread, v rozmezí "
+                    f"{m15.SL_MIN_ATR:g}–{m15.SL_MAX_ATR:g}× ATR14; TP = {m15.TP_R:g}R.</p>")
+        if sig.trigger:
+            rows.append(f"<p style='color:#facc15'><b>Podmínka vstupu:</b> {e(sig.trigger)}</p>")
+        rows.append("<p>Ceny jsou z datového zdroje (podkladové / spotové ceny). Kotace CFD v Trading 212 se může "
+                    "lišit o spread a přirážku – vstup zkontrolujte v platformě.</p>")
+    elif sig.plan == m15.INVALID:
+        rows.append(f"<p style='color:#fca5a5'><b>Plán NEPLATNÝ:</b> {e(sig.note)}</p>")
     if sig.factors:
         rows.append(f"<p><b>Směr z uzavřených 15m svíček</b> – skóre {sig.score:+.2f} (hranice ±{m15.THRESHOLD}), "
                     f"dostupnost indikátorů {sig.quality:.0%}</p><table>")
@@ -1183,6 +1224,12 @@ def detail_extra(r: Result, ocr_ms: float | None) -> str:
 
 
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] in ("--selftest", "--selftest-verify"):   # v2.9 packaged self-test
+        from pathlib import Path as _P
+
+        from . import selftest
+        fn = selftest.run if sys.argv[1] == "--selftest" else selftest.verify
+        os._exit(fn(_P(sys.argv[2])))
     app = QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setStyleSheet(STYLE)

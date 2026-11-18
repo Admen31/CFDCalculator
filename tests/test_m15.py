@@ -13,7 +13,11 @@ from cfdcalc.instruments import BY_SYMBOL, CATALOG
 
 EUR, GOLD, SILVER = BY_SYMBOL["EUR/USD"], BY_SYMBOL["XAU/USD"], BY_SYMBOL["XAG/USD"]
 BTC = BY_SYMBOL["BTC/USD"]
-CONFIRMED_BUY, CONFIRMED_SELL, DIRECTION_ONLY = 44, 14, 3     # seeds of walk() (see test_seeds_are_what_they_say)
+# seeds of walk() (see test_seeds_are_what_they_say)
+CONFIRMED_BUY, CONFIRMED_SELL = 44, 99          # confirmed for EUR/USD and for XAU/USD (base 2000)
+CONDITIONAL_BUY_STOP, CONDITIONAL_SELL_STOP, CONDITIONAL_BUY_LIMIT, CONDITIONAL_SELL_LIMIT = 3, 0, 26, 28
+INVALID_SELL = 1
+DIRECTION_ONLY = CONDITIONAL_BUY_STOP
 
 
 def walk(now, n=400, seed=1, drift=0.0, vol=0.0008, base=1.1, minutes=15):
@@ -37,26 +41,53 @@ def sig(seed, inst=EUR, spread=0.00008, now=T0, events=(), **kw):
 
 
 def test_seeds_are_what_they_say():
-    b, s, d = sig(CONFIRMED_BUY), sig(CONFIRMED_SELL), sig(DIRECTION_ONLY)
-    assert (b.side, b.confirmed) == ("BUY", True)
-    assert (s.side, s.confirmed) == ("SELL", True)
-    assert d.side in ("BUY", "SELL") and not d.confirmed
+    for seed, side, plan, kind in ((CONFIRMED_BUY, "BUY", m15.CONFIRMED, m15.MARKET),
+                                   (CONFIRMED_SELL, "SELL", m15.CONFIRMED, m15.MARKET),
+                                   (CONDITIONAL_BUY_STOP, "BUY", m15.CONDITIONAL, m15.STOP_ENTRY),
+                                   (CONDITIONAL_SELL_STOP, "SELL", m15.CONDITIONAL, m15.STOP_ENTRY),
+                                   (CONDITIONAL_BUY_LIMIT, "BUY", m15.CONDITIONAL, m15.LIMIT_ENTRY),
+                                   (CONDITIONAL_SELL_LIMIT, "SELL", m15.CONDITIONAL, m15.LIMIT_ENTRY)):
+        r = sig(seed)
+        assert (r.side, r.plan, r.entry_kind) == (side, plan, kind), seed
+    bad = sig(INVALID_SELL)
+    assert (bad.side, bad.plan) == ("SELL", m15.INVALID) and bad.entry is None and "příliš daleko" in bad.note
+
+
+def test_every_plan_has_ordered_decimal_levels_on_the_tick_grid_and_2r():
+    """Scenarios C/D/E: every BUY / SELL plan (confirmed or conditional) on 300 random 15m markets."""
+    n = 0
+    for seed in range(300):
+        r = sig(seed)
+        if not r.levels_ok:
+            assert r.entry is r.sl is r.tp is None
+            continue
+        n += 1
+        assert all(isinstance(v, Decimal) and v.as_tuple().exponent == -EUR.decimals for v in (r.entry, r.sl, r.tp))
+        assert (r.sl < r.entry < r.tp) if r.side == "BUY" else (r.tp < r.entry < r.sl)
+        risk_, reward = abs(r.entry - r.sl), abs(r.tp - r.entry)
+        assert risk_ >= 3 * Decimal("0.00001") and 1.9 <= float(reward / risk_) <= 2.0
+        atr = r.values["atr"]
+        assert m15.SL_MIN_ATR * atr * 0.99 <= float(risk_) <= m15.SL_MAX_ATR * atr * 1.01   # ATR-scaled, no fixed %
+        if r.plan == m15.CONDITIONAL:
+            assert r.trigger and "zatím nenastal" in r.note and not r.confirmed
+        else:
+            assert r.confirmed and r.entry_kind == m15.MARKET and float(r.entry) == round(r.price, 5)
+    assert n > 150
 
 
 def test_confirmed_levels_are_decimal_on_the_right_side_and_2r():
     for seed, side in ((CONFIRMED_BUY, "BUY"), (CONFIRMED_SELL, "SELL")):
         r = sig(seed)
-        assert r.levels_ok and all(isinstance(x, Decimal) for x in (r.entry, r.sl, r.tp))
+        assert r.levels_ok and r.confirmed and all(isinstance(x, Decimal) for x in (r.entry, r.sl, r.tp))
         assert (r.sl < r.entry < r.tp) if side == "BUY" else (r.tp < r.entry < r.sl)
-        assert abs(abs(r.tp - r.entry) / abs(r.entry - r.sl) - 2) < Decimal("0.01")
-        assert r.entry.as_tuple().exponent == -EUR.decimals
         assert r.live and r.price_time == T0                     # newest price = the forming bar of the request
+        assert r.forming == m15.period_start(T0) and r.data_time == m15.period_start(T0)
 
 
-def test_direction_only_never_has_levels():
-    r = sig(DIRECTION_ONLY)
-    assert r.entry is r.sl is r.tp is None and "ne obchodní pokyn" in r.note
-    assert "nesplněna podmínka" in r.summary
+def test_conditional_plans_say_what_must_happen():
+    stop, limit = sig(CONDITIONAL_SELL_STOP), sig(CONDITIONAL_BUY_LIMIT)
+    assert "průrazu pod" in stop.trigger and float(stop.entry) < stop.price         # sell stop below the price
+    assert "EMA 20" in limit.trigger and float(limit.entry) < limit.price           # buy limit below the price
 
 
 def test_only_15m_bars_are_used_and_direction_ignores_the_forming_bar():
@@ -86,16 +117,22 @@ def test_no_data_cases():
     assert closed.side == "NO DATA" and "zavřen" in closed.summary
 
 
-def test_entry_checks_block_levels():
+def test_plan_states_for_spread_calendar_news_and_reference():
     no_spread = sig(CONFIRMED_BUY, spread=0)
-    assert not no_spread.confirmed and "spread" in no_spread.summary
+    assert no_spread.plan == m15.CONDITIONAL and "spread" in no_spread.trigger and no_spread.levels_ok
+    # v2.9: an unavailable calendar never hides the plan (it was the cause of "SELL + four dashes"); it is reported
     no_calendar = m15.evaluate(EUR, walk(T0, seed=CONFIRMED_BUY), T0, 0.00008, T0, events=None)
-    assert not no_calendar.confirmed and "kalendář" in no_calendar.summary
+    assert no_calendar.plan == m15.CONFIRMED and any("NEBYLY" in c[2] for c in no_calendar.checks)
     from cfdcalc.calendar import Event
     news = Event(T0 + timedelta(minutes=20), "USD", "Non-Farm Payrolls", "High")
-    assert not sig(CONFIRMED_BUY, events=[news]).confirmed
+    n = sig(CONFIRMED_BUY, events=[news])
+    assert n.plan == m15.CONDITIONAL and "zprávy" in n.trigger and n.levels_ok
     ref = m15.evaluate(EUR, walk(T0, seed=CONFIRMED_BUY), T0, 0.00008, T0, events=[], reference="ETF")
-    assert ref.side == "BUY" and not ref.confirmed and ref.entry is None
+    assert ref.side == "BUY" and ref.plan == m15.INVALID and ref.entry is None and "referenčního" in ref.note
+    late = T0.replace(hour=19, minute=45)
+    assert m15.evaluate(EUR, walk(late, seed=CONFIRMED_BUY), late, 0.00008, late, events=[]).plan == m15.INVALID
+    wide = sig(CONFIRMED_BUY, spread=0.01)
+    assert wide.plan == m15.INVALID and wide.entry is None
 
 
 def test_old_price_is_not_live():

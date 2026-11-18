@@ -111,3 +111,92 @@ def test_screen_without_a_known_instrument_is_not_guessed(app):
     rgb = render("Portfolio", "Overview", "0.00", "0.00", watch=[], name="noinstrument")
     rec = locate(ocr_boxes(rgb))
     assert not rec.confident and rec.best is None
+
+
+# ---------------------------------------------------------------- v2.9: several instrument tabs open in Trading 212
+
+TABS = ["Silver", "NVIDIA", "Gold", "EUR/USD"]
+WATCH = [("Silver", "51.84"), ("NVIDIA", "182.40"), ("Gold", "4,083.45"), ("EUR/USD", "1.15242"),
+         ("GBP/USD", "1.31842")]
+
+
+def render_t212(active, tabs=TABS, scale=1.0, header=None, mark="background", watch=WATCH, name="t212"):
+    """Representative Trading 212 web screen (NOT a real screenshot): a row of instrument tabs at the top (the
+    active one marked by `mark`: background | text | none), a watchlist on the left with the same instruments,
+    the chart area with SELL / BUY buttons and prices, optionally a chart header with the instrument name."""
+    w, h = int(1280 * scale), int(720 * scale)
+    img = Image.new("RGB", (w, h), "#101319")
+    d = ImageDraw.Draw(img)
+    s = scale
+
+    def text(x, y, t, size, color="#e6e6e6", bold=False):
+        d.text((x * s, y * s), t, fill=color, font=font(int(size * s), bold))
+
+    d.rectangle([0, 0, w, int(48 * s)], fill="#161a22")                       # tab bar
+    x = 250
+    for t in tabs:
+        on = t == active
+        if on and mark == "background":
+            d.rectangle([int((x - 14) * s), int(6 * s), int((x + 118) * s), int(44 * s)], fill="#2e3a52")
+        if on and mark == "text":
+            d.rectangle([int((x - 14) * s), int(42 * s), int((x + 118) * s), int(45 * s)], fill="#3b82f6")
+        color = "#ffffff" if on and mark != "none" else "#8b93a1"
+        if mark == "background":
+            color = "#ffffff" if on else "#c9ced6"
+        text(x, 14, t, 15, color, bold=on and mark == "text")
+        x += 150
+    text(16, 60, "Watchlist", 12, "#8b93a1")
+    for i, (n, px) in enumerate(watch):
+        text(16, 92 + 36 * i, n, 13)
+        text(150, 92 + 36 * i, px, 13, "#8b93a1")
+    if header:
+        text(260, 70, header, 24, bold=True)
+        text(260, 104, "15m · Trading 212 CFD", 12, "#8b93a1")
+    d.rectangle([int(260 * s), int(140 * s), int(380 * s), int(196 * s)], fill="#3b1d22")
+    d.rectangle([int(392 * s), int(140 * s), int(512 * s), int(196 * s)], fill="#16341f")
+    text(272, 146, "SELL", 13, "#f87171", True)
+    text(272, 166, "1.15234" if "EUR" in (active or "") else "4,083.10", 16, "#f87171", True)
+    text(404, 146, "BUY", 13, "#4ade80", True)
+    text(404, 166, "1.15242" if "EUR" in (active or "") else "4,083.45", 16, "#4ade80", True)
+    for i in range(6):                                                         # chart grid labels (numbers)
+        text(1180, 220 + 70 * i, f"{1.1530 - 0.0005 * i:.4f}", 11, "#5b6270")
+    img.save(OUT / f"{name}_{int(scale * 100)}.png")
+    return np.asarray(img).copy()
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.25, 1.5, 2.0])
+def test_active_eurusd_among_silver_nvidia_gold_tabs(app, scale):
+    """Scenario A (representative image): Silver, NVIDIA, Gold and EUR/USD open, EUR/USD active -> EUR/USD."""
+    rec = locate(ocr_boxes(render_t212("EUR/USD", scale=scale, name="tabs_eurusd_active")))
+    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason, rec.text[:300])
+    assert rec.via == "aktivní záložka"
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.5])
+def test_active_tab_marked_only_by_text_colour_and_underline(app, scale):
+    rec = locate(ocr_boxes(render_t212("EUR/USD", scale=scale, mark="text", name="tabs_text_marked")))
+    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason)
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.5])
+def test_chart_header_wins_over_tabs(app, scale):
+    rec = locate(ocr_boxes(render_t212("EUR/USD", scale=scale, header="EUR/USD", name="tabs_header")))
+    assert rec.confident and rec.best.symbol == "EUR/USD" and rec.via in ("graf / nadpis", "obchodní panel")
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.25])
+def test_switch_to_gold_is_recognised(app, scale):
+    """Scenario B (representative image): the user clicks the Gold tab -> XAU/USD."""
+    rec = locate(ocr_boxes(render_t212("Gold", scale=scale, name="tabs_gold_active")))
+    assert rec.confident and rec.best.symbol == "XAU/USD", (rec.via, rec.reason)
+
+
+def test_two_tabs_only(app):
+    rec = locate(ocr_boxes(render_t212("EUR/USD", tabs=["Silver", "EUR/USD"], name="two_tabs")))
+    assert rec.confident and rec.best.symbol == "EUR/USD", (rec.via, rec.reason)
+
+
+def test_tabs_without_any_visible_mark_are_not_guessed(app):
+    rec = locate(ocr_boxes(render_t212("EUR/USD", mark="none", name="tabs_unmarked")))
+    assert not rec.confident and rec.best is None
+    assert {i.symbol for i in rec.competing} >= {"EUR/USD", "XAU/USD"}       # offered for the manual choice

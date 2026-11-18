@@ -90,7 +90,9 @@ class Stats:
     confirmed: int = 0
     dir_hits: int = 0
     dir_n: int = 0
-    trades: list = field(default_factory=list)    # (gross R, after spread R, net R, outcome)
+    trades: list = field(default_factory=list)    # (gross R, after spread R, net R, outcome, plan)
+    conditional: int = 0
+    unfilled: int = 0
 
     def add(self, other: "Stats"):
         for k, v in other.counts.items():
@@ -99,6 +101,8 @@ class Stats:
         self.dir_hits += other.dir_hits
         self.dir_n += other.dir_n
         self.trades += other.trades
+        self.conditional += other.conditional
+        self.unfilled += other.unfilled
 
 
 def simulate(sym: str, bars: list[Bar]) -> tuple[Stats, Stats, str]:
@@ -124,17 +128,39 @@ def simulate(sym: str, bars: list[Bar]) -> tuple[Stats, Stats, str]:
                 st.dir_hits += (fut > price) == (sig.side == "BUY")
         if not sig.levels_ok:
             continue
-        st.confirmed += 1
+        if sig.confirmed:
+            st.confirmed += 1
+        else:
+            st.conditional += 1
         if i <= busy_until:
             continue
         sign = 1 if sig.side == "BUY" else -1
         entry, sl, tp = float(sig.entry), float(sig.sl), float(sig.tp)
-        risk = abs(entry - sl)
-        end, _ = market_end(inst, now, DEFAULTS)
-        exit_px, outcome, j = None, "time", i
-        for j in range(i + 1, min(len(bars), i + 1 + MAX_HOLD)):
+        start = i
+        if not sig.confirmed:                     # stop / limit order valid for the next 4 bars (1 h)
+            fill = None
+            for k in range(i + 1, min(len(bars), i + 1 + HORIZON)):
+                x = bars[k]
+                if sig.entry_kind == m15.STOP_ENTRY:
+                    hit = x.h >= entry if sign > 0 else x.l <= entry
+                    px = max(entry, x.o) if sign > 0 else min(entry, x.o)       # a gap fills worse
+                else:
+                    hit = x.l <= entry if sign > 0 else x.h >= entry
+                    px = entry
+                if hit:
+                    fill = (k, px)
+                    break
+            if fill is None:
+                st.unfilled += 1
+                continue
+            start, entry = fill[0] - 1, fill[1]
+            # the bar of the fill itself may already reach the SL (pessimistic: checked below from the fill bar)
+        risk = abs(float(sig.entry) - sl)
+        end, _ = market_end(inst, bars[start].t + m15.STEP, DEFAULTS)
+        exit_px, outcome, j = None, "time", start
+        for j in range(start + 1, min(len(bars), start + 1 + MAX_HOLD)):
             x = bars[j]
-            if x.t + m15.STEP > end:
+            if end is None or x.t + m15.STEP > end:
                 exit_px, outcome = x.o, "večer"
                 break
             hit_sl = (x.l <= sl) if sign == 1 else (x.h >= sl)
@@ -151,15 +177,16 @@ def simulate(sym: str, bars: list[Bar]) -> tuple[Stats, Stats, str]:
         gross = sign * (exit_px - entry) / risk
         after_spread = gross - spread / risk
         net = after_spread - EXTRA * spread / risk
-        st.trades.append((gross, after_spread, net, outcome))
+        st.trades.append((gross, after_spread, net, outcome, "potvrzený" if sig.confirmed else "podmíněný"))
     note = f"{len(bars)} svíček {bars[0].t:%d.%m.}–{bars[-1].t:%d.%m.%Y}, výpočet {time.monotonic() - t0:.0f} s"
     return parts[0], parts[1], note
 
 
-def summary(st: Stats) -> dict:
+def summary(st: Stats, plan: str | None = None) -> dict:
     n = sum(st.counts.values())
-    tr = st.trades
-    out = {"decisions": n, **st.counts, "confirmed": st.confirmed,
+    tr = [t for t in st.trades if plan is None or t[4] == plan]
+    out = {"decisions": n, **st.counts, "confirmed": st.confirmed, "conditional": st.conditional,
+           "unfilled": st.unfilled,
            "dir_acc": (st.dir_hits / st.dir_n) if st.dir_n else None, "dir_n": st.dir_n, "trades": len(tr)}
     for k, name in ((0, "gross"), (1, "spread"), (2, "net")):
         rs = [t[k] for t in tr]
@@ -190,10 +217,12 @@ def table(rows: list[tuple[str, str, dict]]) -> list[str]:
            "obchody | TP / SL | výhry (po nákladech) | Ø zisk R | Ø ztráta R | PF hrubě | PF po spreadu | "
            "PF po nákladech | součet R po nákladech | max DD R |",
            "|" + "---|" * 18]
+    out[0] = out[0].replace("| potvrzené vstupy |", "| plány potvrzené / podmíněné (nevyplněné) |")
     for name, part, s in rows:
         n = s["net"]
         out.append(f"| {name} | {part} | {s['BUY']} | {s['SELL']} | {s['NEUTRAL']} | {s['NO DATA']} | "
-                   f"{s['confirmed']} | {f(s['dir_acc'], True)} (n={s['dir_n']}) | {s['trades']} | "
+                   f"{s['confirmed']} / {s['conditional']} ({s['unfilled']}) | {f(s['dir_acc'], True)} "
+                   f"(n={s['dir_n']}) | {s['trades']} | "
                    f"{s['tp']} / {s['sl']} | {f(n['win'], True)} | {f(n['avg_win'])} | {f(n['avg_loss'])} | "
                    f"{f(s['gross']['pf'])} | {f(s['spread']['pf'])} | {f(n['pf'])} | {f(n['sum'], d=1)} | "
                    f"{f(n['dd'], d=1)} |")
@@ -224,13 +253,18 @@ def main():
         rows += [(sym, "vývoj 60 %", summary(dev)), (sym, "test 40 %", summary(test))]
         print(f"{sym}: hotovo ({note})", flush=True)
     rows += [("CELKEM", "vývoj 60 %", summary(total[0])), ("CELKEM", "test 40 % (out-of-sample)", summary(total[1]))]
+    for plan in ("potvrzený", "podmíněný"):
+        rows += [(f"CELKEM jen {plan}", "vývoj 60 %", summary(total[0], plan)),
+                 (f"CELKEM jen {plan}", "test 40 % (out-of-sample)", summary(total[1], plan))]
     src = "syntetická data (kontrola skriptu)" if a.synthetic else "Yahoo Finance 15m, posledních ~60 dní"
     lines = [f"# Historické ověření M15 strategie v2.8 ({src}, {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC)",
              "",
              "Pravidla jsou pevně v kódu (`cfdcalc.m15`), na těchto datech se nic neladilo. Rozhodnutí v každé "
              "uzavřené 15m svíčce jen z dat, která byla v tu chvíli uzavřená. Bez historického filtru zpráv. "
-             "Obchod: vstup na close rozhodovací svíčky se zaplaceným spreadem, SL 1,5× ATR, TP 2R, jen intradenně, "
-             "SL i TP v jedné svíčce = SL. Náklady navíc 0,5× spread. Data nejsou ceny CFD Trading 212.",
+             "Plán v2.9: POTVRZENÝ = vstup na close rozhodovací svíčky; PODMÍNĚNÝ = stop / limit pokyn platný 4 "
+             "svíčky (1 h), vyplní se jen při skutečném dotyku hladiny (gap = horší cena). SL za M15 swingem v "
+             "rozmezí 1–3× ATR, TP 2R, jen intradenně, SL i TP v jedné svíčce = SL. Spread placen při vstupu, "
+             "náklady navíc 0,5× spread. Data nejsou ceny CFD Trading 212.",
              "", *table(rows), "", "Data:", *notes, "",
              "**Krátký vzorek – výsledky jsou orientační, nejsou důkazem ziskovosti ani její absence.**"]
     text = "\n".join(lines)

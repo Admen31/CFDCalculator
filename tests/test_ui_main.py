@@ -14,7 +14,7 @@ pytest.importorskip("PySide6.QtCore")
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QLabel, QPushButton  # noqa: E402
-from test_m15 import CONFIRMED_BUY, CONFIRMED_SELL, DIRECTION_ONLY, walk  # noqa: E402
+from test_m15 import CONDITIONAL_SELL_STOP, CONFIRMED_BUY, CONFIRMED_SELL, INVALID_SELL, walk  # noqa: E402
 from test_ui_auto import Reader, settle  # noqa: E402
 from test_ui_smooth import app, make  # noqa: E402,F401
 
@@ -22,7 +22,8 @@ from cfdcalc.data import DataError  # noqa: E402
 from cfdcalc.instruments import BY_SYMBOL  # noqa: E402
 
 BASE = {"XAU/USD": 2000.0, "EUR/USD": 1.1}
-SEEDS = {"up": CONFIRMED_BUY, "down": CONFIRMED_SELL, "direction": DIRECTION_ONLY, "flat": 2}
+SEEDS = {"up": CONFIRMED_BUY, "down": CONFIRMED_SELL, "conditional": CONDITIONAL_SELL_STOP, "invalid": INVALID_SELL,
+         "flat": 2}
 
 
 class Script:
@@ -137,11 +138,20 @@ def test_repeated_click_without_new_data_is_instant_and_identical(app, live):  #
     assert script.calls == n + 1
 
 
-def test_direction_only_and_neutral_never_show_levels(app, live):  # noqa: F811
+def test_conditional_plan_shows_its_levels_marked_and_invalid_plan_and_neutral_show_none(app, live):  # noqa: F811
+    """Scenario E + the v2.9 fix of "SELL and four dashes"."""
     w, script, clock = live
-    new_market(w, script, clock, "direction")
+    setup_portfolio(w)
+    new_market(w, script, clock, "conditional")
+    state, (entry, tp, sl, pos) = click(app, w)
+    sig = w.m15_last["XAU/USD"]
+    assert state == "SELL" and sig.plan == "PODMÍNĚNÝ" and "(podmíněný – stop)" in entry
+    assert float(tp) < float(entry.split()[0]) < float(sl) and pos.endswith("(množství T212)")
+    assert "PODMÍNĚNÝ plán – vstup zatím nenastal" in w.info.text() and "Podmínka vstupu" in w.m15_text.toHtml()
+    new_market(w, script, clock, "invalid")
     state, vals = click(app, w)
-    assert state in ("BUY", "SELL") and vals == ["–", "–", "–", "–"] and "vstup nepotvrzen" in w.info.text()
+    assert state == "SELL" and vals == ["–", "–", "–", "–"] and "plán neplatný" in w.info.text()
+    assert "Plán NEPLATNÝ" in w.m15_text.toHtml()
     new_market(w, script, clock, "flat")
     state, vals = click(app, w)
     assert state == "NEUTRAL" and vals == ["–", "–", "–", "–"]
@@ -231,7 +241,7 @@ def test_position_on_the_main_screen_from_the_risk_calculation(app, live):  # no
     setup_portfolio(w)
     state, (entry, _tp, sl, pos) = click(app, w)
     out = w.risk_page.last
-    assert state == "BUY" and out.state == risk.OK and pos == f"{risk.fmt_qty(out.qty)} ks"
+    assert state == "BUY" and out.state == risk.OK and pos == f"{risk.fmt_qty(out.qty)} (množství T212)"
     unit = (abs(D(entry) - D(sl)) + D(str(w.spread_of(w.inst)))) * D(21)
     assert out.loss_sl <= D(2000) and out.qty == risk.floor_step(D(2000) / unit, D("0.01"))
 
@@ -240,7 +250,8 @@ def test_position_cannot_be_computed_without_a_spec_and_too_risky_minimum(app, l
     w, script, clock = live
     setup_portfolio(w, contract="")
     state, vals = click(app, w)
-    assert state == "BUY" and vals[3] == "NELZE SPOČÍTAT" and "specifikace" in w.risk_page.message.text()
+    assert state == "BUY" and vals[3] == "NELZE SPOČÍTAT (chybí specifikace)"
+    assert "specifikace" in w.risk_page.message.text()
     setup_portfolio(w, min_qty="1000", step="1")
     w.risk_page.recompute()
     app.processEvents()
@@ -275,3 +286,21 @@ def test_portfolio_tab_saves_locally(app, live):  # noqa: F811
     assert (str(acc.equity), acc.currency, str(acc.open_risk), str(acc.max_total_pct)) == ("100000", "EUR", "500", "5")
     p.equity.setText("abc")
     assert not p.save() and "kladné číslo" in p.status.text()
+
+
+def test_spec_typed_in_the_portfolio_tab_makes_the_position_available(app, live):  # noqa: F811
+    """v2.9: the CFD specification of the current instrument is typed directly in Portfolio a riziko."""
+    w, script, clock = live
+    setup_portfolio(w, contract="")
+    state, vals = click(app, w)
+    assert vals[3] == "NELZE SPOČÍTAT (chybí specifikace)"
+    w.to_portfolio.click()
+    app.processEvents()
+    f = w.portfolio.spec
+    assert f.inst.symbol == "XAU/USD" and f.isEnabled()
+    f.edits["contract"].setText("1")
+    assert "1 000 × 1" in f.check.text()                       # how to verify the unit against Trading 212
+    assert f.save()
+    for _ in range(10):
+        app.processEvents()
+    assert values(w)[3].endswith("(množství T212)")

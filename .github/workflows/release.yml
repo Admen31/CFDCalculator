@@ -52,6 +52,16 @@ jobs:
           mkdir -p "pkg/CFD Signal Calculator"
           gh run download "$RUN_ID" -R "$REPO" -n cfd-signal-calculator-windows -D "pkg/CFD Signal Calculator"
 
+      - name: Self-test report of the same build (screenshots + report.json, if the build produced one)
+        run: |
+          set -euo pipefail
+          if gh run download "$RUN_ID" -R "$REPO" -n selftest -D selftest 2>/dev/null; then
+            (cd selftest && zip -q -9 "../selftest-v${VERSION}.zip" ./*)
+            echo "EXTRA=selftest-v${VERSION}.zip" >> "$GITHUB_ENV"
+          else
+            echo "EXTRA=" >> "$GITHUB_ENV"
+          fi
+
       - name: Verify the Windows EXE
         run: |
           set -euo pipefail
@@ -101,10 +111,10 @@ jobs:
           SHA-256: \`$(cut -d' ' -f1 "$ZIP.sha256")\`
           EOF
           if gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
-            gh release upload "$tag" "$ZIP" "$ZIP.sha256" -R "$REPO" --clobber
+            gh release upload "$tag" "$ZIP" "$ZIP.sha256" $EXTRA -R "$REPO" --clobber
             gh release edit "$tag" -R "$REPO" --title "CFD Signal Calculator v${VERSION}" --notes-file notes.md --latest
           else
-            gh release create "$tag" "$ZIP" "$ZIP.sha256" -R "$REPO" --target "$SHA" \
+            gh release create "$tag" "$ZIP" "$ZIP.sha256" $EXTRA -R "$REPO" --target "$SHA" \
               --title "CFD Signal Calculator v${VERSION}" --notes-file notes.md --latest
           fi
           echo "Download: https://github.com/${REPO}/releases/download/${tag}/${ZIP}" | tee -a "$GITHUB_STEP_SUMMARY"

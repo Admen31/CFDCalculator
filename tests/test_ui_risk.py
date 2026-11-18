@@ -30,8 +30,8 @@ def m15_signal(verdict):
     now = datetime.now(timezone.utc)
     if verdict in (BUY, SELL):
         sign = 1 if verdict == BUY else -1
-        return m15.Signal(side=verdict, confirmed=True, entry=D("100"), sl=D(100 - sign), tp=D(100 + 2 * sign),
-                          price_time=now, data_time=now, summary="test")
+        return m15.Signal(side=verdict, confirmed=True, plan=m15.CONFIRMED, entry=D("100"), sl=D(100 - sign),
+                          tp=D(100 + 2 * sign), price_time=now, data_time=now, summary="test")
     side = {WAIT: "NEUTRAL", NO_DATA: "NO DATA", ERROR: "NO DATA"}[verdict]
     return m15.Signal(side=side, summary="test", note="test")
 
@@ -63,7 +63,8 @@ def test_confirmed_buy_is_sized_and_shown_on_the_card(app, make, monkeypatch):  
     out = page.last
     assert out.state == risk.OK and out.qty == risk.floor_step(D(1000) / D("1.35"), D("0.01"))
     assert page.entry.text() == "100.00" and page.sl.text() == "99.00" and page.tp.text() == "102.00"
-    assert out.margin == out.notional * D("0.05") and w.pos_lbl.text() == f"POZICE: {risk.fmt_qty(out.qty)} ks"
+    assert out.margin == out.notional * D("0.05")
+    assert w.pos_lbl.text() == f"POZICE: {risk.fmt_qty(out.qty)} (množství T212)"
     assert "V RÁMCI LIMITU" in page.state.text() and "MAX. MNOŽSTVÍ" in page.qty.text()
 
 

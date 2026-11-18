@@ -73,7 +73,8 @@ def test_v28_no_region_finds_the_instrument_header_in_the_whole_window():
     b = backend([W])
     boxes = Boxes(("Gold", 30), ("XAU/USD", 14), ("EUR/USD", 13), ("SELL", 16), ("4,083.10", 16), ("BUY", 16))
     r = auto.read(None, b, OCR(), boxes)
-    assert r.status == auto.OK and r.recognition.best.symbol == "XAU/USD" and r.recognition.via == "celé okno"
+    assert r.status == auto.OK and r.recognition.best.symbol == "XAU/USD"
+    assert r.recognition.via in ("graf / nadpis", "obchodní panel")
     assert b.calls == [(W.left, W.top, W.width, W.height)]
 
 

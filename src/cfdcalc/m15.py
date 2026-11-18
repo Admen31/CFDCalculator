@@ -54,6 +54,11 @@ MAX_STRETCH_ATR = 1.0
 MIN_ROOM_R = 1.0
 
 BUY, SELL, NEUTRAL, NO_DATA = "BUY", "SELL", "NEUTRAL", "NO DATA"
+CONFIRMED, CONDITIONAL, INVALID = "POTVRZENÝ", "PODMÍNĚNÝ", "NEPLATNÝ"      # v2.9 trade plan states
+MARKET, LIMIT_ENTRY, STOP_ENTRY = "trh", "limit", "stop"
+SL_MIN_ATR, SL_MAX_ATR, SL_BUFFER_ATR = 1.0, 3.0, 0.2
+MAX_TRIGGER_ATR = 2.0          # a conditional entry further than this from the price is not a plan for today
+MAX_SPREAD_PLAN = 0.25         # spread above this share of the SL distance -> plan invalid
 WEIGHTS = {"ema200": 1.5, "ema_stack": 1.0, "slope": 0.75, "macd": 1.0, "rsi": 0.75, "structure": 1.0}
 NAMES = {"ema200": "Cena vs EMA 200", "ema_stack": "EMA 20 vs EMA 50", "slope": "Sklon EMA 50 (8 svíček)",
          "macd": "MACD histogram", "rsi": "RSI 14", "structure": "Struktura swingů"}
@@ -98,7 +103,10 @@ def compute(bars: list[Bar]) -> dict:
     atr = ind.atr(h, lo, c)
     tail = bars[-120:]
     res, sup = ind.pivots([b.h for b in tail], [b.l for b in tail], 3)
-    return {"close": c[-1], "ema20": e20[-1], "ema50": e50[-1], "ema200": e200[-1],
+    last10, last8 = bars[-10:], bars[-8:]
+    return {"recent_high": max(b.h for b in last10), "recent_low": min(b.l for b in last10),
+            "range_high": max(b.h for b in last8), "range_low": min(b.l for b in last8),
+            "close": c[-1], "ema20": e20[-1], "ema50": e50[-1], "ema200": e200[-1],
             "ema50_prev": e50[-9] if len(e50) >= 9 else None, "rsi": rsi[-1], "macd": line[-1],
             "macd_signal": signal[-1], "hist": hist[-1], "atr": atr[-1], "highs": res, "lows": sup}
 
@@ -160,8 +168,13 @@ def direction(fs: list[Factor], threshold: float = THRESHOLD) -> tuple[str, floa
 
 @dataclass
 class Signal:
-    side: str = NO_DATA
-    confirmed: bool = False
+    side: str = NO_DATA                    # A. MARKET DIRECTION
+    confirmed: bool = False                # plan == POTVRZENÝ (entry now)
+    plan: str = ""                         # B. TRADE PLAN: POTVRZENÝ | PODMÍNĚNÝ | NEPLATNÝ ("" = no direction)
+    entry_kind: str = ""                   # trh (now) | limit (pullback) | stop (breakout)
+    trigger: str = ""                      # the condition of a conditional plan, in words
+    rr: float | None = None
+    forming: datetime | None = None        # open time of the still forming 15m bar (never used for direction)
     entry: Decimal | None = None
     tp: Decimal | None = None
     sl: Decimal | None = None
@@ -187,7 +200,8 @@ class Signal:
 
     @property
     def levels_ok(self) -> bool:
-        return self.confirmed and None not in (self.entry, self.tp, self.sl)
+        """A trade plan with all prices (confirmed now, or conditional with its trigger)."""
+        return self.plan in (CONFIRMED, CONDITIONAL) and None not in (self.entry, self.tp, self.sl)
 
 
 def _q(x: float, d: int, rounding) -> Decimal:
@@ -218,6 +232,7 @@ def evaluate(inst: Instrument, bars: list[Bar], now: datetime, spread: float, fe
     sig.factors = factors(x)
     sig.side, sig.score, sig.quality = direction(sig.factors, threshold)
     # entry price: the newest one from the request, unless it is old
+    sig.forming = forming.t if forming is not None else None
     if forming is not None and now - fetched <= PRICE_TTL and math.isfinite(forming.c) and forming.c > 0:
         sig.price, sig.price_time, sig.live = forming.c, fetched, True
     else:
@@ -229,66 +244,122 @@ def evaluate(inst: Instrument, bars: list[Bar], now: datetime, spread: float, fe
         sig.summary = f"převaha směru je slabá (skóre {sig.score:+.2f}, hranice ±{threshold:.2f})"
         sig.note = "bez převažujícího směru – vstup, TP a SL se neurčují"
         return sig
-    _confirm(sig, inst, x, now, end, spread, cfg, events)
+    _plan(sig, inst, x, now, end, spread, cfg, events)
     return sig
 
 
-def _confirm(sig: Signal, inst: Instrument, x: dict, now: datetime, end: datetime, spread: float, cfg: Settings,
-             events):
+def _levels(sign: int, entry: float, x: dict, atr: float, spread: float, d: int):
+    """SL behind the recent M15 swing (+0.2 ATR + spread), at least 1 and at most 3 ATR from the entry; TP = 2R.
+    Decimal, SL rounded away from the entry, TP towards it. None when invalid."""
+    swing = x["recent_high"] if sign < 0 else x["recent_low"]
+    struct = abs(swing - entry) + SL_BUFFER_ATR * atr + max(spread, 0.0)
+    if sign * (entry - swing) <= 0:          # entry beyond the swing (breakout): use the ATR distance
+        struct = SL_MIN_ATR * 1.5 * atr
+    dist = min(max(struct, SL_MIN_ATR * atr), SL_MAX_ATR * atr)
+    e = _q(entry, d, ROUND_HALF_EVEN)
+    ef = float(e)
+    if sign > 0:
+        sl, tp = _q(ef - dist, d, ROUND_FLOOR), _q(ef + TP_R * dist, d, ROUND_FLOOR)
+    else:
+        sl, tp = _q(ef + dist, d, ROUND_CEILING), _q(ef - TP_R * dist, d, ROUND_CEILING)
+    tick = Decimal(1).scaleb(-d)
+    if sl <= 0 or tp <= 0 or sign * (e - sl) < 3 * tick or sign * (tp - e) < 3 * tick:
+        return None
+    return e, sl, tp, dist, float(abs(tp - e) / abs(e - sl))
+
+
+def _plan(sig: Signal, inst: Instrument, x: dict, now: datetime, end: datetime, spread: float, cfg: Settings,
+          events):
+    """B. TRADE PLAN for the M15 direction: POTVRZENÝ (entry now), PODMÍNĚNÝ (limit at EMA 20 after a pullback,
+    or stop after a breakout of the recent M15 range, or after a news release) or NEPLATNÝ with the reason."""
     side, sign = sig.side, (1 if sig.side == BUY else -1)
     price, atr, d = sig.price, x["atr"], inst.decimals
     tick = 10 ** -d
-    dist = SL_ATR * atr
     votes = {f.key: f.vote for f in sig.factors}
     checks = sig.checks
-    checks.append(("trend M15", votes.get("ema200") == sign and votes.get("ema_stack") == sign,
-                   "cena vůči EMA 200 i EMA 20/50 ve směru" if votes.get("ema200") == sign
-                   and votes.get("ema_stack") == sign else "EMA 200 nebo EMA 20/50 nesouhlasí se směrem"))
+    spread_known = spread is not None and spread > 0
+    spread = spread if spread_known else 0.0
+
+    def invalid(why: str):
+        sig.plan, sig.note = INVALID, why
+        sig.summary = f"{side} převažuje (směr trhu), obchodní plán NEPLATNÝ – {why}"
+
+    if sig.reference:
+        checks.append(("přesná data instrumentu", False, f"referenční data ({sig.reference})"))
+        return invalid(f"ceny jsou z referenčního produktu {sig.reference}, ne z CFD – vstup, TP ani SL z nich "
+                       "nelze převzít")
+    left = (end - now).total_seconds() / 60
+    checks.append(("čas do večerního limitu", left >= cfg.min_minutes_left,
+                   f"{left:.0f} min (minimum {cfg.min_minutes_left})"))
+    if left < cfg.min_minutes_left:
+        return invalid(f"do večerního limitu zbývá {left:.0f} min – intradenní obchod se už neotevírá")
+    checks.append(("volatilita (ATR) nad tickem", atr >= 3 * tick, f"ATR14 {atr:.{d + 1}f}"))
+    if atr < 3 * tick:
+        return invalid("ATR M15 je menší než 3 ticky – SL by nebyl smysluplný")
+    # immediate-entry conditions
+    trend = votes.get("ema200") == sign and votes.get("ema_stack") == sign
+    checks.append(("trend M15 (EMA 200, EMA 20/50)", trend, "souhlasí se směrem" if trend else
+                   "EMA 200 nebo EMA 20/50 nesouhlasí se směrem"))
     r = x["rsi"]
-    checks.append(("RSI není extrémní", r <= RSI_HIGH if side == BUY else r >= RSI_LOW, f"RSI {r:.1f}"))
+    rsi_ok = r <= RSI_HIGH if side == BUY else r >= RSI_LOW
+    checks.append(("RSI není extrémní", rsi_ok, f"RSI {r:.1f}"))
     stretch = abs(price - x["ema20"]) / atr
-    checks.append(("cena není daleko od EMA 20", stretch <= MAX_STRETCH_ATR, f"{stretch:.2f} × ATR"))
+    stretch_ok = stretch <= MAX_STRETCH_ATR
+    checks.append(("cena do 1× ATR od EMA 20", stretch_ok, f"{stretch:.2f} × ATR"))
     if side == BUY:
         level = min((h for h in x["highs"] if h > price), default=None)
     else:
         level = max((lo for lo in x["lows"] if lo < price), default=None)
-    room = None if level is None else abs(level - price) / dist
-    checks.append(("prostor k nejbližšímu swingu", room is None or room >= MIN_ROOM_R,
+    now_lv = _levels(sign, price, x, atr, spread, d)
+    room = None if level is None or now_lv is None else abs(level - price) / now_lv[3]
+    room_ok = room is None or room >= MIN_ROOM_R
+    checks.append(("prostor ≥ 1R k nejbližšímu swingu", room_ok,
                    "žádný swing v cestě" if room is None else f"{room:.2f} R ({level:.{d}f})"))
-    checks.append(("volatilita (ATR) nad tickem", dist >= 3 * tick, f"ATR14 {atr:.{d + 1}f}"))
-    if spread is None or spread <= 0:
-        checks.append(("spread zadán", False, "zadejte spread z Trading 212 (Podrobnosti)"))
-    else:
-        checks.append(("spread vůči SL", spread <= MAX_SPREAD_OF_SL * dist,
-                       f"spread {spread:g} = {spread / dist:.0%} vzdálenosti SL"))
-    left = (end - now).total_seconds() / 60
-    checks.append(("čas do večerního limitu", left >= cfg.min_minutes_left,
-                   f"{left:.0f} min (minimum {cfg.min_minutes_left})"))
     if events is None:
-        checks.append(("ekonomický kalendář", False, "kalendář zpráv nedostupný – vstup nelze potvrdit"))
+        block = []
+        checks.append(("ekonomický kalendář", True, "kalendář nedostupný – zprávy NEBYLY zkontrolovány, ověřte je"))
     else:
         block, _later = news_window(events, inst.currencies, now, cfg, end)
         checks.append(("ekonomický kalendář", not block, "bez důležitých zpráv" if not block else
                        "zpráva " + ", ".join(f"{e.currency} {e.title} {e.time.astimezone():%H:%M}" for e in block[:2])))
-    checks.append(("přesná data instrumentu", not sig.reference,
-                   "přesný zdroj" if not sig.reference else f"referenční data ({sig.reference})"))
-    failed = [c for c in checks if not c[1]]
-    if failed:
-        sig.summary = (f"{side} převažuje, vstup ale není potvrzen – nesplněna podmínka „{failed[0][0]}“ "
-                       f"({failed[0][2]})")
-        sig.note = "převažující směr, ne obchodní pokyn – vstup nesplňuje podmínky"
-        return
-    entry = _q(price, d, ROUND_HALF_EVEN)
-    e = float(entry)
-    if side == BUY:
-        sl, tp = _q(e - dist, d, ROUND_FLOOR), _q(e + TP_R * dist, d, ROUND_FLOOR)
+    checks.append(("spread zadán", spread_known, f"spread {spread:g}" if spread_known else
+                   "spread není zadán – náklady nezapočteny (Podrobnosti → spread)"))
+    # choose the plan
+    if trend and rsi_ok and stretch_ok and room_ok:
+        kind, entry_px, trig = MARKET, price, ""
+    elif not trend or not room_ok:
+        lvl = (x["range_low"] - 0.1 * atr) if sign < 0 else (x["range_high"] + 0.1 * atr)
+        if level is not None and not room_ok:
+            lvl = (level - 0.1 * atr) if sign < 0 else (level + 0.1 * atr)
+        kind, entry_px = STOP_ENTRY, lvl
+        trig = (f"{side} až po průrazu {'pod' if sign < 0 else 'nad'} {_q(lvl, d, ROUND_HALF_EVEN)} "
+                f"(stop pokyn – vstup při dosažení hladiny)")
     else:
-        sl, tp = _q(e + dist, d, ROUND_CEILING), _q(e - TP_R * dist, d, ROUND_CEILING)
-    if sl <= 0 or tp <= 0 or sign * (entry - sl) <= 0 or sign * (tp - entry) <= 0:
-        sig.summary = sig.note = "TP/SL by byly neplatné"
+        kind, entry_px = LIMIT_ENTRY, x["ema20"]
+        trig = f"{side} až při návratu ceny k EMA 20 = {_q(entry_px, d, ROUND_HALF_EVEN)} (limitní vstup)"
+    if kind != MARKET and sign * (entry_px - price) * (1 if kind == STOP_ENTRY else -1) < 0:
+        return invalid("podmínka vstupu už je za cenou – počkejte na novou M15 svíčku")
+    if abs(entry_px - price) > MAX_TRIGGER_ATR * atr:
+        return invalid(f"vstupní hladina je {abs(entry_px - price) / atr:.1f}× ATR od ceny – příliš daleko")
+    lv = _levels(sign, entry_px, x, atr, spread, d)
+    if lv is None:
+        return invalid("SL nebo TP by byly neplatné (vzdálenost pod 3 ticky nebo cena ≤ 0)")
+    entry, sl, tp, dist, rr = lv
+    if spread_known and spread > MAX_SPREAD_PLAN * dist:
+        return invalid(f"spread {spread:g} je {spread / dist:.0%} vzdálenosti SL (max {MAX_SPREAD_PLAN:.0%})")
+    sig.entry, sig.sl, sig.tp, sig.rr, sig.entry_kind = entry, sl, tp, rr, kind
+    if kind == MARKET and not block and spread_known:
+        sig.plan, sig.confirmed = CONFIRMED, True
+        sig.summary = (f"{side}: POTVRZENÝ plán M15 – vstup nyní {entry}, SL {sl}, TP {tp} (R:R 1:{rr:.1f}, "
+                       f"skóre {sig.score:+.2f})")
         return
-    sig.entry, sig.sl, sig.tp, sig.confirmed = entry, sl, tp, True
-    sig.summary = f"{side}: potvrzený vstup M15 (skóre {sig.score:+.2f}), SL {SL_ATR:g}× ATR, TP {TP_R:g}R"
+    if kind == MARKET:
+        trig = ("až po zveřejnění zprávy " + ", ".join(f"{e.currency} {e.title} {e.time.astimezone():%H:%M}"
+                                                       for e in block[:2])) if block else \
+            "po zadání spreadu (náklady zatím nezapočteny)"
+    sig.plan, sig.trigger = CONDITIONAL, trig
+    sig.note = f"PODMÍNĚNÝ plán – vstup zatím nenastal: {trig}"
+    sig.summary = f"{side}: PODMÍNĚNÝ plán M15 – {trig}; SL {sl}, TP {tp} (R:R 1:{rr:.1f})"
 
 
 # ---------------------------------------------------------------- data: one 15min series per instrument

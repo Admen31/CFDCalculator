@@ -209,28 +209,194 @@ def match(lines: list[str], catalog: tuple[Instrument, ...] = CATALOG) -> Recogn
     return Recognition(best, s1 if best else 0.0, candidates, raw, competing, s1, "oblast")
 
 
-# ---------------------------------------------------------------- whole-window fallback
+# ---------------------------------------------------------------- whole-window / region reading (v2.9)
 
 @dataclass(frozen=True)
 class Box:
+    """One OCR text box with its geometry (pixels of the captured image) and look."""
     text: str
-    height: float            # text height in pixels (font size)
+    height: float                 # text height = font size
     x: float = 0.0
     y: float = 0.0
+    w: float = 0.0
+    bg: float | None = None       # luminance (0-255) around the text = background of a tab / button
+    fg: float | None = None       # luminance of the text itself (bright text on dark, or dark on light)
+
+    @property
+    def cx(self) -> float:
+        return self.x + self.w / 2
+
+    @property
+    def cy(self) -> float:
+        return self.y + self.height / 2
+
+
+def _style(lum, x0: int, y0: int, x1: int, y1: int) -> tuple[float | None, float | None]:
+    """Background (median of a ring around the box) and text luminance (the extreme inside, away from the
+    background) of one box. lum = 2-D luminance array."""
+    h, w = lum.shape
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None, None
+    pad = max(2, (y1 - y0) // 3)
+    ox0, oy0, ox1, oy1 = max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
+    ring = [lum[oy0:y0, ox0:ox1].ravel(), lum[y1:oy1, ox0:ox1].ravel(),
+            lum[y0:y1, ox0:x0].ravel(), lum[y0:y1, x1:ox1].ravel()]
+    import numpy as np
+    ring = np.concatenate([r for r in ring if r.size]) if any(r.size for r in ring) else None
+    inside = lum[y0:y1, x0:x1].ravel()
+    bg = float(np.median(ring)) if ring is not None else float(np.median(inside))
+    lo, hi = float(np.percentile(inside, 3)), float(np.percentile(inside, 97))
+    fg = hi if abs(hi - bg) >= abs(lo - bg) else lo
+    return bg, fg
 
 
 def ocr_boxes(rgb) -> list[Box]:
-    """Text boxes with their height (RapidOCR, offline)."""
+    """Text boxes with geometry and look (RapidOCR, offline)."""
+    import numpy as np
     result, _ = warm_up()(rgb)
+    lum = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
     out = []
     for item in result or []:
         pts, text = item[0], item[1]
         ys, xs = [p[1] for p in pts], [p[0] for p in pts]
-        out.append(Box(text, float(max(ys) - min(ys)), float(min(xs)), float(min(ys))))
+        x0, y0, x1, y1 = int(min(xs)), int(min(ys)), int(max(xs)) + 1, int(max(ys)) + 1
+        bg, fg = _style(lum, x0, y0, x1, y1)
+        out.append(Box(text, float(y1 - y0), float(x0), float(y0), float(x1 - x0), bg, fg))
     return out
 
 
-SAME_SIZE = 0.85      # another instrument written at >= 85 % of the largest height -> ambiguous
+SAME_SIZE = 0.85        # another candidate written at >= 85 % of the largest height is not "clearly larger"
+TRADE_WORDS = {"BUY", "SELL", "KOUPIT", "PRODAT", "NÁKUP", "NAKUP", "PRODEJ"}
+ACTIVE_DIFF = 18.0      # luminance difference that marks the active tab / row against the others
+UNIFORM = 10.0          # the other tabs must look alike (spread of their look below this)
+
+
+@dataclass
+class _Hit:
+    inst: Instrument
+    box: Box
+    score: float
+
+
+def _hits(boxes: list[Box], catalog) -> list[_Hit]:
+    out = []
+    for b in boxes:
+        for line in clean([b.text]):
+            for inst, sc in _exact(line, catalog):
+                out.append(_Hit(inst, b, sc))
+    return out
+
+
+def _collections(hits: list[_Hit]) -> list[list[_Hit]]:
+    """Groups of DIFFERENT instruments written alike in one row (tabs) or one column (watchlist)."""
+    groups: list[list[_Hit]] = []
+    for kind in ("row", "column"):
+        used: set[int] = set()
+        for i, a in enumerate(hits):
+            if i in used:
+                continue
+            g = [a]
+            for j, b in enumerate(hits):
+                if j == i or j in used:
+                    continue
+                hmax = max(a.box.height, b.box.height)
+                alike = min(a.box.height, b.box.height) >= 0.7 * hmax
+                if kind == "row":
+                    near = abs(a.box.cy - b.box.cy) <= 0.6 * hmax
+                else:
+                    near = abs(a.box.x - b.box.x) <= 1.0 * hmax and abs(a.box.cy - b.box.cy) <= 12 * hmax
+                if alike and near:
+                    g.append(b)
+            if len({h.inst for h in g}) >= 2:
+                used.update(hits.index(h) for h in g)
+                groups.append(g)
+    return groups
+
+
+def _look(h: _Hit) -> tuple[float, float] | None:
+    b = h.box
+    return None if b.bg is None or b.fg is None else (b.bg, abs(b.fg - b.bg))
+
+
+def _active(group: list[_Hit], screen_bg: float | None = None) -> _Hit | None:
+    """The one member that LOOKS different (highlighted background or text) while all others look alike.
+    With only two tabs, the active one is the one whose background differs from the screen background."""
+    looks = [_look(h) for h in group]
+    if any(x is None for x in looks) or len(group) < 2:
+        return None
+    if len(group) == 2:
+        if screen_bg is None:
+            return None
+        off = [abs(lk[0] - screen_bg) for lk in looks]
+        i = 0 if off[0] > off[1] else 1
+        return group[i] if off[i] >= ACTIVE_DIFF and off[1 - i] <= UNIFORM else None
+    best = None
+    for i, h in enumerate(group):
+        others = [looks[j] for j in range(len(group)) if j != i]
+        mb = sorted(o[0] for o in others)[len(others) // 2]
+        mc = sorted(o[1] for o in others)[len(others) // 2]
+        spread = max(max(abs(o[0] - mb), abs(o[1] - mc)) for o in others)
+        diff = max(abs(looks[i][0] - mb), abs(looks[i][1] - mc))
+        if diff >= ACTIVE_DIFF and spread <= UNIFORM:
+            if best is not None and best.inst != h.inst:
+                return None          # two different "active" members: no decision
+            best = h
+    return best
+
+
+def _near_trade(h: _Hit, anchors: list[Box]) -> bool:
+    for a in anchors:
+        hmax = max(h.box.height, a.height)
+        if abs(h.box.cy - a.cy) <= 8 * hmax and abs(h.box.cx - a.cx) <= 16 * hmax:
+            return True
+    return False
+
+
+def locate(boxes: list[Box], catalog: tuple[Instrument, ...] = CATALOG) -> Recognition:
+    """Which instrument is ACTIVE in a Trading 212 screen. Hierarchy:
+      1. the name at the SELL / BUY trade panel (one instrument only),
+      2. a stand-alone instrument name (chart header) that is not part of a row of tabs / column of a watchlist,
+         clearly larger than any other stand-alone name,
+      3. the visually marked tab / row of a row of tabs or a watchlist (different background or text),
+      4. other tabs / watchlist rows are only offered as candidates - never counted as equal rivals.
+    Nothing decisive -> not confident (the user picks)."""
+    raw = " | ".join(b.text for b in boxes if b.text.strip())
+    hits = _hits(boxes, catalog)
+    if not hits:
+        return Recognition(None, 0.0, (), raw, via="celé okno")
+    groups = _collections(hits)
+    grouped = {id(h) for g in groups for h in g}
+    alone = [h for h in hits if id(h) not in grouped]
+    order = sorted(hits, key=lambda h: -h.box.height)
+    cands = tuple(dict.fromkeys(h.inst for h in order))[:6]
+
+    def ok(h: _Hit, via: str) -> Recognition:
+        return Recognition(h.inst, h.score, cands, raw, (), h.score, via)
+
+    anchors = [b for b in boxes if any(t.upper().strip(".:") in TRADE_WORDS for t in b.text.split())]
+    near = [h for h in alone if _near_trade(h, anchors)] if 0 < len(anchors) <= 4 else []
+    if near and len({h.inst for h in near}) == 1:          # one trade panel (SELL + BUY), one name at it
+        return ok(max(near, key=lambda h: h.box.height), "obchodní panel")
+    if alone:
+        med = sorted(h.box.height for h in hits)[len(hits) // 2]
+        tabs = max((h.box.height for g in groups for h in g), default=0.0)
+        big = [h for h in alone if h.box.height >= med and h.box.height >= 1.15 * tabs]
+        ranked = sorted(big, key=lambda h: -h.box.height)
+        if ranked:
+            top = ranked[0]
+            rivals = [h for h in ranked[1:] if h.inst != top.inst and h.box.height >= SAME_SIZE * top.box.height]
+            if not rivals:
+                return ok(top, "graf / nadpis")
+    bgs = sorted(b.bg for b in boxes if b.bg is not None)
+    screen_bg = bgs[len(bgs) // 2] if bgs else None
+    actives = [a for a in (_active(g, screen_bg) for g in groups) if a is not None]
+    if len({a.inst for a in actives}) == 1:
+        return ok(actives[0], "aktivní záložka")
+    rivals = tuple(dict.fromkeys(h.inst for h in (actives or order)))
+    top = rivals[0] if rivals else None
+    return Recognition(None, 0.0, cands, raw, rivals if len(rivals) > 1 else (), 0.0 if top is None else 0.95,
+                       "celé okno")
 
 
 def _exact(line: str, catalog) -> list[tuple[Instrument, float]]:
@@ -259,24 +425,3 @@ def _inside(small: Instrument, big: Instrument, line: str) -> bool:
     sw = [_words(a) for a in labels(small) if _contains(lw, _words(a))]
     bw = [_words(a) for a in labels(big) if _contains(lw, _words(a))]
     return bool(sw) and all(any(_contains(b, s) for b in bw) for s in sw)
-
-
-def locate(boxes: list[Box], catalog: tuple[Instrument, ...] = CATALOG) -> Recognition:
-    """The instrument written in the largest font in the window. Never guesses: two different instruments of
-    (almost) the same size, or only small mentions, -> not confident."""
-    raw = " | ".join(b.text for b in boxes if b.text.strip())
-    found: dict[Instrument, tuple[float, float]] = {}       # inst -> (largest height, score)
-    for b in boxes:
-        for line in clean([b.text]):
-            for inst, sc in _exact(line, catalog):
-                h, s0 = found.get(inst, (0.0, 0.0))
-                found[inst] = (max(h, b.height), max(s0, sc))
-    if not found:
-        return Recognition(None, 0.0, (), raw, via="celé okno")
-    ranked = sorted(found.items(), key=lambda kv: -kv[1][0])
-    (top, (h1, s1)) = ranked[0]
-    rivals = tuple(i for i, (h, _) in ranked[1:] if h >= SAME_SIZE * h1)
-    cands = tuple(i for i, _ in ranked[:6])
-    if rivals:
-        return Recognition(None, 0.0, cands, raw, (top, *rivals), s1, "celé okno")
-    return Recognition(top, s1, cands, raw, (), s1, "celé okno")

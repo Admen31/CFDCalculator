@@ -5,7 +5,8 @@ on:
     branches: [main, "v2.0-auto-recognition", "v2.1-signal-and-smooth-ui", "v2.2-research-backtest",
                "v2.2.1-xagusd-data-fix", "v2.3-smart-signals-color-ui",
                "v2.4-risk-position-sizing", "v2.5-multi-provider-market-coverage",
-               "v2.6-instant-market-direction", "v2.6.1-repeatable-start-minimal-ui", "v2.8-m15-trading-ready"]
+               "v2.6-instant-market-direction", "v2.6.1-repeatable-start-minimal-ui", "v2.8-m15-trading-ready",
+               "v2.9-stability-and-trade-plan"]
   pull_request:
   workflow_dispatch:
 
@@ -118,6 +119,34 @@ jobs:
           if ($p.HasExited) { Write-Error "EXE exited early with code $($p.ExitCode)"; exit 1 }
           Write-Output "EXE is running (PID $($p.Id))"
           Stop-Process -Id $p.Id -Force
+      - name: v2.9 self-test of the PACKAGED EXE on the real desktop (scenarios A-J)
+        timeout-minutes: 10
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "selftest"
+          $exe = "dist/CFD Signal Calculator/CFD Signal Calculator.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "--selftest", "`"$out`"" -PassThru -Wait
+          Get-Content -Encoding utf8 (Join-Path $out "report.json")
+          $q = Start-Process -FilePath $exe -ArgumentList "--selftest-verify", "`"$out`"" -PassThru -Wait
+          Get-Content -Encoding utf8 (Join-Path $out "persist.json")
+          foreach ($f in "t212_tabs_eurusd_active", "C_sell_plan", "D_buy_plan", "E_conditional_plan", "B_switched_to_gold") {
+            $png = Join-Path $out "$f.png"
+            if (Test-Path $png) {
+              $b = [Convert]::ToBase64String([IO.File]::ReadAllBytes($png))
+              Write-Output "=== PNG $f $($b.Length)"
+              for ($i = 0; $i -lt $b.Length; $i += 4000) { Write-Output $b.Substring($i, [Math]::Min(4000, $b.Length - $i)) }
+              Write-Output "=== END $f"
+            }
+          }
+          New-Item -ItemType Directory -Force selftest-out | Out-Null
+          Copy-Item (Join-Path $out "*.png"), (Join-Path $out "*.json") selftest-out
+          if ($p.ExitCode -ne 0 -or $q.ExitCode -ne 0) { Write-Error "self-test failed: $($p.ExitCode) / $($q.ExitCode)"; exit 1 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: selftest
+          path: selftest-out
+          retention-days: 30
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cfd-signal-calculator-windows

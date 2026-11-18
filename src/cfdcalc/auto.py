@@ -3,6 +3,7 @@
 Runs in a worker thread (never in the UI thread). Window access is injected (`backend`) so the logic is
 testable without Windows. No OCR runs unless the window exists and is not minimised.
 
+v2.9: several instruments in the region (tabs) -> the visually active one (recognize.locate hierarchy).
 v2.8: the user's region (▭) is read first. When there is no region, or the region does not show a recognisable
 instrument (Trading 212 moved its layout after a resize, a price is in the region, ...), the WHOLE window is read
 and the instrument written in the largest font is taken (recognize.locate) - never a guess between two names.
@@ -65,6 +66,11 @@ def read(region: window.Region | None, backend=window, ocr=ocr_lines, boxes=ocr_
                     if rgb.shape[0] < 60:     # small UI text reads better enlarged
                         rgb = np.repeat(np.repeat(rgb, 2, axis=0), 2, axis=1)
                     rec = match(ocr(rgb))
+                    if not rec.confident and rec.competing:   # tabs in the region: which one is active?
+                        geo = locate(boxes(rgb))
+                        if geo.confident:
+                            rec = Recognition(geo.best, geo.score, geo.candidates, geo.text, (), geo.top,
+                                              f"oblast · {geo.via}")
                 first = Reading(OK, "", win, rec)
                 if rec.confident:
                     return first

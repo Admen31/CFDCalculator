@@ -139,6 +139,13 @@ class TwelveData:
         self._blocked_until = 0.0             # monotonic time from a Retry-After answer
         self.credits: dict[str, str] = {}     # api-credits-used / -left from the last response, if sent
 
+    def account(self) -> str:
+        """v2.9 connection test: ONE api_usage request -> plan and usage (raises DataError with the cause)."""
+        u = self._get("api_usage", {})
+        return (f"Tarif {u.get('plan_category', '?')}, využití {u.get('current_usage', '?')}/"
+                f"{u.get('plan_limit', '?')} dotazů za minutu, dnes {u.get('daily_usage', '?')}/"
+                f"{u.get('plan_daily_limit', '?')}.")
+
     def usage(self) -> str:
         """Human summary of the known limits (no network)."""
         day, n = self._day

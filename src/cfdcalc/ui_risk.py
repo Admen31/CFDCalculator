@@ -370,12 +370,16 @@ class RiskPage(QWidget):
 
 
 def plan_from_m15(sig) -> tuple[Plan, str]:
-    """Plan of a v2.8 M15 signal: only a confirmed entry with all levels is sized."""
+    """Plan of an M15 signal (v2.9): a confirmed or a conditional trade plan with all levels is sized; the
+    conditional one is labelled - its entry has not happened yet."""
     if sig is None:
         return Plan(None, None, origin="ruční zadání"), "Zadejte vstup a stop-loss, nebo klikněte START."
     if sig.levels_ok:
-        return (Plan(sig.entry, sig.sl, sig.tp, True, "potvrzený signál M15", sig.price_time),
-                f"Potvrzený {sig.side} (M15).")
+        if sig.confirmed:
+            return (Plan(sig.entry, sig.sl, sig.tp, True, "potvrzený plán M15", sig.price_time),
+                    f"POTVRZENÝ {sig.side} (M15) – vstup nyní.")
+        return (Plan(sig.entry, sig.sl, sig.tp, True, "podmíněný plán M15", sig.price_time),
+                f"PODMÍNĚNÝ {sig.side} (M15) – vstup zatím nenastal: {sig.trigger}.")
     if sig.reference:
         return Plan(None, None, origin="ruční zadání"), "Referenční data – vstup a SL z nich nelze převzít."
     what = sig.side if sig.side in ("BUY", "SELL") else sig.side
@@ -435,6 +439,12 @@ class PortfolioPage(QWidget):
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         lay.addWidget(line)
+        self.spec = SpecForm(s)
+        self.spec.saved.connect(risk_page.recompute)
+        lay.addWidget(self.spec)
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(line2)
         lay.addWidget(risk_page)
         lay.addStretch(1)
         scroll = QScrollArea()
@@ -446,6 +456,10 @@ class PortfolioPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
         self.status.setText(f"Ukládá se jen lokálně ({s.fileName()}). Aplikace se k Trading 212 nepřipojuje.")
+
+    def showEvent(self, e):  # noqa: N802 - Qt API
+        self.spec.show_instrument(self.risk_page.inst)
+        super().showEvent(e)
 
     def save(self) -> bool:
         for field, text in ((self.equity, "Hodnota portfolia"), (self.open_risk, "Riziko otevřených pozic"),
@@ -465,5 +479,84 @@ class PortfolioPage(QWidget):
         s.sync()
         self.status.setText("Uloženo.")
         self.risk_page.recompute()
+        self.saved.emit()
+        return True
+
+
+class SpecForm(QWidget):
+    """v2.9: the CFD specification of the CURRENT instrument, typed in directly in the Portfolio tab (the same
+    settings keys as SpecDialog). The app never guesses it: the unit of the Trading 212 quantity field differs by
+    instrument, so the user copies it and can check it against the position value Trading 212 shows."""
+    saved = Signal()
+
+    def __init__(self, s: QSettings):
+        super().__init__(objectName="page")
+        self.s, self.inst = s, None
+        self.title = QLabel("SPECIFIKACE CFD", objectName="caption")
+        self.edits = {k: QLineEdit(placeholderText="povinné" if req else "nepovinné")
+                      for k, _, req in SpecDialog.FIELDS}
+        self.edits["contract"].setToolTip("Kolik jednotek podkladu (EUR, uncí, akcií…) představuje 1 kus v poli "
+                                          "Množství v Trading 212")
+        self.check = QLabel("", objectName="muted", wordWrap=True)
+        self.status = QLabel("", objectName="muted", wordWrap=True)
+        for e in self.edits.values():
+            e.textChanged.connect(self.explain)
+        save = QPushButton("Uložit specifikaci")
+        save.clicked.connect(self.save)
+        form = QFormLayout()
+        form.setVerticalSpacing(3)
+        labels = {"contract": "1 ks množství T212 = jednotek podkladu", "min_qty": "Minimální množství",
+                  "step": "Krok množství", "max_qty": "Maximální množství", "margin_pct": "Marže (%)"}
+        for k, _, _ in SpecDialog.FIELDS:
+            form.addRow(labels[k], self.edits[k])
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+        lay.addWidget(self.title)
+        lay.addLayout(form)
+        lay.addWidget(self.check)
+        row = QHBoxLayout()
+        row.addWidget(self.status, 1)
+        row.addWidget(save)
+        lay.addLayout(row)
+
+    def show_instrument(self, inst: Instrument | None):
+        self.inst = inst
+        self.setEnabled(inst is not None)
+        self.title.setText(f"SPECIFIKACE CFD – {inst.name} ({inst.symbol})" if inst else "SPECIFIKACE CFD – "
+                           "vyberte instrument")
+        spec = load_spec(self.s, inst) if inst else Spec(None, None, None)
+        for k, _, _ in SpecDialog.FIELDS:
+            self.edits[k].blockSignals(True)
+            self.edits[k].setText(_decimal_text(getattr(spec, k)))
+            self.edits[k].blockSignals(False)
+        self.status.setText("" if spec.contract else "Bez specifikace se POZICE nespočítá (NELZE SPOČÍTAT).")
+        self.explain()
+
+    def explain(self):
+        """How to verify the quantity unit against Trading 212: position value of 1 000 units."""
+        c = risk.num(self.edits["contract"].text())
+        if self.inst is None or c is None:
+            self.check.setText("Jak ověřit: v Trading 212 zadejte množství (např. 1 000) a porovnejte zobrazenou "
+                               "hodnotu pozice s výpočtem zde.")
+            return
+        q = risk.quote_currency(self.inst)
+        self.check.setText(f"Ověření: množství 1 000 v Trading 212 má odpovídat nominálu 1 000 × {c.normalize():f} "
+                           f"× cena (v {q}). Pokud Trading 212 ukazuje jinou hodnotu pozice, je kontrakt jiný.")
+
+    def save(self) -> bool:
+        if self.inst is None:
+            return False
+        for key, label, _req in SpecDialog.FIELDS:
+            t = self.edits[key].text().strip()
+            if t and risk.num(t) is None:
+                self.status.setText(f"{label}: zadejte kladné číslo.")
+                return False
+        k = f"spec/{_key(self.inst.symbol)}"
+        for key, _, _ in SpecDialog.FIELDS:
+            self.s.setValue(f"{k}/{key}", str(risk.num(self.edits[key].text()) or ""))
+        self.s.setValue(f"{k}/updated", datetime.now(timezone.utc).isoformat())
+        self.s.sync()
+        self.status.setText("Specifikace uložena.")
         self.saved.emit()
         return True
