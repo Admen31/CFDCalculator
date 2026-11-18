@@ -16,9 +16,10 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThread, QTime, QTimer, Signal
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTimeEdit, QVBoxLayout, QWidget)
+                               QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTabWidget, QTextBrowser,
+                               QTimeEdit, QVBoxLayout, QWidget)
 
-from . import __version__, widgets
+from . import __version__, m15, widgets
 from . import strategies as st
 from .analysis import BUY, ERROR, MODULES, NO_DATA, PROFILES, SELL, TITLES, Result, Settings, run_analysis
 from .backtest import HISTORY, journal_add, journal_read, journal_verify
@@ -33,7 +34,7 @@ from .ui_markets import MarketsDialog, load_custom
 from .instruments import BY_SYMBOL, Instrument
 from . import risk
 from .ui_instrument import AUTO, InstrumentBar
-from .ui_risk import RiskPage, manual_fx
+from .ui_risk import PortfolioPage, RiskPage, manual_fx, plan_from_m15
 from .widgets import (ACCENT, BIAS_COLORS, DIRECTION_COLORS, GREEN, RED, SLATE, YELLOW, Gauge, ResultPanel,
                       Tile, tint)
 
@@ -41,6 +42,9 @@ APP = "CFD Signal Calculator"
 WIDTH = 380
 REFRESH_MS = 60_000             # periodic refresh of the shown result (the candle cache keeps it cheap)
 ANALYSIS_TIMEOUT_MS = 75_000    # 3 requests x 15 s + calendar 15 s + margin; then the analysis is abandoned
+M15_TIMEOUT_MS = 25_000         # v2.8 main button: one 15min request (15 s timeout) + a fallback source
+BACKGROUND_MS = 15_000          # v2.8: check every 15 s whether a new 15m bar closed (then ONE request)
+CALENDAR_MS = 3_600_000         # economic calendar reloaded hourly in the background
 STYLE = """
 QWidget { background: #11151d; color: #e5e7eb; font-family: 'Segoe UI', sans-serif; font-size: 12px; }
 QPushButton { background: #1e2533; border: 1px solid #2b3446; border-radius: 8px; padding: 6px 10px; }
@@ -202,7 +206,9 @@ class MainWindow(QWidget):
         self.go.setToolTip("Spustit / obnovit analýzu (totéž jako klik do kruhu)")
         self.go.setStyleSheet("padding: 2px 10px; font-weight: 700;")
         self.go.clicked.connect(self.start)
-        self.latencies: list[float] = []         # START click -> result shown, seconds (this session)
+        self.latencies: list[float] = []         # main START click -> M15 result shown, seconds (this session)
+        self.hist_latencies: list[float] = []    # historical mode (details page) START -> result
+        self._t_hist: float | None = None
         self._t_click: float | None = None
         self.last_results: dict[str, tuple] = {}  # symbol -> (view, shown at, data time): instant previous result
         self.last_levels: dict = {}               # symbol -> analysis.Levels of the last result
@@ -219,9 +225,21 @@ class MainWindow(QWidget):
         self._fx_failed: dict[tuple[str, str], datetime] = {}
         self._levels = ""
         self.risk_page = RiskPage(self.s, self.spread_of, self.fx_for)
-        self.result.add_page(self.risk_page, "Risk ▸", self.risk_page.back)
         self.risk_page.summary.connect(self.on_risk_summary)
         self.risk_page.needs_fx.connect(self.fetch_fx)
+        self.portfolio = PortfolioPage(self.s, self.risk_page)
+        # ---- v2.8 M15 signal of the main screen (the historical multi-timeframe analysis never touches it) ----
+        self.m15 = m15.Service(m15.Feed(lambda: self.providers(), lambda: datetime.now(timezone.utc)))
+        self.m15_task: Task | None = None
+        self.m15_bg: Task | None = None
+        self._m15_gen = 0
+        self.m15_last: dict[str, m15.Signal] = {}     # symbol -> last M15 signal (never shown for another symbol)
+        self.shown_m15: Instrument | None = None     # instrument of the M15 result on the main screen
+        self.latency_kinds: list[str] = []           # "cache" | "síť" for every entry of self.latencies
+        self._bg = QTimer(self)
+        self._bg.timeout.connect(self.background)
+        self._cal = QTimer(self)
+        self._cal.timeout.connect(self.load_calendar)
 
         self.spread = QLineEdit()
         self.spread.setToolTip("Aktuální spread z Trading 212 (rozdíl BUY − SELL) v cenových jednotkách")
@@ -244,9 +262,14 @@ class MainWindow(QWidget):
         self.big.setFixedHeight(170)
         self.big.setCursor(Qt.CursorShape.PointingHandCursor)
         self.big.clicked.connect(self.analyze)
-        self.entry_lbl, self.tp_lbl, self.sl_lbl = (QLabel("", objectName="level") for _ in range(3))
+        self.entry_lbl, self.tp_lbl, self.sl_lbl, self.pos_lbl = (QLabel("", objectName="level") for _ in range(4))
+        self.info = QLabel("", objectName="muted", alignment=Qt.AlignmentFlag.AlignCenter)
+        self.info.setFixedHeight(16)
         self.to_details = QPushButton("Podrobnosti ▸", objectName="nav")
-        self.to_details.setToolTip("Indikátory, vysvětlení, Risk management, backtest, deník, trhy, spread")
+        self.to_details.setToolTip("Důvody signálu M15, dostupnost dat, diagnostika, historický režim, spread, "
+                                   "backtest, deník, trhy")
+        self.to_portfolio = QPushButton("Portfolio a riziko ▸", objectName="nav")
+        self.to_portfolio.setToolTip("Hodnota portfolia, měna, riziko na obchod, specifikace CFD, velikost pozice")
         main = QWidget(objectName="page")
         ml = QVBoxLayout(main)
         ml.setContentsMargins(6, 16, 6, 6)
@@ -254,31 +277,53 @@ class MainWindow(QWidget):
         ml.addStretch(1)
         ml.addWidget(self.big)
         ml.addSpacing(14)
-        for lab in (self.entry_lbl, self.tp_lbl, self.sl_lbl):
+        for lab in (self.entry_lbl, self.tp_lbl, self.sl_lbl, self.pos_lbl):
             ml.addWidget(lab)
+        ml.addSpacing(6)
+        ml.addWidget(self.info)
         ml.addStretch(2)
-        ml.addWidget(self.to_details, 0, Qt.AlignmentFlag.AlignRight)
+        nav = QHBoxLayout()
+        nav.addWidget(self.to_portfolio)
+        nav.addStretch(1)
+        nav.addWidget(self.to_details)
+        ml.addLayout(nav)
         # ---- details page: everything that was on the main screen before ----
         details = QWidget(objectName="page")
         dl = QVBoxLayout(details)
         dl.setContentsMargins(0, 0, 0, 0)
         dl.setSpacing(4)
         back = QPushButton("◂ Zpět", objectName="nav")
-        dl.addWidget(self.gauge, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.m15_text = QTextBrowser()
+        self.m15_text.setStyleSheet("background: transparent; border: none; font-size: 11px;")
+        self.m15_text.setHtml("<p>Klikněte START na hlavní obrazovce.</p>")
+        hist = QWidget(objectName="page")
+        hl = QVBoxLayout(hist)
+        hl.setContentsMargins(0, 4, 0, 0)
+        hl.setSpacing(4)
+        hl.addWidget(self.gauge, alignment=Qt.AlignmentFlag.AlignHCenter)
         steprow = QHBoxLayout()
-        steprow.addWidget(back)
         steprow.addWidget(self.step, 1)
         steprow.addWidget(self.go)
-        dl.addLayout(steprow)
-        dl.addLayout(grid)
-        dl.addWidget(self.result)
+        hl.addLayout(steprow)
+        hl.addLayout(grid)
+        hl.addWidget(self.result)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.m15_text, "Signál M15")
+        self.tabs.addTab(hist, "Historický režim 5m/15m/1h")
+        self.tabs.setTabToolTip(1, "Starší vícetimeframová analýza (v2.1–v2.6). Hlavní obrazovku NEOVLIVŇUJE.")
+        dl.addWidget(back, 0, Qt.AlignmentFlag.AlignLeft)
+        dl.addWidget(self.tabs, 1)
         dl.addLayout(sp)
         dl.addWidget(self.footer)
         self.pages = QStackedWidget(objectName="pages")
         self.pages.addWidget(main)
         self.pages.addWidget(details)
+        self.pages.addWidget(self.portfolio)
         self.to_details.clicked.connect(lambda: self.pages.setCurrentIndex(1))
+        self.to_portfolio.clicked.connect(lambda: self.pages.setCurrentIndex(2))
         back.clicked.connect(lambda: self.pages.setCurrentIndex(0))
+        self.risk_page.back.setText("◂ Hlavní obrazovka")
+        self.risk_page.back.clicked.connect(lambda: self.pages.setCurrentIndex(0))
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 8, 14, 6)
@@ -293,6 +338,10 @@ class MainWindow(QWidget):
         self.setFixedSize(self.size())                 # never resizes afterwards: no visible jumping
         if self.bar.mode() == AUTO:
             QTimer.singleShot(300, self.bar.warmup)    # OCR model loads after the window is visible
+        self._bg.start(BACKGROUND_MS)
+        self._cal.start(CALENDAR_MS)
+        QTimer.singleShot(500, self.load_calendar)
+        QTimer.singleShot(800, self.background)        # first 15m data of the confirmed instrument
 
     # ---- settings helpers ----
     def cfg(self) -> Settings:
@@ -383,14 +432,18 @@ class MainWindow(QWidget):
 
     def on_instrument_changed(self, inst: Instrument | None):
         self.refresh_header()
+        if inst != self.shown_m15:                   # v2.8: old prices and position are dropped at once
+            self.shown_m15 = None
+            self.show_main(START, None)
+            self.info.setText("" if inst else "Instrument nerozpoznán – vyberte ho ručně (hledání nahoře)")
+            self.m15_text.setHtml("<p>Klikněte START na hlavní obrazovce.</p>")
+            QTimer.singleShot(0, self.background)    # first data of the new instrument in the background
         if self.shown and inst != self.shown:
             self.mark_historical()
         elif inst != self.risk_page.inst:
             self.risk_page.load(inst, None)
         if not self.running():
             self.gauge.show_state(0, "START", "spustit analýzu" if inst else "vyberte instrument", ACCENT)
-            if inst != self.shown:
-                self.show_main(START, None)
             if inst and not self.demo():   # local record only - no network request on recognition
                 state, text = self.availability().summary(TwelveData.name, inst.symbol)
                 self.step.setText(text if state != "neověřeno" else "Data Twelve Data: zatím neověřena")
@@ -400,7 +453,6 @@ class MainWindow(QWidget):
         """The instrument changed: the result on screen no longer applies to what Trading 212 shows."""
         old = self.shown
         self._refresh.stop()
-        self.show_main(START, None)              # never the prices of another instrument
         self.risk_page.load(self.inst, None)     # an old signal is never sized for the new instrument
         self.result.mark_historical(f"Instrument se změnil – signál platil jen pro {old.name} ({old.symbol}) "
                                     f"a je historický.")
@@ -409,14 +461,140 @@ class MainWindow(QWidget):
 
     # ---- main screen ----
     def analyze(self):
-        """The big button: START, or a repeat of the analysis from a shown BUY / SELL / NEUTRAL / NO DATA / ERROR.
-        A click while an analysis runs is ignored (no duplicate, no cancel); the timeout ends a hung run."""
-        if self.running():
+        """The big button (v2.8): M15 analysis. START, or a repeat from a shown BUY / SELL / NEUTRAL / NO DATA /
+        ERROR. A click while one runs is ignored (no duplicate, no cancel); the timeout ends a hung request."""
+        if self.m15_busy():
             return
-        self.start()
+        self._t_click = clock.perf_counter()
+        self.save_spread()
+        if self.bar.mode() == AUTO:
+            self.info.setText("Čtu instrument z Trading 212…")
+        self.bar.confirm_for_start(self.m15_begin)
+
+    def m15_busy(self) -> bool:
+        return bool(self.m15_task and self.m15_task.isRunning())
+
+    def m15_begin(self, inst: Instrument):
+        if self.m15_busy() or inst != self.inst:
+            return
+        self.bar.remember(inst)
+        spread, cfg = self.spread_of(inst), self.cfg()
+        sig = self.m15.analyze_cached(inst, spread, cfg)
+        if sig is not None:                          # nothing new can be obtained: answer at once
+            self._m15_gen += 1
+            self.on_m15(sig, inst, self._m15_gen)
+            return
+        prev = self.m15_last.get(inst.symbol) if self.shown_m15 == inst else None
+        self.show_main("ANALYZUJI…", prev if prev and prev.levels_ok else None, dim=True)
+        self.info.setText("Načítám M15 data…")
+        self._m15_gen += 1
+        gen = self._m15_gen
+        task = Task(lambda _: self.m15.analyze(inst, spread, cfg))
+        task.done.connect(lambda r, g=gen, i=inst: self.on_m15(r, i, g))
+        task.failed.connect(lambda msg, g=gen, i=inst: self.on_m15(
+            m15.Signal(symbol=i.symbol, summary=f"technická chyba: {msg}", note="technická chyba"), i, g, error=True))
+        self.m15_task = task
+        task.start()
+        QTimer.singleShot(M15_TIMEOUT_MS, lambda g=gen: self._m15_timeout(g))
+
+    def _m15_timeout(self, gen: int):
+        if gen != self._m15_gen or not self.m15_busy():
+            return
+        task, self.m15_task = self.m15_task, None
+        self._retire(task)
+        self._m15_gen += 1                                       # its late result is ignored
+        self._t_click = None
+        self.show_main(NO_DATA, None)
+        self.info.setText(f"Poskytovatel dat neodpověděl do {M15_TIMEOUT_MS // 1000} s – klikněte znovu")
+
+    def _retire(self, task: QThread):
+        """Keep a worker referenced until it has really finished (a QThread must never be destroyed running)."""
+        self._retired.append(task)
+        task.finished.connect(lambda t=task: self._retired.remove(t) if t in self._retired else None)
+        if task.isFinished():
+            self._retired.remove(task)
+
+    def on_m15(self, sig: m15.Signal, inst: Instrument, gen: int, error: bool = False):
+        if gen != self._m15_gen:
+            return                                               # superseded or timed out
+        if self.m15_task is not None:
+            self._retire(self.m15_task)
+            self.m15_task = None
+        self.m15_last[inst.symbol] = sig
+        if inst != self.inst:                                    # the instrument changed meanwhile: not shown
+            return
+        latency = (clock.perf_counter() - self._t_click) if self._t_click else None
+        if latency is not None:
+            self.latencies.append(latency)
+            self.latency_kinds.append("cache" if sig.from_cache else "síť")
+            self._t_click = None
+        self.shown_m15 = inst
+        state = ERROR if error else sig.side
+        self.show_main(state, sig if sig.levels_ok else None)
+        plan, note = plan_from_m15(sig)
+        self.risk_page.load_plan(inst, plan, note)               # POZICE follows via on_risk_summary
+        self.info.setText(m15_info(sig, state, latency))
+        self.info.setToolTip(sig.summary)
+        self.m15_text.setHtml(m15_detail_html(sig, inst, self.m15.report(inst, self.cfg(), self.has_key(),
+                                                                          self.usage()), latency,
+                                              self.bar.last_ocr_ms, self.latencies, self.latency_kinds))
+        if sig.levels_ok and not self.demo() and not sig.from_cache:
+            journal_add(data_dir() / "journal.csv", inst.symbol, sig.side, sig.data_time, sig.entry, sig.sl, sig.tp)
+
+    def has_key(self) -> bool:
+        return bool(os.environ.get("TWELVEDATA_API_KEY") or self.s.value("api_key", ""))
+
+    def usage(self) -> str:
+        try:
+            td = self.provider()
+            return td.provider.usage() if isinstance(td, CachedProvider) else "demo – bez API"
+        except DataError:
+            return ""
+
+    def background(self):
+        """v2.8: keep the 15m series of the confirmed instrument current - ONE request only when a new 15m bar has
+        closed (or nothing is cached yet). Never while a click is being answered, never twice at once."""
+        inst = self.inst
+        if inst is None or self.m15_busy() or (self.m15_bg and self.m15_bg.isRunning()) or not self.isVisible() \
+                or not self.s.value("m15_background", True, type=bool):
+            return
+        cfg = self.cfg()
+        feed = self.m15.feed
+        if feed.need(feed.cached(inst, cfg.td_plan), feed.clock(), False) is None:
+            return
+        task = Task(lambda _: feed.get(inst, cfg.td_plan, want_price=False))
+        if self.m15_bg is not None:
+            self._retire(self.m15_bg)
+        self.m15_bg = task
+        task.start()
+
+    def load_calendar(self):
+        """Economic calendar in the background (file cache 1 h); the M15 entry check needs it."""
+        if self.demo():
+            self.m15.set_events([])
+            return
+        cal = Calendar(data_dir() / "calendar.json")
+        task = Task(lambda _: cal.events())
+        task.done.connect(lambda ev: self.m15.set_events(ev))
+        task.failed.connect(lambda msg: self.m15.set_events(None, f"kalendář zpráv nedostupný ({msg[:60]})"))
+        self._retire(task)
+        task.start()
+
+    def position_text(self) -> str:
+        """POZICE of the main screen from the v2.4 risk calculation (RiskPage), in CFD quantity units."""
+        sig = self.m15_last.get(self.shown_m15.symbol) if self.shown_m15 else None
+        out = self.risk_page.last
+        if sig is None or not sig.levels_ok or out is None or self.risk_page.inst != self.shown_m15:
+            return "–"
+        if out.qty is not None:
+            return f"{risk.fmt_qty(out.qty)} ks" + ("" if out.state == risk.OK else " (orientačně)")
+        if out.state == risk.LIMIT:
+            return out.headline
+        return "NELZE SPOČÍTAT"
 
     def show_main(self, state: str, levels, dim: bool = False):
-        """state: START | ANALYZUJI… | BUY | SELL | NEUTRAL | NO DATA | ERROR; levels: analysis.Levels or None."""
+        """state: START | ANALYZUJI… | BUY | SELL | NEUTRAL | NO DATA | ERROR; levels: object with entry/tp/sl or
+        None (an M15 signal only when its entry is confirmed)."""
         color = {BUY: GREEN, SELL: RED, NEUTRAL: YELLOW, NO_DATA: SLATE, ERROR: RED}.get(state, ACCENT)
         dashed = "dashed" if state == ERROR else "solid"
         self.big.setText(state)
@@ -430,11 +608,13 @@ class MainWindow(QWidget):
                                 strict=True):
             lab.setText(f"{name}: {v if v is not None else '–'}")
             lab.setStyleSheet("color: #64748b;" if dim else "")
+        self.pos_lbl.setText(f"POZICE: {self.position_text() if levels is not None and not dim else '–'}")
+        self.pos_lbl.setStyleSheet("color: #64748b;" if dim else "")
         tip = ""
         if levels and levels.entry is not None:
             when = levels.price_time.astimezone() if levels.price_time else None
             tip = (f"Aktuální cena získaná {when:%H:%M:%S}" if levels.live and when else
-                   f"Cena poslední uzavřené 5m svíčky ({when:%H:%M})" if when else "") + f". {levels.note}"
+                   f"Cena poslední uzavřené 15m svíčky ({when:%H:%M})" if when else "") + f". {levels.note}"
         elif levels:
             tip = levels.note
         self.entry_lbl.setToolTip(tip)
@@ -446,7 +626,7 @@ class MainWindow(QWidget):
             self.cancel("Analýza zrušena.")
             return
         self._refresh.stop()
-        self._t_click = clock.perf_counter()
+        self._t_hist = clock.perf_counter()
         self.go.setText("■ ZRUŠIT")
         self.save_spread()
         if self.bar.mode() == AUTO:
@@ -468,8 +648,6 @@ class MainWindow(QWidget):
         self.analysed, self.shown = inst, None
         self.bar.remember(inst)
         self._levels = ""
-        prev = self.last_levels.get(inst.symbol)
-        self.show_main("ANALYZUJI…", prev, dim=True)      # previous values of THIS instrument only, greyed out
         cached = self.last_results.get(inst.symbol)
         if cached:          # instant answer: the previous result, clearly marked, while fresh data load
             v, when, data_time = cached
@@ -514,8 +692,6 @@ class MainWindow(QWidget):
         self.analysed = None
         self.gauge.show_state(0, "START", "zrušeno – klikněte znovu", ACCENT)
         self.go.setText("▶ START")
-        self._t_click = None
-        self.show_main(START, None)
         self.result.clear("ZRUŠENO")
         self.result.reason.setText(why)
         self.step.setText(why)
@@ -545,10 +721,10 @@ class MainWindow(QWidget):
             sub = {NO_DATA: "nedostatek dat", ERROR: "technická chyba"}.get(side, "hotovo")
         self.gauge.show_state(pct, side, sub, DIRECTION_COLORS.get(side, ACCENT))
         self.go.setText("⟳ REFRESH")
-        latency = (clock.perf_counter() - self._t_click) if self._t_click else None
+        latency = (clock.perf_counter() - self._t_hist) if self._t_hist else None
         if latency is not None:
-            self.latencies.append(latency)
-            self._t_click = None
+            self.hist_latencies.append(latency)
+            self._t_hist = None
         took = sum(r.timings.values())
         self.step.setText((f"{r.completed}/{r.total} kroků" if r.total else "")
                           + (f" · výsledek za {latency:.2f} s" if latency is not None else
@@ -572,14 +748,12 @@ class MainWindow(QWidget):
         self.result.display(v)
         self.last_results[inst.symbol] = (v, datetime.now(timezone.utc), r.data_time)
         self.last_levels[inst.symbol] = r.levels
-        self.show_main(side, r.levels)
         if self.s.value("auto_refresh", False, type=bool) and side != ERROR and inst == self.inst:
             self._refresh.start(REFRESH_MS)
         self._levels = levels
         if inst != self.inst:  # the instrument changed while the analysis was running
             self.mark_historical()
             return
-        self.risk_page.load(inst, r)             # a confirmed BUY/SELL hands entry, SL and TP over
         if not self.demo():
             av = self.availability()
             for source, symbol, interval, state, detail in r.sources:
@@ -588,11 +762,11 @@ class MainWindow(QWidget):
             journal_add(data_dir() / "journal.csv", inst.symbol, r.verdict, r.data_time, r.entry, r.sl, r.tp)
 
     # ---- risk management ----
-    def on_risk_summary(self, line: str):
-        """Max quantity of a confirmed signal on the summary card (first line of the levels)."""
-        if self._levels and not self.result.verdict.text().startswith("HISTORICKÝ"):
-            first, *rest = self._levels.split("\n")
-            self.result.levels.setText("\n".join([first + (f"  · {line}" if line else "")] + rest))
+    def on_risk_summary(self, _line: str = ""):
+        """v2.8: the risk page recomputed (account, spec, FX rate arrived): refresh POZICE on the main screen."""
+        if self.shown_m15 is not None and not self.m15_busy():
+            sig = self.m15_last.get(self.shown_m15.symbol)
+            self.pos_lbl.setText(f"POZICE: {self.position_text() if sig and sig.levels_ok else '–'}")
 
     def fx_for(self, quote: str, acc: str) -> risk.Fx | None:
         """Rate quote -> account currency: the same currency, a fresh Twelve Data rate, or the user's manual rate.
@@ -678,7 +852,12 @@ class MainWindow(QWidget):
     def closeEvent(self, e):
         """Stop timers, cancel work and let worker threads end (bounded) before the window goes away."""
         self.hide()
+        self._bg.stop()
+        self._cal.stop()
         self.bar.shutdown()
+        for t in (self.m15_task, self.m15_bg):
+            if t and t.isRunning():
+                self._retired.append(t)
         if self.running():
             self.cancel("Ukončování…")
         deadline = datetime.now(timezone.utc).timestamp() + 20
@@ -768,6 +947,94 @@ class _NoNews:
 
     def events(self):
         return []
+
+
+def m15_info(sig: m15.Signal, state: str, latency: float | None) -> str:
+    """One muted line under the main values: what the shown result is based on (time of data and price)."""
+    if state == ERROR:
+        return "Technická chyba – klikněte znovu (detail v Podrobnostech)"
+    parts = []
+    if sig.data_time:
+        parts.append(f"M15 svíčka {sig.data_time.astimezone():%H:%M}")
+    if sig.price_time and sig.live:
+        parts.append(f"cena {sig.price_time.astimezone():%H:%M:%S}")
+    if sig.side in (BUY, SELL) and not sig.levels_ok:
+        parts.append("jen směr – vstup nepotvrzen")
+    elif sig.side in (NO_DATA, NEUTRAL) and sig.note:
+        parts.append(sig.note[:60])
+    if sig.reference:
+        parts.append("REFERENČNÍ data")
+    if latency is not None:
+        parts.append(f"{latency:.2f} s" + (" z cache" if sig.from_cache else ""))
+    return " · ".join(parts)
+
+
+def m15_detail_html(sig: m15.Signal, inst: Instrument, report: list[str], latency: float | None,
+                    ocr_ms: float | None, latencies: list[float], kinds: list[str]) -> str:
+    """Detail page of the M15 signal: decision, votes, entry checks, data diagnostics, timings."""
+    e = html.escape
+    rows = [f"<h3>{e(inst.name)} ({e(inst.symbol)}) – {e(sig.side)}"
+            f"{' · POTVRZENÝ VSTUP' if sig.levels_ok else ''}</h3>",
+            f"<p><b>{e(sig.summary)}</b></p>"]
+    if sig.side in (BUY, SELL) and not sig.levels_ok:
+        rows.append("<p>BUY/SELL zde označuje <b>převažující směr trhu na M15</b>. Vstup nesplňuje podmínky, proto "
+                    "aplikace nezobrazuje VSTUP, TP, SL ani pozici – <b>nejde o obchodní pokyn</b>.</p>")
+    if sig.reference:
+        rows.append(f"<p style='color:#fb923c'><b>REFERENČNÍ TRŽNÍ DATA</b> – "
+                    f"{e(sig.reference)}. Cena jiného produktu není cena CFD v Trading 212.</p>")
+    if sig.levels_ok:
+        rr = abs(sig.tp - sig.entry) / abs(sig.entry - sig.sl)
+        rows.append(f"<p>VSTUP {sig.entry} · SL {sig.sl} ({m15.SL_ATR:g}× ATR14 M15) · TP {sig.tp} "
+                    f"(R:R 1:{rr:.1f}). Podkladová cena se může lišit od ceny CFD v Trading 212 – zkontrolujte "
+                    "vstup v platformě.</p>")
+    if sig.factors:
+        rows.append(f"<p><b>Směr z uzavřených 15m svíček</b> – skóre {sig.score:+.2f} (hranice ±{m15.THRESHOLD}), "
+                    f"dostupnost indikátorů {sig.quality:.0%}</p><table>")
+        for f in sig.factors:
+            v = {1: "BUY", -1: "SELL", 0: "neutrální", None: "nedostupné"}[f.vote]
+            rows.append(f"<tr><td>{e(f.name)}</td><td>{v}</td><td>váha {f.weight:g}</td><td>{e(f.detail)}</td></tr>")
+        rows.append("</table>")
+    if sig.checks:
+        rows.append("<p><b>Podmínky vstupu</b></p><table>")
+        for name, ok, detail in sig.checks:
+            rows.append(f"<tr><td>{'✓' if ok else '✗'}</td><td>{e(name)}</td><td>{e(detail)}</td></tr>")
+        rows.append("</table>")
+    v = sig.values
+    if v:
+        def f(x):
+            return "–" if x is None else f"{x:.6g}"
+        rows.append(f"<p><b>Indikátory M15</b>: EMA20 {f(v.get('ema20'))}, EMA50 {f(v.get('ema50'))}, "
+                    f"EMA200 {f(v.get('ema200'))}, RSI14 {f(v.get('rsi'))}, MACD {f(v.get('macd'))} / signál "
+                    f"{f(v.get('macd_signal'))}, ATR14 {f(v.get('atr'))}</p>")
+    data = [f"Zdroj: {e(sig.source or '–')}", f"uzavřených svíček M15: {sig.bars}"]
+    if sig.data_time:
+        data.append(f"poslední uzavřená svíčka do {sig.data_time.astimezone():%d.%m. %H:%M}")
+    if sig.price_time:
+        data.append(f"cena {'z aktuální svíčky' if sig.live else 'z uzavřené svíčky'} "
+                    f"{sig.price_time.astimezone():%H:%M:%S}")
+    if sig.fetched:
+        data.append(f"staženo {sig.fetched.astimezone():%H:%M:%S}" + (" (z cache, bez dotazu)" if sig.from_cache
+                                                                       else ""))
+    rows.append("<p><b>Data</b>: " + " · ".join(data) + "</p>")
+    for err in sig.errors:
+        rows.append(f"<p style='color:#fca5a5'>{e(err)}</p>")
+    rows.append("<p><b>Diagnostika dat</b></p><ul>" + "".join(f"<li>{e(x)}</li>" for x in report) + "</ul>")
+    t = sig.timings
+    timing = [f"data {t.get('data', 0):.0f} ms", f"výpočet {t.get('výpočet', 0):.1f} ms"]
+    if latency is not None:
+        timing.insert(0, f"klik → výsledek {latency * 1000:.0f} ms")
+    if ocr_ms is not None:
+        timing.append(f"čtení Trading 212 {ocr_ms:.0f} ms")
+    rows.append("<p><b>Měření</b>: " + " · ".join(timing) + "</p>")
+    for kind in ("cache", "síť"):
+        xs = sorted(x for x, k in zip(latencies, kinds, strict=False) if k == kind)
+        if xs:
+            p95 = xs[max(0, int(round(0.95 * len(xs))) - 1)]
+            rows.append(f"<p>Odezva v této relaci ({kind}): medián {xs[len(xs) // 2] * 1000:.0f} ms, p95 "
+                        f"{p95 * 1000:.0f} ms, n={len(xs)}</p>")
+    rows.append("<p style='color:#94a3b8'>Jen analýza – aplikace neodesílá žádné pokyny. Při skluzu nebo gapu může "
+                "být ztráta vyšší než plánovaná.</p>")
+    return "".join(rows)
 
 
 def detail_html(r: Result, inst: Instrument, ocr_ms: float | None = None) -> str:

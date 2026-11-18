@@ -49,14 +49,61 @@ def test_reads_instrument_from_window_region():
 @pytest.mark.parametrize("wins, region, cap, status", [
     ([], REGION, None, auto.NO_WINDOW),
     ([Win(7, "Trading 212", 0, 0, 800, 600, minimized=True)], REGION, None, auto.MINIMIZED),
-    ([W], None, None, auto.NO_REGION),
-    ([Win(7, "Trading 212", 0, 0, 200, 100)], REGION, None, auto.UNREADABLE),       # window too small
     ([W], REGION, CaptureError("okno je zakryté"), auto.UNREADABLE),               # covered, no content
 ])
 def test_no_ocr_without_a_safely_readable_window(wins, region, cap, status):
-    ocr = OCR("NVIDIA")
-    r = auto.read(region, backend(wins, cap), ocr)
-    assert r.status == status and r.message and ocr.calls == 0
+    ocr, boxes = OCR("NVIDIA"), Boxes(("NVIDIA", 30))
+    r = auto.read(region, backend(wins, cap), ocr, boxes)
+    assert r.status == status and r.message and ocr.calls == 0 and boxes.calls == 0
+
+
+class Boxes:
+    """Whole-window OCR: (text, height) pairs."""
+
+    def __init__(self, *items):
+        self.items, self.calls = list(items), 0
+
+    def __call__(self, rgb):
+        from cfdcalc.recognize import Box
+        self.calls += 1
+        return [Box(t, h) for t, h in self.items]
+
+
+def test_v28_no_region_finds_the_instrument_header_in_the_whole_window():
+    b = backend([W])
+    boxes = Boxes(("Gold", 30), ("XAU/USD", 14), ("EUR/USD", 13), ("SELL", 16), ("4,083.10", 16), ("BUY", 16))
+    r = auto.read(None, b, OCR(), boxes)
+    assert r.status == auto.OK and r.recognition.best.symbol == "XAU/USD" and r.recognition.via == "celé okno"
+    assert b.calls == [(W.left, W.top, W.width, W.height)]
+
+
+def test_v28_region_showing_a_price_falls_back_to_the_window():
+    b = backend([W])
+    r = auto.read(REGION, b, OCR("1.15234", "SELL"), Boxes(("EUR/USD", 26), ("Gold", 13)))
+    assert r.recognition.best.symbol == "EUR/USD" and len(b.calls) == 2       # region, then the whole window
+
+
+def test_v28_two_headers_of_the_same_size_are_not_guessed():
+    r = auto.read(None, backend([W]), OCR(), Boxes(("EUR/USD", 24), ("Gold", 23)))
+    assert r.status == auto.OK and not r.recognition.confident and "nejednoznačné" in r.recognition.reason
+
+
+def test_v28_window_too_small_for_the_region_still_reads_the_window():
+    small = Win(7, "Trading 212", 0, 0, 200, 100)
+    r = auto.read(REGION, backend([small]), OCR("NVIDIA"), Boxes(("NVIDIA", 22)))
+    assert r.status == auto.OK and r.recognition.best.symbol == "NVDA"
+
+
+def test_v28_whole_window_reading_is_throttled_while_watching():
+    t = [100.0]
+    boxes = Boxes(("NVIDIA", 22))
+    auto.read(None, backend([W]), OCR(), boxes, force_locate=True, clock=lambda: t[0])
+    t[0] += 3
+    r = auto.read(None, backend([W]), OCR(), boxes, force_locate=False, clock=lambda: t[0])
+    assert boxes.calls == 1 and r.status == auto.NO_REGION and "nerozpoznán" in r.message
+    t[0] += 10
+    auto.read(None, backend([W]), OCR(), boxes, force_locate=False, clock=lambda: t[0])
+    assert boxes.calls == 2
 
 
 def test_unsupported_platform():

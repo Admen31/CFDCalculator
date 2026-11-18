@@ -218,6 +218,17 @@ def test_app_recognises_switches_and_marks_old_signal_historical(app, tmp_path, 
         pump(app, 600)                     # let the colour transition finish for the screenshot
         w.grab().save(str(OUT / "3_app_eurusd.png"))
 
+        w.pages.setCurrentIndex(0)         # v2.8 main screen: the big button runs the M15 analysis
+        n = len(w.latencies)
+        w.analyze()
+        w.bar.wait_idle()
+        deadline = time.monotonic() + 40
+        while len(w.latencies) == n and time.monotonic() < deadline:
+            pump(app, 50)
+        mark(f"M15 START done in {w.latencies[-1]:.2f} s: {w.big.text()} · {w.info.text()}")
+        assert w.shown_m15.symbol == "EUR/USD" and w.big.text() in ("BUY", "SELL", "NEUTRAL", "NO DATA")
+        w.grab().save(str(OUT / "3b_main_eurusd.png"))
+
         t212.w.move(200, 300)              # move the browser window and switch the instrument
         t212.set("Gold")
         with Latency() as reading:         # real Win32 capture + OCR in the worker thread
@@ -229,6 +240,15 @@ def test_app_recognises_switches_and_marks_old_signal_historical(app, tmp_path, 
         assert reading.worst < 700, reading.gaps
         assert w.inst.symbol == "XAU/USD", w.bar.status.text()
         assert w.result.verdict.text().startswith("HISTORICKÝ")
+        assert w.big.text() == "START" and w.entry_lbl.text() == "VSTUP: –" and w.pos_lbl.text() == "POZICE: –"
+        n = len(w.latencies)
+        w.analyze()                        # the new instrument gets its own M15 result
+        w.bar.wait_idle()
+        deadline = time.monotonic() + 40
+        while len(w.latencies) == n and time.monotonic() < deadline:
+            pump(app, 50)
+        assert w.shown_m15.symbol == "XAU/USD", w.info.text()
+        mark(f"M15 after the switch: {w.big.text()} · {w.info.text()}")
         pump(app, 600)
         w.grab().save(str(OUT / "4_app_switched_to_gold.png"))
         print("status:", w.bar.status.text())

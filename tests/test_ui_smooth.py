@@ -33,6 +33,7 @@ def make(app, tmp_path, monkeypatch):
                              "CFDSignalCalculator", "app")
         s.setValue("demo", demo)
         s.setValue("watch", False)
+        s.setValue("m15_background", False)
         s.setValue("mode", "auto")
         s.setValue("api_key", "test-key")
         s.sync()

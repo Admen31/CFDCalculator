@@ -22,13 +22,38 @@ def setup_account(w, ccy="USD", equity="50 000", pct="2"):
         w.s.setValue(f"spec/XAU_USD/{k}", v)
 
 
+def m15_signal(verdict):
+    """v2.8: the risk page is fed by the M15 signal of the main screen (never by the historical mode)."""
+    from datetime import datetime, timezone
+
+    from cfdcalc import m15
+    now = datetime.now(timezone.utc)
+    if verdict in (BUY, SELL):
+        sign = 1 if verdict == BUY else -1
+        return m15.Signal(side=verdict, confirmed=True, entry=D("100"), sl=D(100 - sign), tp=D(100 + 2 * sign),
+                          price_time=now, data_time=now, summary="test")
+    side = {WAIT: "NEUTRAL", NO_DATA: "NO DATA", ERROR: "NO DATA"}[verdict]
+    return m15.Signal(side=side, summary="test", note="test")
+
+
+def click_m15(app, w, sig):  # noqa: F811
+    w.m15.analyze_cached = lambda *a, **k: sig
+    n = len(w.latencies)
+    w.analyze()
+    for _ in range(200):
+        app.processEvents()
+        if len(w.latencies) > n:
+            break
+    settle(app, w)
+
+
 def run(app, make, monkeypatch, verdict, **kw):  # noqa: F811
-    gate, _ = gated(monkeypatch, verdict, **kw)
     w = make(Reader("Gold"))
     setup_account(w)
-    gate.set()
-    w.start()
-    settle(app, w)
+    w.s.setValue("account/reserve_pct", "0")
+    w.bar.set_mode("manual")
+    w.set_instrument(w.inst or __import__("cfdcalc.instruments").instruments.BY_SYMBOL["XAU/USD"])
+    click_m15(app, w, m15_signal(verdict))
     return w
 
 
@@ -38,7 +63,7 @@ def test_confirmed_buy_is_sized_and_shown_on_the_card(app, make, monkeypatch):  
     out = page.last
     assert out.state == risk.OK and out.qty == risk.floor_step(D(1000) / D("1.35"), D("0.01"))
     assert page.entry.text() == "100.00" and page.sl.text() == "99.00" and page.tp.text() == "102.00"
-    assert out.margin == out.notional * D("0.05") and "max" in w.result.levels.text()
+    assert out.margin == out.notional * D("0.05") and w.pos_lbl.text() == f"POZICE: {risk.fmt_qty(out.qty)} ks"
     assert "V RÁMCI LIMITU" in page.state.text() and "MAX. MNOŽSTVÍ" in page.qty.text()
 
 
@@ -62,17 +87,17 @@ def test_no_confirmed_signal_no_prefilled_plan(app, make, monkeypatch, verdict):
 
 
 def test_instrument_change_clears_the_plan(app, make, monkeypatch):  # noqa: F811
-    gate, _ = gated(monkeypatch, BUY)
     reader = Reader("Gold")
     w = make(reader)
     setup_account(w)
-    gate.set()
-    w.start()
-    settle(app, w)
-    assert w.risk_page.last.qty is not None
+    ticks(app, w)
+    assert w.inst.symbol == "XAU/USD"
+    click_m15(app, w, m15_signal(BUY))
+    assert w.risk_page.last.qty is not None and w.pos_lbl.text() != "POZICE: –"
     reader.set("EUR/USD")
     ticks(app, w)
     assert w.risk_page.inst.symbol == "EUR/USD" and w.risk_page.entry.text() == "" and w.risk_page.last.qty is None
+    assert w.pos_lbl.text() == "POZICE: –" and w.entry_lbl.text() == "VSTUP: –"
 
 
 def test_fx_is_fetched_only_when_it_is_the_last_missing_piece(app, make, monkeypatch):  # noqa: F811
@@ -86,16 +111,17 @@ def test_fx_is_fetched_only_when_it_is_the_last_missing_piece(app, make, monkeyp
 
         def redact(self, t):
             return t
-    gate, _ = gated(monkeypatch, BUY)
     w = make(Reader("Gold"))
     monkeypatch.setattr(type(w), "provider", lambda self: type("P", (), {"provider": TD()})())
     w.s.setValue("account/currency", "CZK")
+    w.bar.set_mode("manual")
+    from cfdcalc.instruments import BY_SYMBOL
+    w.set_instrument(BY_SYMBOL["XAU/USD"])
     w.risk_page.load(w.inst, None)
     assert not calls                              # no equity / spec / plan yet: no request
     setup_account(w, "CZK")
-    gate.set()
-    w.start()
-    settle(app, w)
+    w.s.setValue("account/reserve_pct", "0")
+    click_m15(app, w, m15_signal(BUY))
     for _ in range(50):
         app.processEvents()
         if w.risk_page.last.state == risk.OK:

@@ -54,10 +54,27 @@ class Account:
     risk_pct: Decimal = DEFAULT_RISK
     max_notional_pct: Decimal | None = None     # optional exposure limit (e.g. 10 % of equity)
     free_margin: Decimal | None = None          # optional
+    open_risk: Decimal | None = None            # v2.8: planned loss of positions already open (account currency)
+    max_total_pct: Decimal | None = None        # v2.8: limit of all open risk incl. this trade, % of equity
+    reserve_pct: Decimal = Decimal("0")         # v2.8: extra stop distance for slippage, % of |entry - SL|
 
     @property
     def budget(self) -> Decimal | None:
+        """Risk budget of ONE trade = equity x risk %."""
         return None if self.equity is None else self.equity * self.risk_pct / 100
+
+    @property
+    def total_room(self) -> Decimal | None:
+        """What is left of the total open-risk limit for a new trade (None = no total limit set)."""
+        if self.equity is None or self.max_total_pct is None:
+            return None
+        return self.equity * self.max_total_pct / 100 - (self.open_risk or Decimal(0))
+
+    @property
+    def allowed(self) -> Decimal | None:
+        """The planned loss this trade may have: the smaller of the trade budget and the remaining total room."""
+        room = self.total_room
+        return self.budget if room is None or self.budget is None else min(self.budget, max(room, Decimal(0)))
 
 
 @dataclass(frozen=True)
@@ -155,11 +172,23 @@ def size(acc: Account, spec: Spec, plan: Plan, spread: Decimal | None, fx: Fx | 
         out.state, out.headline, out.messages = LIMIT, "NEPLATNÝ STOP-LOSS", bad
         return out
 
+    room = acc.total_room
+    if room is not None and room <= 0:
+        out.state, out.headline = LIMIT, "PŘEKROČENO CELKOVÉ RIZIKO"
+        out.messages = [f"Otevřené pozice už mají riziko {money(acc.open_risk, acc.currency)}, limit všech pozic je "
+                        f"{acc.max_total_pct.normalize():f} % účtu = "
+                        f"{money(acc.equity * acc.max_total_pct / 100, acc.currency)}."
+                        " Další obchod nelze otevřít bez překročení limitu."]
+        return out
     contract, rate = spec.contract, fx.rate
     dist = abs(plan.entry - plan.sl)
-    risk_unit = (dist + spread) * contract * rate          # spread paid once (half at entry, half at exit)
+    reserve = dist * acc.reserve_pct / 100                  # slippage reserve beyond the stop
+    risk_unit = (dist + spread + reserve) * contract * rate  # spread paid once (half at entry, half at exit)
     notional_unit = plan.entry * contract * rate
-    caps = {"riziko": out.budget / risk_unit}
+    out.budget = acc.allowed
+    caps = {"riziko": acc.budget / risk_unit}
+    if room is not None and room < acc.budget:
+        caps["celkové otevřené riziko"] = room / risk_unit
     if acc.max_notional_pct is not None:
         caps["limit expozice"] = acc.equity * acc.max_notional_pct / 100 / notional_unit
     margin_unit = notional_unit * spec.margin_pct / 100 if spec.margin_pct is not None else None
@@ -177,11 +206,12 @@ def size(acc: Account, spec: Spec, plan: Plan, spread: Decimal | None, fx: Fx | 
         if out.binding == "maximální množství":
             out.headline = "NEPLATNÁ SPECIFIKACE"
             out.messages = ["Maximální množství je menší než minimální – zkontrolujte specifikaci instrumentu."]
-        elif out.binding == "riziko":
+        elif out.binding in ("riziko", "celkové otevřené riziko"):
             out.headline = "PŘÍLIŠ RIZIKOVÉ"
             out.messages = [TOO_RISKY, f"Minimální množství {fmt_qty(q)} by při SL znamenalo ztrátu "
                                        f"{money(min_loss, acc.currency)} = {min_loss / acc.equity * 100:.2f} % účtu "
-                                       f"(limit {acc.risk_pct.normalize():f} %)."]
+                                       + (f"(limit {acc.risk_pct.normalize():f} %)." if out.binding == "riziko" else
+                                          f"(zbývá z limitu všech pozic {money(out.budget, acc.currency)}).")]
         elif out.binding == "volná marže":
             out.headline = "NEDOSTATEČNÁ MARŽE"
             out.messages = [f"Minimální množství {fmt_qty(q)} vyžaduje marži {money(q * margin_unit, acc.currency)},"
@@ -193,6 +223,10 @@ def size(acc: Account, spec: Spec, plan: Plan, spread: Decimal | None, fx: Fx | 
                             f" % účtu."]
         return out
 
+    if qty * risk_unit > out.budget:          # re-check after rounding (never more than the allowed loss)
+        out.state, out.headline = LIMIT, "PŘÍLIŠ RIZIKOVÉ"
+        out.messages = [TOO_RISKY, "Po zaokrouhlení na krok množství by ztráta při SL překročila rozpočet."]
+        return out
     out.qty = qty
     out.notional = qty * notional_unit
     out.margin = qty * margin_unit if margin_unit is not None else None
@@ -204,6 +238,8 @@ def size(acc: Account, spec: Spec, plan: Plan, spread: Decimal | None, fx: Fx | 
     out.state = OK if plan.confirmed else ORIENTATION
     out.headline = f"{fmt_qty(qty)} ks"
     out.messages = [f"Množství určuje: {out.binding}."]
+    if acc.reserve_pct:
+        out.messages.append(f"Rezerva na skluz {acc.reserve_pct.normalize():f} % vzdálenosti SL je započtena.")
     if not plan.confirmed:
         out.messages.insert(0, f"Orientační scénář ({plan.origin or 'ruční zadání'}) – nejde o potvrzený vstup.")
     if margin_unit is None:

@@ -170,3 +170,40 @@ def test_exchange_rate_direct_inverse_and_invalid(monkeypatch):
     install(monkeypatch, lambda p: {"symbol": p["symbol"]})
     with pytest.raises(DataError, match="bez hodnoty"):
         TwelveData(KEY).exchange_rate("USD", "CZK")
+
+
+# ---- v2.8: total open risk, slippage reserve, re-check after rounding, EUR/USD example from the brief
+
+def _v28(**acc):
+    from datetime import datetime, timezone
+    from decimal import Decimal as D
+
+    from cfdcalc import risk as rk
+    now = datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)
+    a = rk.Account(D("100000"), "CZK", D("2"), **acc)
+    spec = rk.Spec(contract=D("1"), min_qty=D("1"), step=D("1"))
+    plan = rk.Plan(D("1.10000"), D("1.09850"), D("1.10300"), True, "M15", now)
+    return rk.size(a, spec, plan, D("0.00008"), rk.Fx(D("21.00"), now, "Twelve Data"), now, "USD")
+
+
+def test_v28_eurusd_100k_czk_2_percent():
+    from decimal import Decimal as D
+    out = _v28()
+    # budget 2 000 CZK; risk per unit (0.0015 + 0.00008) x 21 = 0.03318 CZK -> 60 277 units
+    assert out.budget == D("2000") and out.qty == D("60277") and out.loss_sl <= D("2000")
+    assert out.notional == D("60277") * D("1.10000") * D("21.00")          # notional, not risk
+
+
+def test_v28_total_open_risk_limits_the_new_trade():
+    from decimal import Decimal as D
+    out = _v28(open_risk=D("4500"), max_total_pct=D("5"))          # 5 000 limit - 4 500 open = 500 left
+    assert out.binding == "celkové otevřené riziko" and out.loss_sl <= D("500") and out.budget == D("500")
+    full = _v28(open_risk=D("5000"), max_total_pct=D("5"))
+    assert full.qty is None and full.headline == "PŘEKROČENO CELKOVÉ RIZIKO"
+
+
+def test_v28_reserve_reduces_the_quantity():
+    from decimal import Decimal as D
+    plain, reserved = _v28(), _v28(reserve_pct=D("10"))
+    assert reserved.qty < plain.qty and reserved.loss_sl <= D("2000")
+    assert any("Rezerva" in m for m in reserved.messages)

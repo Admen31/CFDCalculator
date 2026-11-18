@@ -12,7 +12,8 @@ from typing import Callable
 
 from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget)
+                               QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
+                               QVBoxLayout, QWidget)
 
 from . import risk
 from .analysis import BUY, ERROR, NO_DATA, SELL, Result
@@ -32,8 +33,11 @@ def load_account(s: QSettings) -> Account:
     pct = risk.num(s.value("account/risk_pct", "2")) or risk.DEFAULT_RISK
     notional = risk.num(s.value("account/notional_pct", "")) if s.value("account/notional_on", False, type=bool) \
         else None
+    total = risk.num(s.value("account/max_total_pct", "")) if s.value("account/total_on", False, type=bool) \
+        else None
     return Account(risk.num(s.value("account/equity", "")), str(s.value("account/currency", "CZK")), pct, notional,
-                   risk.num(s.value("account/free_margin", "")))
+                   risk.num(s.value("account/free_margin", "")), risk.num(s.value("account/open_risk", "")), total,
+                   risk.num(s.value("account/reserve_pct", "10")) or Decimal(0))
 
 
 def load_spec(s: QSettings, inst: Instrument) -> Spec:
@@ -275,8 +279,12 @@ class RiskPage(QWidget):
     # ---- inputs ----
     def load(self, inst: Instrument | None, r: Result | None):
         """New analysis result or instrument: refill entry/SL/TP from what the analysis may hand over."""
+        self.load_plan(inst, *plan_from_result(r))
+
+    def load_plan(self, inst: Instrument | None, plan: Plan, note: str):
+        """v2.8: the M15 signal hands over its plan (only a confirmed entry is a confirmed plan)."""
         self.inst = inst
-        self.base, self.note = plan_from_result(r)
+        self.base, self.note = plan, note
         d = inst.decimals if inst else 5
         for e, v in ((self.entry, self.base.entry), (self.sl, self.base.sl), (self.tp, self.base.tp)):
             e.setText("" if v is None else f"{v.quantize(Decimal(1).scaleb(-d)):f}")
@@ -359,3 +367,103 @@ class RiskPage(QWidget):
             line = f"max {out.headline}"
         self.summary.emit(line)
 
+
+
+def plan_from_m15(sig) -> tuple[Plan, str]:
+    """Plan of a v2.8 M15 signal: only a confirmed entry with all levels is sized."""
+    if sig is None:
+        return Plan(None, None, origin="ruční zadání"), "Zadejte vstup a stop-loss, nebo klikněte START."
+    if sig.levels_ok:
+        return (Plan(sig.entry, sig.sl, sig.tp, True, "potvrzený signál M15", sig.price_time),
+                f"Potvrzený {sig.side} (M15).")
+    if sig.reference:
+        return Plan(None, None, origin="ruční zadání"), "Referenční data – vstup a SL z nich nelze převzít."
+    what = sig.side if sig.side in ("BUY", "SELL") else sig.side
+    return Plan(None, None, origin="ruční zadání"), f"{what} bez potvrzeného vstupu – pozice se nepočítá."
+
+
+class PortfolioPage(QWidget):
+    """v2.8 tab PORTFOLIO A RIZIKO: the account (typed in, stored locally) and the position sizing of the current
+    instrument (RiskPage). Nothing is read from Trading 212."""
+    saved = Signal()
+
+    def __init__(self, s: QSettings, risk_page: RiskPage):
+        super().__init__(objectName="page")
+        self.s, self.risk_page = s, risk_page
+        acc = load_account(s)
+        title = QLabel("PORTFOLIO A RIZIKO", objectName="caption")
+        self.equity = QLineEdit(_decimal_text(acc.equity), placeholderText="např. 100 000")
+        self.currency = QComboBox()
+        self.currency.addItems(risk.CURRENCIES)
+        self.currency.setCurrentText(acc.currency)
+        self.risk = QDoubleSpinBox(minimum=0.1, maximum=100.0, singleStep=0.1, decimals=2, suffix=" %",
+                                   value=float(acc.risk_pct))
+        self.open_risk = QLineEdit(_decimal_text(acc.open_risk), placeholderText="nepovinné, v měně účtu")
+        self.total_on = QCheckBox("Max. celkové otevřené riziko")
+        self.total_on.setChecked(s.value("account/total_on", False, type=bool))
+        self.total = QDoubleSpinBox(minimum=0.1, maximum=100.0, decimals=1, suffix=" %",
+                                    value=float(risk.num(s.value("account/max_total_pct", "6")) or 6))
+        self.reserve = QDoubleSpinBox(minimum=0.0, maximum=100.0, decimals=0, suffix=" % SL",
+                                      value=float(acc.reserve_pct))
+        self.reserve.setToolTip("Rezerva na skluz: o kolik % vzdálenosti SL může být skutečná ztráta větší")
+        self.margin = QLineEdit(_decimal_text(acc.free_margin), placeholderText="nepovinné")
+        self.status = QLabel("", objectName="muted", wordWrap=True)
+        save = QPushButton("Uložit")
+        save.clicked.connect(self.save)
+        form = QFormLayout()
+        form.setVerticalSpacing(3)
+        form.addRow("Hodnota portfolia", self.equity)
+        form.addRow("Měna účtu", self.currency)
+        form.addRow("Riziko na obchod", self.risk)
+        form.addRow("Riziko otevřených pozic", self.open_risk)
+        row = QHBoxLayout()
+        row.addWidget(self.total_on)
+        row.addWidget(self.total)
+        form.addRow(row)
+        form.addRow("Rezerva na skluz", self.reserve)
+        form.addRow("Volná marže", self.margin)
+        inner = QWidget(objectName="page")
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        lay.addWidget(title)
+        lay.addLayout(form)
+        btns = QHBoxLayout()
+        btns.addWidget(self.status, 1)
+        btns.addWidget(save)
+        lay.addLayout(btns)
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(line)
+        lay.addWidget(risk_page)
+        lay.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+        self.status.setText(f"Ukládá se jen lokálně ({s.fileName()}). Aplikace se k Trading 212 nepřipojuje.")
+
+    def save(self) -> bool:
+        for field, text in ((self.equity, "Hodnota portfolia"), (self.open_risk, "Riziko otevřených pozic"),
+                            (self.margin, "Volná marže")):
+            if field.text().strip() and risk.num(field.text()) is None:
+                self.status.setText(f"{text}: zadejte kladné číslo.")
+                return False
+        s = self.s
+        s.setValue("account/equity", str(risk.num(self.equity.text()) or ""))
+        s.setValue("account/currency", self.currency.currentText())
+        s.setValue("account/risk_pct", f"{self.risk.value():g}")
+        s.setValue("account/open_risk", str(risk.num(self.open_risk.text()) or ""))
+        s.setValue("account/total_on", self.total_on.isChecked())
+        s.setValue("account/max_total_pct", f"{self.total.value():g}")
+        s.setValue("account/reserve_pct", f"{self.reserve.value():g}")
+        s.setValue("account/free_margin", str(risk.num(self.margin.text()) or ""))
+        s.sync()
+        self.status.setText("Uloženo.")
+        self.risk_page.recompute()
+        self.saved.emit()
+        return True

@@ -51,6 +51,7 @@ def make(app, tmp_path, monkeypatch):
                              "CFDSignalCalculator", "app")
         s.setValue("demo", demo)
         s.setValue("watch", False)   # the tests drive the ticks themselves
+        s.setValue("m15_background", False)
         s.setValue("mode", "auto")
         s.setValue("api_key", "test-key")
         s.sync()
@@ -241,4 +242,4 @@ def test_index_is_analysed_only_on_labelled_reference_data(app, make, monkeypatc
     assert w.inst.symbol == "SPX" and {q["symbol"] for q in params} == {"SPY"}       # never "SPX" itself
     assert all(q["exchange"] == "NYSE" for q in params)
     assert "REFERENČNÍ TRŽNÍ DATA" in w.result.detail.toPlainText() and w.result.levels.text() == ""
-    assert w.risk_page.entry.text() == "" and "referenční" in w.risk_page.message.text().lower()
+    assert w.risk_page.entry.text() == ""        # v2.8: the historical mode never hands a plan to the risk page

@@ -102,7 +102,8 @@ class InstrumentBar(QWidget):
         super().__init__()
         self.s = settings
         self.backend = backend
-        self.reader = reader or (lambda region: auto.read(region, backend))
+        self._force = True                      # one-shot readings may OCR the whole window (auto.read)
+        self.reader = reader or (lambda region: auto.read(region, backend, force_locate=self._force))
         self.tracker = Tracker(stable=2)
         self.reading: auto.Reading | None = None
         self._task: ReadTask | None = None
@@ -240,6 +241,7 @@ class InstrumentBar(QWidget):
             self._queued.append((stable, then))
             return
         region = self.region()
+        self._force = stable == 1
         self._start(lambda: self.reader(region), "read", stable, then)
 
     def _start(self, fn, kind: str, stable, then):
@@ -451,13 +453,16 @@ class InstrumentBar(QWidget):
         if isinstance(target, Instrument):
             pending = " – ověřuji změnu…" if target != self.tracker.confirmed else ""
             return f"Vidím {target.name}{pending} · {title}", "#22c55e"
-        return f"{rec.reason[:1].upper()}{rec.reason[1:]} – klikněte ⟳ nebo zvolte ručně · {title}", "#f59e0b"
+        via = " (celé okno)" if rec.via == "celé okno" else ""
+        return (f"{rec.reason[:1].upper()}{rec.reason[1:]}{via} – vyberte instrument ručně (hledání) nebo ⟳ · {title}",
+                "#f59e0b")
 
     def _show(self):
         inst = self.tracker.confirmed
         fav = bool(inst) and inst.symbol in self._list("favorites")
         text, color = self._status()
-        state = (describe(inst) if inst else "Instrument neurčen", fav, text, color)
+        none = "Instrument nerozpoznán" if self.mode() == AUTO and self.reading is not None else "Instrument neurčen"
+        state = (describe(inst) if inst else none, fav, text, color)
         if state != self._shown:  # repaint only what changed
             self._shown = state
             self.name.setText(state[0])
